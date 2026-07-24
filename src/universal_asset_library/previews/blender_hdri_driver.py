@@ -1,0 +1,78 @@
+"""Executed inside Blender; do not import bpy from the desktop application."""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+
+import bpy
+
+
+def arguments():
+    values = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hdri", required=True)
+    parser.add_argument("--scene-output", required=True)
+    parser.add_argument("--panorama-output", required=True)
+    parser.add_argument("--result", required=True)
+    return parser.parse_args(values)
+
+
+def main() -> None:
+    args = arguments()
+    scene = bpy.context.scene
+    if scene.camera is None:
+        raise RuntimeError("The HDRI preview template has no active camera.")
+    actual_size = (
+        round(scene.render.resolution_x * scene.render.resolution_percentage / 100),
+        round(scene.render.resolution_y * scene.render.resolution_percentage / 100),
+    )
+    if actual_size != (2048, 512):
+        raise RuntimeError(f"The template must render at 2048x512, not {actual_size[0]}x{actual_size[1]}.")
+    world = bpy.data.worlds.get("World.001")
+    if world is None:
+        raise RuntimeError("The HDRI preview template must contain the World.001 World.")
+    if scene.world != world:
+        raise RuntimeError("The template scene must use World.001 as its configured World.")
+    if world is None or world.node_tree is None:
+        raise RuntimeError("World.001 must use nodes.")
+    environment = world.node_tree.nodes.get("Environment Texture")
+    if environment is None or environment.bl_idname != "ShaderNodeTexEnvironment":
+        raise RuntimeError("World.001 must contain an Environment Texture image node named 'Environment Texture'.")
+    environment.image = bpy.data.images.load(str(Path(args.hdri).resolve()), check_existing=False)
+
+    original = {
+        "camera": scene.camera,
+        "filepath": scene.render.filepath,
+        "format": scene.render.image_settings.file_format,
+        "color_mode": scene.render.image_settings.color_mode,
+        "resolution_x": scene.render.resolution_x,
+        "resolution_y": scene.render.resolution_y,
+        "percentage": scene.render.resolution_percentage,
+        "film_transparent": scene.render.film_transparent,
+    }
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGB"
+    scene.render.filepath = str(Path(args.scene_output).resolve())
+    bpy.ops.render.render(write_still=True)
+
+    # The upper preview is the source equirectangular image itself. Do not project it
+    # through a camera or onto geometry. Scaling this newly loaded image datablock is
+    # safe because the template is never saved.
+    environment.image.scale(2048, 1024)
+    environment.image.save_render(str(Path(args.panorama_output).resolve()), scene=scene)
+
+    scene.camera = original["camera"]
+    scene.render.filepath = original["filepath"]
+    scene.render.image_settings.file_format = original["format"]
+    scene.render.image_settings.color_mode = original["color_mode"]
+    scene.render.resolution_x = original["resolution_x"]
+    scene.render.resolution_y = original["resolution_y"]
+    scene.render.resolution_percentage = original["percentage"]
+    scene.render.film_transparent = original["film_transparent"]
+    Path(args.result).write_text(json.dumps({"blender_version": bpy.app.version_string}), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

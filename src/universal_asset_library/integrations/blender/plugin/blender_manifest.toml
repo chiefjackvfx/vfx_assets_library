@@ -1,0 +1,13 @@
+schema_version = "1.0.0"
+id = "shotbox_assets_bridge"
+version = "0.4.1"
+name = "ShotBox Assets Bridge"
+tagline = "Send managed HDRIs, PBR materials, and USD models into Blender"
+maintainer = "ShotBox Assets"
+type = "add-on"
+blender_version_min = "5.1.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read managed HDRIs, texture maps, and USD models selected in ShotBox Assets"
+network = "Receive authenticated requests from ShotBox Assets on localhost"
