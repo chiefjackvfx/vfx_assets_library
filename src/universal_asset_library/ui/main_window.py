@@ -42,6 +42,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         QSettings().setValue("window/geometry", self.saveGeometry())
+        self.assets_tab.shutdown_ai()
         super().closeEvent(event)
 
     def _apply_settings(self, settings: AppSettings) -> None:

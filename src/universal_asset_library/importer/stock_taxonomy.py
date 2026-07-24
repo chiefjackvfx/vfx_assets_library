@@ -9,7 +9,7 @@ import unicodedata
 
 
 SCHEMA_VERSION = 1
-DEFAULTS_VERSION = 2
+DEFAULTS_VERSION = 3
 CATEGORY_FILENAME = "stock_categories.json"
 TAG_FILENAME = "stock_tags.json"
 SPECIALIST_CATEGORIES = {"Lens", "Magic", "Motion Graphics"}
@@ -54,7 +54,9 @@ class StockClassification:
 
 
 DEFAULT_CATEGORY_RULES = (
-    StockCategoryRule("Atmospheres", ("atmosphere", "atmospheres", "snow", "snowfall")),
+    StockCategoryRule("Atmospheres", (
+        "atmosphere", "atmospheres", "snow", "snowfall", "fog", "Cloud",
+    )),
     StockCategoryRule("Blood", ("blood",)),
     StockCategoryRule("Ballistics", ("ballistic", "ballistics", "bullet", "bullets", "muzzle flash", "muzzle flashes", "shell", "shells")),
     StockCategoryRule("Debris", ("debris",)),
@@ -66,14 +68,22 @@ DEFAULT_CATEGORY_RULES = (
     StockCategoryRule("Glass", ("glass", "windshield", "windshields")),
     StockCategoryRule("Impacts", ("impact", "impacts", "hit", "hits", "couch hit", "couch hits", "wall hit", "wall hits", "particle hit", "particle hits", "powder hit", "powder hits")),
     StockCategoryRule("Lasers", ("laser", "lasers")),
-    StockCategoryRule("Lens", ("lens", "lens effect", "lens effects", "bokeh")),
+    StockCategoryRule("Lens", (
+        "lens", "lens effect", "lens effects", "bokeh", "light leak",
+        "light leaks", "film burn", "film burns", "lens flare", "lens flares",
+        "anamorphic flare", "anamorphic flares", "optical flare",
+        "optical flares", "light streak", "light streaks", "Light Leaks",
+    )),
     StockCategoryRule("Magic", ("magic", "magical", "spell", "spells")),
     StockCategoryRule("Meteors", ("meteor", "meteors")),
-    StockCategoryRule("Motion Graphics", ("motion graphic", "motion graphics", "mograph", "graphic element", "graphic elements", "chaotic", "duality", "reveal")),
+    StockCategoryRule("Motion Graphics", (
+        "motion graphic", "motion graphics", "mograph", "graphic element",
+        "graphic elements", "chaotic", "duality", "reveal", "noise",
+    )),
     StockCategoryRule("Particles", ("particle", "particles")),
-    StockCategoryRule("Smoke", ("smoke", "smoke charge", "smoke charges")),
+    StockCategoryRule("Smoke", ("smoke", "smoke charge", "smoke charges", "Plume")),
     StockCategoryRule("Sparks", ("spark", "sparks", "welding spark", "welding sparks")),
-    StockCategoryRule("Water", ("water", "wet charge", "wet charges", "rain")),
+    StockCategoryRule("Water", ("water", "wet charge", "wet charges", "rain", "splash")),
     StockCategoryRule("Miscellaneous", ("misc", "miscellaneous")),
     StockCategoryRule("Uncategorized", ("uncategorized",)),
 )
@@ -93,7 +103,6 @@ DEFAULT_TAG_RULES = (
     _tag("big"),
     _tag("blast", "blasts"),
     _tag("blood"),
-    _tag("bokeh"),
     _tag("body-layer", "body"),
     _tag("bouncing", "bounce"),
     _tag("burst", "bursts"),
@@ -106,8 +115,6 @@ DEFAULT_TAG_RULES = (
     _tag("collapse", "collapsing"),
     _tag("cork"),
     _tag("couch"),
-    _tag("crack", "cracks"),
-    _tag("chaotic"),
     _tag("dark"),
     _tag("day"),
     _tag("debris"),
@@ -115,7 +122,6 @@ DEFAULT_TAG_RULES = (
     _tag("dirt"),
     _tag("droplets", "drop", "drops"),
     _tag("dust"),
-    _tag("duality"),
     _tag("electricity", "electric"),
     _tag("explosion", "explosions"),
     _tag("falling", "fall"),
@@ -125,7 +131,6 @@ DEFAULT_TAG_RULES = (
     _tag("flying", "fllying"),
     _tag("foam"),
     _tag("front"),
-    _tag("ground"),
     _tag("glass"),
     _tag("guard-layer", "guard"),
     _tag("hit", "hits"),
@@ -144,14 +149,12 @@ DEFAULT_TAG_RULES = (
     _tag("puffy"),
     _tag("rain"),
     _tag("rock", "rocks"),
-    _tag("reveal"),
     _tag("screen-blend", "screen mode", "screen blend"),
     _tag("shell", "shells"),
     _tag("shatter", "shattered", "smash", "smashed"),
     _tag("side"),
     _tag("slow-motion", "slow", "slow motion"),
     _tag("smoke"),
-    _tag("snow"),
     _tag("spark", "sparks"),
     _tag("splat", "splats"),
     _tag("splatter", "splatters"),
@@ -165,7 +168,6 @@ DEFAULT_TAG_RULES = (
     _tag("wall"),
     _tag("water"),
     _tag("wave", "waves"),
-    _tag("weather"),
     _tag("welding", "weld"),
     _tag("wet"),
     _tag("wide"),
@@ -174,6 +176,14 @@ DEFAULT_TAG_RULES = (
     _tag("windy", "wind"),
     _tag("wisp", "wisps"),
     _tag("wood"),
+    _tag("bokeh"),
+    _tag("crack", "cracks"),
+    _tag("chaotic"),
+    _tag("duality"),
+    _tag("ground"),
+    _tag("reveal"),
+    _tag("snow"),
+    _tag("weather"),
 )
 
 DEFAULT_STOP_WORDS = (

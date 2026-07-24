@@ -92,7 +92,6 @@ def test_hdri_scan_uses_only_local_variants_and_classifies_companions(tmp_path) 
         "delivery/license.dat",
         "notes.txt",
         "sunny_courtyard.blend",
-        "thumbnail.webp",
     ]
     assert any("2K" in warning for warning in candidate.warnings)
 
@@ -113,8 +112,11 @@ def test_hdri_import_generates_real_jpeg_and_preserves_all_safe_files(tmp_path) 
     assert asset.asset_type == "hdri"
     assert asset.resolution == "1K, 4K"
     assert asset.thumbnail_path.read_bytes().startswith(b"\xff\xd8\xff")
+    assert asset.hero_path == asset.thumbnail_path
+    assert asset.preview_render["type"] == "existing_preview"
+    assert asset.preview_render["source"] == "thumbnail.webp"
     assert {item.original_path for item in asset.extra_files} == {
-        "delivery/license.dat", "notes.txt", "sunny_courtyard.blend", "thumbnail.webp"
+        "delivery/license.dat", "notes.txt", "sunny_courtyard.blend"
     }
     manifest = json.loads((asset.asset_dir / "asset.json").read_text(encoding="utf-8"))
     assert manifest["type"] == "hdri"
@@ -125,6 +127,10 @@ def test_hdri_import_generates_real_jpeg_and_preserves_all_safe_files(tmp_path) 
     assert manifest["source"]["original_path"] == str(source)
     assert manifest["source_metadata_original_paths"] == {
         "metadata/info.json": "info.json",
+    }
+    assert manifest["preview_original_paths"] == {
+        "thumbnail": "thumbnail.webp",
+        "hero": "thumbnail.webp",
     }
     assert {
         record["original_path"]
@@ -144,6 +150,7 @@ def test_hdri_import_generates_real_jpeg_and_preserves_all_safe_files(tmp_path) 
 
 def test_hdri_import_publishes_composite_render_metadata_when_blender_succeeds(tmp_path, monkeypatch) -> None:
     source = _hdri_source(tmp_path)
+    (source / "thumbnail.webp").unlink()
     library = tmp_path / "library"
     library.mkdir()
 
@@ -151,15 +158,15 @@ def test_hdri_import_publishes_composite_render_metadata_when_blender_succeeds(t
         request.output_dir.mkdir(parents=True, exist_ok=True)
         hero = request.output_dir / "Sunny_Courtyard_HDRI_Preview.jpg"
         thumbnail = request.output_dir / "Sunny_Courtyard_HDRI_Thumbnail.jpg"
-        image = QImage(2048, 1536, QImage.Format.Format_RGB32)
+        image = QImage(1024, 768, QImage.Format.Format_RGB32)
         image.fill(QColor("#446688"))
         assert image.save(str(hero), "JPG", 90)
         thumb = image.scaled(640, 480)
         assert thumb.save(str(thumbnail), "JPG", 90)
         metadata = {
             "type": "hdri_composite", "status": "ready", "source": request.source_relative,
-            "width": 2048, "height": 1536, "scene_width": 2048, "scene_height": 512,
-            "panorama_width": 2048, "panorama_height": 1024, "generated_at": "now",
+            "width": 1024, "height": 768, "scene_width": 1024, "scene_height": 256,
+            "panorama_width": 1024, "panorama_height": 512, "generated_at": "now",
             "blender_version": "5.0.1", "template_sha256": "abc", "diagnostic": "",
         }
         return HdriPreviewResult("ready", thumbnail, hero, request.source_relative, metadata=metadata)
@@ -176,6 +183,7 @@ def test_hdri_import_publishes_composite_render_metadata_when_blender_succeeds(t
 
 def test_hdri_render_exception_never_fails_import_or_replaces_fallback(tmp_path, monkeypatch) -> None:
     source = _hdri_source(tmp_path)
+    (source / "thumbnail.webp").unlink()
     library = tmp_path / "library"
     library.mkdir()
     monkeypatch.setattr(
@@ -205,7 +213,7 @@ def test_manual_hdri_regeneration_keeps_previous_preview_when_source_changes(tmp
         thumbnail = request.output_dir / "Sunny_Courtyard_HDRI_Thumbnail.jpg"
         with request.hdri_path.open("ab") as handle:
             handle.write(b"changed-during-render")
-        image = QImage(2048, 1536, QImage.Format.Format_RGB32)
+        image = QImage(1024, 768, QImage.Format.Format_RGB32)
         image.fill(QColor("#112233"))
         assert image.save(str(hero), "JPG", 90)
         assert image.scaled(640, 480).save(str(thumbnail), "JPG", 90)

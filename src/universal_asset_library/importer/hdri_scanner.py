@@ -180,6 +180,9 @@ def _scan_hdri(root: Path, default_category: str, entries) -> HdriCandidate:
         candidate.warnings.append(f"Provider metadata lists non-local resolutions: {', '.join(missing)}.")
     _assign_hdri_preview(candidate, entries)
     assigned = primary_paths | set(metadata_paths)
+    assigned.update(
+        path for path in (candidate.selected_thumbnail, candidate.selected_hero) if path
+    )
     candidate.extra_paths = sorted(
         (
             path for path, snapshot in candidate.source_snapshots.items()

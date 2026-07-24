@@ -34,7 +34,7 @@ pytest
 
 ## HDRI composite previews
 
-HDRI imports can use the immutable `templates/hdri_preview.blend` scene to generate one clean 2048×1536 preview without text or resolution badges: the source equirectangular image is directly resized and tone-mapped to 2048×1024 above the template's existing 2048×512 sphere render. It is not projected through another camera or mapped to geometry. Both the catalog card and inspector use this same `_HDRI_Preview.jpg`; no separate generated thumbnail is stored. The driver replaces only `World.001`'s `Environment Texture` image; the template's camera, geometry, materials, render engine, sampling, device, denoising, and color management remain authoritative.
+HDRI imports can use the immutable `templates/hdri_preview.blend` scene to generate one clean 1024×768 preview without text or resolution badges: the source equirectangular image is directly resized and tone-mapped to 1024×512 above a 1024×256 sphere render from the template. It is not projected through another camera or mapped to geometry. Both the catalog card and inspector use this same `_HDRI_Preview.jpg`; no separate generated thumbnail is stored. When the source package already includes a WebP preview, that image is converted directly to JPEG and the Blender render is skipped. The driver replaces only `World.001`'s `Environment Texture` image and explicitly renders with the first available Cycles GPU backend in OptiX, CUDA, HIP, oneAPI, then Metal order; the template's camera, geometry, materials, render engine, sampling, denoising, and color management remain authoritative.
 
 Choose Blender in **Settings**, or leave the executable empty to search `PATH`. The **Check Blender** action reports its detected version. Automatic rendering is enabled by default, but Blender remains optional: unavailable or failed rendering never fails an import and the existing fallback preview is retained. HDRI details provide **Render preview**, **Regenerate preview**, and cancellation controls. Regeneration renders outside the library lock, then verifies the source hash and unchanged manifest before atomically publishing the result.
 
@@ -123,7 +123,7 @@ The scanner builds one source inventory, ignores symlinks and corrupt/empty imag
 
 Imported folders and files use human-readable names. For example, `Aerial Asphalt 01` is stored in `aerial-asphalt-01/` with maps such as `Aerial_Asphalt_01_2K_BaseColor.jpg`. A genuinely different same-name material receives a readable `-2` suffix. Stable UUIDs remain inside `asset.json`; untouched provider records remain under `metadata/`.
 
-Texture scanning securely extracts every ZIP found under the selected import folder into a temporary review workspace. A same-name external image such as `Marble_001.jpg` is preferred as the preview for `Marble_001.zip`; otherwise an internal preview or Base Color fallback is used. Same-name JPEG/RAR pairs use the same workflow. Common archive tokens including `COL`, `GLOSS`, `NRM`, and `REFL` normalize to Base Color, Glossiness, Normal, and Specular, and non-power-of-two labels such as 6K are retained. The complete archive is not duplicated into the managed asset; its original path, format, size, and preflight hash remain in source provenance. ZIP support is built in; RAR imports require `bsdtar`.
+Texture scanning securely extracts every ZIP found under the selected import folder into a temporary review workspace. A same-name external image such as `Marble_001.jpg` is preferred as the preview for `Marble_001.zip`; otherwise an internal preview or Base Color fallback is used. Same-name JPEG/RAR pairs use the same workflow. Common archive tokens including `COL`, `GLOSS`, `NRM`, and `REFL` normalize to Base Color, Glossiness, Normal, and Specular, and non-power-of-two labels such as 6K are retained. WebP texture maps and previews are converted to genuine JPEG files when they are published to the managed library, while their original source paths remain recorded in the manifest. The complete archive is not duplicated into the managed asset; its original path, format, size, and preflight hash remain in source provenance. ZIP support is built in; RAR imports require `bsdtar`.
 
 Use **Unzip all ZIPs** beside **Scan folder** to expand every ZIP under the selected source into its own same-name sibling folder before scanning. The complete archive contents, including provider JSON and text metadata, are preserved. Existing destination folders are skipped and never overwritten; extraction happens in a temporary sibling and is published only after that archive completes successfully.
 
@@ -132,6 +132,17 @@ The Settings tab includes confirmed **Update / Fix Library** and **Rename existi
 After a successful batch, the app reloads and opens the Assets tab automatically. Imported cards use real thumbnails, and their detail panels can copy or reveal the managed asset path.
 
 The Assets inspector also provides **Edit material…** for updating the display name, category, tags, author, physical size, and description. Every asset has exactly one category selected from its asset type's `.ual` JSON and any number of searchable tags. Changing the category moves the complete managed asset into that category's filesystem folder, while tag edits never move files. Tags use removable chips with Enter/comma input, multi-value paste, suggestions, and automatic duplicate prevention. The provider boilerplate term `surface` is never retained as a category or tag.
+
+The selected asset inspector also provides **Guess Category** and **Guess Tags**.
+These actions send the managed still preview to a local Ollama
+`ministral-3:8b` vision model and show a read-only current-versus-suggested
+confirmation before changing metadata. Categories are restricted to the
+asset-type category JSON; five guessed tags are restricted to the bundled
+type-specific vocabulary, with Stock using `.ual/stock_tags.json`. Confirmed
+tags merge with existing tags, while confirmed categories use the normal atomic
+metadata update and category-folder move. If Ollama or the model is unavailable,
+the setup dialog can start the local server and download the model explicitly.
+Preview images remain on the local computer.
 
 The Assets catalog uses an expandable category rail beside the asset grid. It starts as an icon strip, can expand to show category names and live result counts, and combines its single-category selection with the current search and technical facet. Only primary categories used by the selected asset type are shown. Switching asset types resets the rail to **All**.
 

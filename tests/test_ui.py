@@ -8,7 +8,7 @@ import pytest
 from PyQt6.QtCore import QSettings, QThreadPool, Qt
 from PyQt6.QtGui import QColor, QImage, QPixmap
 from PyQt6.QtMultimedia import QMediaPlayer
-from PyQt6.QtWidgets import QApplication, QDialogButtonBox
+from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox
 
 from universal_asset_library.app import create_application
 from universal_asset_library.settings import AppSettings, SettingsStore
@@ -20,7 +20,10 @@ from universal_asset_library.ui.assets_tab import (
     ModelAssetRescanDialog,
     ModelConversionDialog,
     TagEditor,
+    _classification_preview,
+    _merge_ai_tags,
 )
+from universal_asset_library.ai import CategoryGuess, OllamaStatus, TagGuess
 from universal_asset_library.ui.importer_tab import ImporterTab
 from universal_asset_library.ui.main_window import MainWindow
 from universal_asset_library.ui.settings_tab import SettingsTab
@@ -666,6 +669,147 @@ def test_assets_detail_lists_retained_extra_files(app, tmp_path) -> None:
     tab.load_library(str(library))
     assert tab.detail.extras_title.text() == "Included Extras · 1"
     assert "license.txt" in tab.detail.extras.text()
+
+
+def test_asset_inspector_ai_buttons_use_managed_preview(app, tmp_path) -> None:
+    source = texture_source(tmp_path, "AI_Stone")
+    preview = QImage(320, 180, QImage.Format.Format_RGB32)
+    preview.fill(QColor("#6f777a"))
+    assert preview.save(str(source / "AI_Stone_preview.jpg"))
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_materials(
+        scan_texture_folder(source).materials
+    ).imported[0]
+    panel = DetailPanel()
+    panel.show()
+    captured = []
+    panel.ai_guess_requested.connect(lambda value, operation: captured.append((value.id, operation)))
+    panel.show_asset(asset)
+    app.processEvents()
+
+    assert panel.guess_category_button.isVisibleTo(panel)
+    assert panel.guess_tags_button.isVisibleTo(panel)
+    assert panel.guess_category_button.isEnabled()
+    assert _classification_preview(asset) in {asset.hero_path, asset.thumbnail_path}
+    panel.guess_category_button.click()
+    panel.guess_tags_button.click()
+    assert captured == [(asset.id, "category"), (asset.id, "tags")]
+    panel.set_ai_busy(True, "Working")
+    assert not panel.guess_category_button.isEnabled()
+    assert panel.ai_status.text() == "Working"
+    panel.close()
+
+
+def test_asset_inspector_ai_buttons_disable_without_still_preview(app, tmp_path) -> None:
+    asset = stock_asset(tmp_path, "missing-thumb")
+    asset.thumbnail_path.unlink()
+    panel = DetailPanel()
+    panel.show_asset(asset)
+
+    assert not panel.guess_category_button.isEnabled()
+    assert not panel.guess_tags_button.isEnabled()
+    assert _classification_preview(asset) is None
+
+
+def test_ai_tag_merge_is_case_insensitive_and_stable() -> None:
+    assert _merge_ai_tags(
+        ("existing", "Sunny"),
+        ("sunny", "urban", "midday", "hard-light", "high-contrast"),
+    ) == ("existing", "Sunny", "urban", "midday", "hard-light", "high-contrast")
+
+
+def test_ai_confirmation_cancel_does_not_write(app, tmp_path, monkeypatch) -> None:
+    source = texture_source(tmp_path, "Cancel_Stone")
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_materials(
+        scan_texture_folder(source).materials
+    ).imported[0]
+    tab = AssetsTab()
+    tab.load_library(str(library))
+    before = (asset.category, asset.tags)
+    tab._ai_asset_id = asset.id
+    monkeypatch.setattr(
+        assets_tab_module.GuessConfirmationDialog,
+        "exec",
+        lambda self: QDialog.DialogCode.Rejected,
+    )
+
+    tab._ai_guess_finished(
+        "category", CategoryGuess("Concrete", 0.8, "Looks concrete.")
+    )
+
+    current = LibraryRepository(library).list_assets()[0]
+    assert (current.category, current.tags) == before
+
+
+def test_ai_category_and_tags_confirm_through_repository(
+    app, tmp_path, monkeypatch,
+) -> None:
+    source = texture_source(tmp_path, "Apply_Stone")
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_materials(
+        scan_texture_folder(source).materials
+    ).imported[0]
+    tab = AssetsTab()
+    tab.load_library(str(library))
+    monkeypatch.setattr(
+        assets_tab_module.GuessConfirmationDialog,
+        "exec",
+        lambda self: QDialog.DialogCode.Accepted,
+    )
+
+    tab._ai_asset_id = asset.id
+    tab._ai_guess_finished(
+        "category", CategoryGuess("Concrete", 0.9, "Concrete surface.")
+    )
+    categorized = LibraryRepository(library).list_assets()[0]
+    assert categorized.category == "Concrete"
+    assert categorized.tags == asset.tags
+    assert categorized.asset_dir.parent.name == "concrete"
+
+    tab._ai_asset_id = asset.id
+    tab._ai_guess_finished(
+        "tags",
+        TagGuess(
+            ("rough", "outdoor", "weathered", "stone", "matte"),
+            0.85,
+            "Visible surface properties.",
+        ),
+    )
+    tagged = LibraryRepository(library).list_assets()[0]
+    assert tagged.category == "Concrete"
+    assert tagged.tags[-5:] == (
+        "rough", "outdoor", "weathered", "stone", "matte",
+    )
+
+
+def test_ollama_setup_flow_rechecks_readiness(app, monkeypatch) -> None:
+    statuses = iter((
+        OllamaStatus(False, diagnostic="offline"),
+        OllamaStatus(True, ("ministral-3:8b",)),
+    ))
+    monkeypatch.setattr(
+        assets_tab_module.OllamaClient,
+        "status",
+        lambda self: next(statuses),
+    )
+    opened = []
+
+    class FakeSetupDialog:
+        def __init__(self, start_server, parent, model):
+            opened.append(model)
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(assets_tab_module, "OllamaSetupDialog", FakeSetupDialog)
+    tab = AssetsTab()
+
+    assert tab._ensure_ollama_ready()
+    assert opened == ["ministral-3:8b"]
 
 
 def test_assets_bridge_layout_has_compact_toolbar_and_pinned_footer(app, tmp_path) -> None:

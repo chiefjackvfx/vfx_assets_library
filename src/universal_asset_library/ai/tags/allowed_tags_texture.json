@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "asset_type": "texture_set",
+  "tags": [
+    "seamless", "tileable", "rough", "smooth", "worn", "clean", "dirty",
+    "cracked", "weathered", "painted", "polished", "matte", "glossy",
+    "metallic", "non-metallic", "porous", "wet", "dry", "aged", "new",
+    "natural", "manufactured", "patterned", "plain", "damaged", "mossy",
+    "rusty", "stained", "indoor", "outdoor", "floor", "wall", "roof",
+    "ground", "fabric", "wood", "stone", "concrete", "brick", "metal",
+    "plaster", "ceramic", "leather", "paper", "asphalt", "soil", "sand",
+    "gravel"
+  ]
+}

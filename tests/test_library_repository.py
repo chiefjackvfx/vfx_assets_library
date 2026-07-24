@@ -72,6 +72,33 @@ def test_atomic_import_manifest_catalog_and_source_integrity(tmp_path) -> None:
     assert asset.thumbnail_path.name == "Stone_Thumbnail.png"
 
 
+def test_texture_import_converts_webp_maps_and_previews_to_jpeg(tmp_path) -> None:
+    source = tmp_path / "webp-stone"
+    source.mkdir()
+    image(source / "webp_stone_diff_1k.webp", "#736c62")
+    image(source / "webp_stone_preview.webp", "#736c62", 256)
+    candidate = scan_texture_folder(source).materials[0]
+    original_map = (source / "webp_stone_diff_1k.webp").read_bytes()
+
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_materials([candidate]).imported[0]
+    manifest = json.loads((asset.asset_dir / "asset.json").read_text(encoding="utf-8"))
+    map_record = manifest["resolutions"]["1K"]["maps"]["Base Color"][0]
+    managed_map = asset.asset_dir / map_record["path"]
+
+    assert managed_map.suffix == ".jpg"
+    assert managed_map.read_bytes().startswith(b"\xff\xd8\xff")
+    assert map_record["format"] == "JPEG"
+    assert map_record["original_path"] == "webp_stone_diff_1k.webp"
+    assert map_record["size"] == managed_map.stat().st_size
+    assert map_record["sha256"] == repository_module._sha256_file(managed_map)
+    assert asset.thumbnail_path.suffix == ".jpg"
+    assert asset.thumbnail_path.read_bytes().startswith(b"\xff\xd8\xff")
+    assert manifest["preview_original_paths"]["thumbnail"] == "webp_stone_preview.webp"
+    assert (source / "webp_stone_diff_1k.webp").read_bytes() == original_map
+
+
 def test_content_duplicate_is_skipped_without_visible_copy(tmp_path) -> None:
     _source, candidate = source_material(tmp_path)
     library = tmp_path / "library"

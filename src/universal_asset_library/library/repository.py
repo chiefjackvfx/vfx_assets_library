@@ -2315,17 +2315,42 @@ class LibraryRepository:
                     for source_map in _ordered_map_alternatives(variant.maps[channel]):
                         source = _safe_source(material.source_root, source_map.relative_path)
                         destination_dir = stage / "maps" / _safe_component(label)
-                        destination = _map_destination(destination_dir, asset_token, label, channel, source_map, source.suffix, used_names)
-                        size, digest = _copy_hash(
-                            source, destination, material.name, progress, token,
-                            completed_before + copied_bytes, total_bytes,
-                            material.source_snapshots.get(source_map.relative_path),
-                            preflight.hashes.get(source_map.relative_path, ""),
+                        convert_webp = source.suffix.casefold() == ".webp"
+                        destination = _map_destination(
+                            destination_dir,
+                            asset_token,
+                            label,
+                            channel,
+                            source_map,
+                            ".jpg" if convert_webp else source.suffix,
+                            used_names,
                         )
-                        copied_bytes += size
+                        if convert_webp:
+                            processed, source_digest, size, digest = _convert_webp_to_jpeg(
+                                source, destination, material.name, progress, token,
+                                completed_before + copied_bytes, total_bytes,
+                                material.source_snapshots.get(source_map.relative_path),
+                                preflight.hashes.get(source_map.relative_path, ""),
+                            )
+                        else:
+                            processed, digest = _copy_hash(
+                                source, destination, material.name, progress, token,
+                                completed_before + copied_bytes, total_bytes,
+                                material.source_snapshots.get(source_map.relative_path),
+                                preflight.hashes.get(source_map.relative_path, ""),
+                            )
+                            source_digest = digest
+                            size = processed
+                        copied_bytes += processed
                         relative = destination.relative_to(stage).as_posix()
-                        records.append(_map_manifest(source_map, relative, size, digest))
-                        fingerprint_records.append(f"{label}|{channel}|{digest}")
+                        records.append(_map_manifest(
+                            source_map,
+                            relative,
+                            size,
+                            digest,
+                            format_override="JPEG" if convert_webp else None,
+                        ))
+                        fingerprint_records.append(f"{label}|{channel}|{source_digest}")
                     map_groups[channel] = records
                 manifest_resolutions[label] = {
                     "width": variant.width,
@@ -2353,14 +2378,24 @@ class LibraryRepository:
                     preview_original_paths[role] = relative_source
                     continue
                 source = _safe_source(material.source_root, relative_source)
-                destination = stage / "previews" / f"{asset_token}_{role.title()}{_safe_suffix(source.suffix)}"
-                size, _digest = _copy_hash(
-                    source, destination, material.name, progress, token,
-                    completed_before + copied_bytes, total_bytes,
-                    material.source_snapshots.get(relative_source),
-                    preflight.hashes.get(relative_source, ""),
-                )
-                copied_bytes += size
+                convert_webp = source.suffix.casefold() == ".webp"
+                suffix = ".jpg" if convert_webp else _safe_suffix(source.suffix)
+                destination = stage / "previews" / f"{asset_token}_{role.title()}{suffix}"
+                if convert_webp:
+                    processed, _source_digest, _size, _digest = _convert_webp_to_jpeg(
+                        source, destination, material.name, progress, token,
+                        completed_before + copied_bytes, total_bytes,
+                        material.source_snapshots.get(relative_source),
+                        preflight.hashes.get(relative_source, ""),
+                    )
+                else:
+                    processed, _digest = _copy_hash(
+                        source, destination, material.name, progress, token,
+                        completed_before + copied_bytes, total_bytes,
+                        material.source_snapshots.get(relative_source),
+                        preflight.hashes.get(relative_source, ""),
+                    )
+                copied_bytes += processed
                 stored = destination.relative_to(stage).as_posix()
                 preview_manifest[role] = stored
                 preview_original_paths[role] = relative_source
@@ -2673,9 +2708,35 @@ class LibraryRepository:
             _write_hdri_thumbnail(material, preview_path, token)
             preview_relative = preview_path.relative_to(stage).as_posix()
 
-            selected = select_hdri_variant(manifest_resolutions)
             render_result: HdriPreviewResult | None = None
-            if selected:
+            existing_webp = (
+                material.selected_thumbnail
+                if material.selected_thumbnail
+                and Path(material.selected_thumbnail).suffix.casefold() == ".webp"
+                else ""
+            )
+            if existing_webp:
+                preview_image = QImage(str(preview_path))
+                render_result = HdriPreviewResult(
+                    "ready",
+                    preview_path,
+                    preview_path,
+                    existing_webp,
+                    metadata={
+                        "type": "existing_preview",
+                        "status": "ready",
+                        "source": existing_webp,
+                        "width": preview_image.width(),
+                        "height": preview_image.height(),
+                        "generated_at": _utc_now(),
+                        "blender_version": "",
+                        "template_sha256": "",
+                        "diagnostic": "Converted the existing WebP preview to JPEG.",
+                    },
+                )
+
+            selected = select_hdri_variant(manifest_resolutions)
+            if not existing_webp and selected:
                 _selected_label, selected_variant = selected
                 selected_file = select_hdri_file(selected_variant)
                 if selected_file:
@@ -2811,7 +2872,10 @@ class LibraryRepository:
                         "diagnostic": "No local HDRI map was available for preview rendering.",
                     },
                 },
-                "preview_original_paths": {"thumbnail": None, "hero": None},
+                "preview_original_paths": {
+                    "thumbnail": existing_webp or None,
+                    "hero": existing_webp or None,
+                },
                 "source_metadata": metadata_manifest,
                 "source_metadata_original_paths": metadata_original_paths,
                 "extra_files": extras_manifest,
@@ -4268,8 +4332,7 @@ def _material_extra_paths(material: MaterialCandidate) -> list[str]:
         for texture_map in alternatives
     }
     assigned.update(material.metadata_paths)
-    if not isinstance(material, HdriCandidate):
-        assigned.update(path for path in (material.selected_thumbnail, material.selected_hero) if path)
+    assigned.update(path for path in (material.selected_thumbnail, material.selected_hero) if path)
     candidates = set(material.extra_paths)
     candidates.update(path for path in material.source_snapshots if path not in assigned)
     return sorted((path for path in candidates if path not in assigned), key=str.casefold)
@@ -4343,6 +4406,49 @@ def _write_hdri_thumbnail(material: HdriCandidate, destination: Path, token: Can
         os.fsync(handle.fileno())
 
 
+def _convert_webp_to_jpeg(
+    source: Path,
+    destination: Path,
+    material: str,
+    callback: Callable[[ImportProgress], None] | None,
+    token: CancelToken,
+    completed_before: int,
+    total_bytes: int,
+    expected_snapshot: SourceFileSnapshot | None,
+    expected_hash: str,
+) -> tuple[int, str, int, str]:
+    source_digest, processed = _hash_source(
+        source,
+        expected_snapshot,
+        material,
+        callback,
+        token,
+        completed_before,
+        total_bytes,
+    )
+    if expected_hash and source_digest != expected_hash:
+        raise StaleSourceError(f"{source.name} no longer matches its reviewed content.")
+
+    token.check()
+    reader = QImageReader(str(source))
+    reader.setDecideFormatFromContent(True)
+    reader.setAutoTransform(True)
+    image = reader.read()
+    if image.isNull():
+        raise LibraryError(f"Could not decode the WebP texture {source.name}.")
+    if expected_snapshot and not _snapshot_matches(source, expected_snapshot):
+        raise StaleSourceError(f"{source.name} changed while it was being converted.")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    image = image.convertToFormat(QImage.Format.Format_RGB32)
+    if not image.save(str(destination), "JPG", 95):
+        raise LibraryError(f"Could not convert the WebP texture {source.name} to JPEG.")
+    with destination.open("rb") as handle:
+        os.fsync(handle.fileno())
+    token.check()
+    return processed, source_digest, destination.stat().st_size, _sha256_file(destination)
+
+
 def _write_model_placeholder(name: str, destination: Path, token: CancelToken) -> None:
     token.check()
     image = QImage(640, 360, QImage.Format.Format_RGB32)
@@ -4391,11 +4497,18 @@ def _snapshot_matches(path: Path, snapshot: SourceFileSnapshot) -> bool:
     return stat.st_size == snapshot.size and stat.st_mtime_ns == snapshot.mtime_ns
 
 
-def _map_manifest(source: TextureMap, path: str, size: int, digest: str) -> dict:
+def _map_manifest(
+    source: TextureMap,
+    path: str,
+    size: int,
+    digest: str,
+    *,
+    format_override: str | None = None,
+) -> dict:
     return {
         "path": path,
         "original_path": source.relative_path,
-        "format": source.file_format,
+        "format": format_override or source.file_format,
         "size": size,
         "sha256": digest,
         "bit_depth": source.bit_depth,

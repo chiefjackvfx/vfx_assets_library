@@ -14,9 +14,9 @@ from typing import Callable, Mapping
 from PyQt6.QtGui import QColor, QImage, QPainter
 
 
-EXPECTED_SCENE_SIZE = (2048, 512)
-PANORAMA_SIZE = (2048, 1024)
-COMPOSITE_SIZE = (2048, 1536)
+EXPECTED_SCENE_SIZE = (1024, 256)
+PANORAMA_SIZE = (1024, 512)
+COMPOSITE_SIZE = (1024, 768)
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +200,9 @@ def render_hdri_preview(
         "scene_width": EXPECTED_SCENE_SIZE[0], "scene_height": EXPECTED_SCENE_SIZE[1],
         "panorama_width": PANORAMA_SIZE[0], "panorama_height": PANORAMA_SIZE[1],
         "generated_at": datetime.now(timezone.utc).isoformat(), "blender_version": metadata.get("blender_version", version),
+        "render_device": metadata.get("render_device", "GPU"),
+        "compute_device_type": metadata.get("compute_device_type", ""),
+        "gpu_devices": metadata.get("gpu_devices", []),
         "template_sha256": template_hash, "diagnostic": "",
     }
     return HdriPreviewResult("ready", hero, hero, request.source_relative, str(render_metadata["blender_version"]), template_hash, metadata=render_metadata, log=output)
@@ -211,9 +214,15 @@ def compose_hdri_preview(
     scene = QImage(str(scene_path))
     panorama = QImage(str(panorama_path))
     if (scene.width(), scene.height()) != EXPECTED_SCENE_SIZE:
-        raise ValueError(f"Template render must be 2048×512; received {scene.width()}×{scene.height()}.")
+        raise ValueError(
+            f"Template render must be {EXPECTED_SCENE_SIZE[0]}×{EXPECTED_SCENE_SIZE[1]}; "
+            f"received {scene.width()}×{scene.height()}."
+        )
     if (panorama.width(), panorama.height()) != PANORAMA_SIZE:
-        raise ValueError(f"Panorama render must be 2048×1024; received {panorama.width()}×{panorama.height()}.")
+        raise ValueError(
+            f"Panorama render must be {PANORAMA_SIZE[0]}×{PANORAMA_SIZE[1]}; "
+            f"received {panorama.width()}×{panorama.height()}."
+        )
     canvas = QImage(*COMPOSITE_SIZE, QImage.Format.Format_RGB32)
     canvas.fill(QColor("#11151a"))
     painter = QPainter(canvas)

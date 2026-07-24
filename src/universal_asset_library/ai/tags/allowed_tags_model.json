@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "asset_type": "model",
+  "tags": [
+    "realistic", "stylized", "modern", "vintage", "industrial",
+    "residential", "commercial", "indoor", "outdoor", "low-poly",
+    "high-detail", "clean", "worn", "damaged", "painted", "metallic",
+    "wooden", "stone", "plastic", "fabric", "vehicle", "furniture",
+    "architecture", "prop", "decorative", "organic", "hard-surface",
+    "modular", "standalone", "interior", "exterior", "historical",
+    "contemporary", "sci-fi", "fantasy", "food", "plant", "rock",
+    "character", "creature", "appliance", "tool", "container", "seating",
+    "table", "lighting", "storage", "construction"
+  ]
+}

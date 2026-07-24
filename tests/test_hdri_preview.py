@@ -55,8 +55,8 @@ def test_composite_dimensions_order_and_jpeg_validity(tmp_path) -> None:
     full = QImage(str(hero))
     assert (full.width(), full.height()) == COMPOSITE_SIZE
     assert full.pixelColor(100, 100).blue() > full.pixelColor(100, 100).red()
-    assert full.pixelColor(1950, 50).blue() > full.pixelColor(1950, 50).red()
-    assert full.pixelColor(100, 1300).red() > full.pixelColor(100, 1300).blue()
+    assert full.pixelColor(950, 50).blue() > full.pixelColor(950, 50).red()
+    assert full.pixelColor(100, 650).red() > full.pixelColor(100, 650).blue()
     assert hero.read_bytes().startswith(b"\xff\xd8\xff")
 
 
@@ -81,7 +81,12 @@ def test_blender_invocation_is_shell_free_and_outputs_are_validated(tmp_path, mo
             values = dict(zip(args[::2], args[1::2]))
             _image(Path(values["--scene-output"]), EXPECTED_SCENE_SIZE, "#222222")
             _image(Path(values["--panorama-output"]), PANORAMA_SIZE, "#777777")
-            Path(values["--result"]).write_text(json.dumps({"blender_version": "5.0.1"}), encoding="utf-8")
+            Path(values["--result"]).write_text(json.dumps({
+                "blender_version": "5.0.1",
+                "render_device": "GPU",
+                "compute_device_type": "OPTIX",
+                "gpu_devices": ["Test GPU"],
+            }), encoding="utf-8")
 
         def communicate(self, timeout=None):
             return "Blender mock complete", None
@@ -100,9 +105,12 @@ def test_blender_invocation_is_shell_free_and_outputs_are_validated(tmp_path, mo
         "--python-exit-code", "1", str(template),
     ]
     assert captured["kwargs"].get("shell") is None
-    assert result.metadata["scene_width"] == 2048
-    assert result.metadata["panorama_height"] == 1024
-    assert result.metadata["height"] == 1536
+    assert result.metadata["scene_width"] == 1024
+    assert result.metadata["panorama_height"] == 512
+    assert result.metadata["height"] == 768
+    assert result.metadata["render_device"] == "GPU"
+    assert result.metadata["compute_device_type"] == "OPTIX"
+    assert result.metadata["gpu_devices"] == ["Test GPU"]
 
 
 def test_missing_blender_is_nonfatal(tmp_path, monkeypatch) -> None:
@@ -119,6 +127,11 @@ def test_driver_uses_world_001_and_writes_source_equirectangular_directly() -> N
     assert 'bpy.data.worlds.get("World.001")' in source
     assert 'nodes.get("Environment Texture")' in source
     assert "environment.image.save_render" in source
+    assert "actual_size not in {(1024, 256), (2048, 512)}" in source
+    assert "scene.render.resolution_x = 1024" in source
+    assert "scene.render.resolution_y = 256" in source
+    assert 'scene.cycles.device = "GPU"' in source
+    assert 'GPU_BACKENDS = ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL")' in source
     assert 'camera_data.type = "PANO"' not in source
 
 
@@ -133,4 +146,4 @@ def test_real_template_can_render_when_blender_is_available(tmp_path) -> None:
         timeout_seconds=600,
     ))
     assert result.status == "ready", result.diagnostic or result.log
-    assert QImage(str(result.hero_path)).size().width() == 2048
+    assert QImage(str(result.hero_path)).size().width() == 1024

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "asset_type": "stock",
+  "tags": [
+    "alpha", "opaque", "slow-motion", "close-up", "wide", "front", "side",
+    "at-camera", "looping", "isolated", "dark-background",
+    "light-background", "fire", "smoke", "dust", "water", "sparks",
+    "debris", "explosion", "impact", "blood", "glass", "magic",
+    "particles", "lens", "weather", "rain", "snow", "fog", "ground",
+    "wall", "falling", "flying", "rising", "turbulent", "burst", "stream",
+    "splash", "splatter", "shatter", "large-scale", "small-scale", "fast",
+    "slow", "realistic", "stylized"
+  ]
+}

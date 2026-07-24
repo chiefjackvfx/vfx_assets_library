@@ -5,7 +5,7 @@ import re
 import traceback
 from pathlib import Path
 
-from PyQt6.QtCore import QAbstractListModel, QEvent, QModelIndex, QObject, QPoint, QPersistentModelIndex, QRect, QRectF, QRunnable, QSettings, QSize, Qt, QSortFilterProxyModel, QThreadPool, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QAbstractListModel, QEvent, QModelIndex, QObject, QPoint, QPersistentModelIndex, QProcess, QRect, QRectF, QRunnable, QSettings, QSize, Qt, QSortFilterProxyModel, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -67,6 +67,7 @@ from universal_asset_library.library import (
     PolyHavenOptions,
 )
 from universal_asset_library.categories import CategoryCatalog, default_category_catalog
+from universal_asset_library.ai import DEFAULT_MODEL, OllamaClient, load_tag_vocabulary
 from universal_asset_library.integrations.houdini import (
     BridgeResponse,
     HoudiniBridgeClient,
@@ -92,6 +93,11 @@ from universal_asset_library.integrations import (
 )
 from .asset_type_tabs import AssetTypeTabs
 from .category_rail import CategoryRail
+from .ai_classification import (
+    AiGuessWorker,
+    GuessConfirmationDialog,
+    OllamaSetupDialog,
+)
 
 
 ASSET_ROLE = int(Qt.ItemDataRole.UserRole) + 1
@@ -345,6 +351,32 @@ class TagEditor(QFrame):
 
 
 AssetRecord = LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset
+
+
+def _classification_preview(asset: AssetRecord | None) -> Path | None:
+    if isinstance(asset, LibraryStockAsset):
+        candidates = (asset.thumbnail_path,)
+    elif asset is not None:
+        candidates = (asset.hero_path, asset.thumbnail_path)
+    else:
+        candidates = ()
+    return next(
+        (Path(path) for path in candidates if path and Path(path).is_file()),
+        None,
+    )
+
+
+def _merge_ai_tags(
+    existing: tuple[str, ...], suggested: tuple[str, ...]
+) -> tuple[str, ...]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in (*existing, *suggested):
+        tag = str(value).strip()
+        if tag and tag.casefold() not in seen:
+            seen.add(tag.casefold())
+            result.append(tag)
+    return tuple(result)
 
 
 class MaterialEditDialog(QDialog):
@@ -1093,6 +1125,7 @@ class CollapsibleSection(QFrame):
 
 class DetailPanel(QFrame):
     edit_requested = pyqtSignal(object)
+    ai_guess_requested = pyqtSignal(object, str)
     model_convert_requested = pyqtSignal(object)
     model_convert_canceled = pyqtSignal()
     model_rescan_requested = pyqtSignal(object)
@@ -1111,6 +1144,7 @@ class DetailPanel(QFrame):
     def __init__(self) -> None:
         super().__init__()
         self._asset: AssetRecord | None = None
+        self._ai_busy = False
         self._houdini_sessions: list[HoudiniSession] = []
         self._blender_sessions: list[BlenderSession] = []
         self.setObjectName("panel")
@@ -1229,6 +1263,18 @@ class DetailPanel(QFrame):
         self.edit_button = QPushButton("Edit material…")
         self.edit_button.setObjectName("primaryButton")
         self.edit_button.clicked.connect(self._edit)
+        self.guess_category_button = QPushButton("Guess Category")
+        self.guess_category_button.clicked.connect(
+            lambda: self._asset
+            and self.ai_guess_requested.emit(self._asset, "category")
+        )
+        self.guess_tags_button = QPushButton("Guess Tags")
+        self.guess_tags_button.clicked.connect(
+            lambda: self._asset and self.ai_guess_requested.emit(self._asset, "tags")
+        )
+        self.ai_status = QLabel()
+        self.ai_status.setObjectName("mutedLabel")
+        self.ai_status.setWordWrap(True)
         self.view_3d_button = QPushButton("View 3D externally")
         self.view_3d_button.clicked.connect(self._view_3d)
         self.model_convert_button = QPushButton("Convert to USD")
@@ -1372,11 +1418,16 @@ class DetailPanel(QFrame):
         primary_actions = QHBoxLayout()
         primary_actions.setSpacing(6)
         primary_actions.addWidget(self.edit_button)
-        primary_actions.addWidget(self.view_3d_button)
-        primary_actions.addWidget(self.model_convert_button)
-        primary_actions.addWidget(self.model_rescan_button)
-        primary_actions.addWidget(self.hdri_render_button)
+        primary_actions.addWidget(self.guess_category_button)
+        primary_actions.addWidget(self.guess_tags_button)
         primary_actions.addStretch()
+        asset_actions = QHBoxLayout()
+        asset_actions.setSpacing(6)
+        asset_actions.addWidget(self.view_3d_button)
+        asset_actions.addWidget(self.model_convert_button)
+        asset_actions.addWidget(self.model_rescan_button)
+        asset_actions.addWidget(self.hdri_render_button)
+        asset_actions.addStretch()
         path_actions = QHBoxLayout()
         path_actions.setSpacing(6)
         path_actions.addWidget(self.path_button)
@@ -1427,6 +1478,8 @@ class DetailPanel(QFrame):
         layout.addWidget(self.name)
         layout.addWidget(self.description)
         layout.addLayout(primary_actions)
+        layout.addWidget(self.ai_status)
+        layout.addLayout(asset_actions)
         layout.addLayout(path_actions)
         layout.addWidget(self.hdri_cancel_button)
         layout.addWidget(self.hdri_render_status)
@@ -1473,6 +1526,12 @@ class DetailPanel(QFrame):
         self.path_button.setEnabled(False)
         self.reveal_button.setEnabled(False)
         self.edit_button.setEnabled(False)
+        self.guess_category_button.setEnabled(False)
+        self.guess_tags_button.setEnabled(False)
+        self.guess_category_button.hide()
+        self.guess_tags_button.hide()
+        self.ai_status.clear()
+        self.ai_status.hide()
         self.view_3d_button.hide()
         self.model_convert_button.hide()
         self.model_convert_cancel.hide()
@@ -1763,6 +1822,38 @@ class DetailPanel(QFrame):
         self.path_button.setEnabled(True)
         self.reveal_button.setEnabled(True)
         self.edit_button.setEnabled(True)
+        self.guess_category_button.show()
+        self.guess_tags_button.show()
+        self._update_ai_controls()
+
+    def set_ai_busy(self, active: bool, message: str = "") -> None:
+        self._ai_busy = active
+        self._update_ai_controls()
+        self.ai_status.setVisible(bool(message))
+        if message:
+            self.ai_status.setText(message)
+            self.ai_status.setStyleSheet("color:#8792a1;")
+
+    def set_ai_result(self, message: str, success: bool) -> None:
+        self._ai_busy = False
+        self._update_ai_controls()
+        self.ai_status.setText(message)
+        self.ai_status.setStyleSheet(
+            f"color:{'#78c995' if success else '#ef7d7d'};"
+        )
+        self.ai_status.show()
+
+    def _update_ai_controls(self) -> None:
+        preview = _classification_preview(self._asset) if self._asset else None
+        enabled = bool(preview and not self._ai_busy)
+        self.guess_category_button.setEnabled(enabled)
+        self.guess_tags_button.setEnabled(enabled)
+        tooltip = (
+            "Analyze the managed preview with the local Ollama vision model."
+            if preview else "This asset has no readable managed still preview."
+        )
+        self.guess_category_button.setToolTip(tooltip)
+        self.guess_tags_button.setToolTip(tooltip)
 
     def _toggle_technical_details(self, expanded: bool) -> None:
         self.technical_section.set_expanded(expanded)
@@ -2481,6 +2572,9 @@ class AssetsTab(QWidget):
         self._polyhaven_token: CancelToken | None = None
         self._polyhaven_options: PolyHavenOptions | None = None
         self._polyhaven_asset_id = ""
+        self._ai_guess_worker: AiGuessWorker | None = None
+        self._ai_asset_id = ""
+        self._ollama_process: QProcess | None = None
         self._all_assets: list[AssetRecord] = []
         self._category_catalogs = {
             asset_type: default_category_catalog(asset_type)
@@ -2545,6 +2639,7 @@ class AssetsTab(QWidget):
             self.stock_hover_previews.set_suspended
         )
         self.detail.edit_requested.connect(self._edit_material)
+        self.detail.ai_guess_requested.connect(self._guess_asset_metadata)
         self.detail.model_convert_requested.connect(self._convert_model_to_usd)
         self.detail.model_convert_canceled.connect(self._cancel_model_conversion)
         self.detail.model_rescan_requested.connect(self._rescan_model_asset)
@@ -2698,6 +2793,176 @@ class AssetsTab(QWidget):
         self.load_library(self._library_path, selected_id=updated.id)
         self.material_updated.emit(updated)
         return True
+
+    def _guess_asset_metadata(self, asset: AssetRecord, operation: str) -> None:
+        if self._ai_guess_worker is not None:
+            self.detail.set_ai_result(
+                "Another AI classification is already running.", False
+            )
+            return
+        preview = _classification_preview(asset)
+        if preview is None:
+            self.detail.set_ai_result(
+                "This asset has no readable managed still preview.", False
+            )
+            return
+        if not self._ensure_ollama_ready():
+            self.detail.set_ai_result("AI classification was canceled.", False)
+            return
+        try:
+            catalog = self._category_catalogs[asset.asset_type]
+            allowed_tags = (
+                load_tag_vocabulary(asset.asset_type, self._library_path)
+                if operation == "tags" else ()
+            )
+        except Exception as error:
+            self.detail.set_ai_result(str(error), False)
+            return
+        worker = AiGuessWorker(
+            operation,
+            preview,
+            asset.asset_type,
+            asset.name,
+            asset.category,
+            asset.tags,
+            categories=catalog.names,
+            allowed_tags=allowed_tags,
+            model=DEFAULT_MODEL,
+        )
+        self._ai_guess_worker = worker
+        self._ai_asset_id = asset.id
+        worker.signals.finished.connect(self._ai_guess_finished)
+        worker.signals.failed.connect(self._ai_guess_failed)
+        self.detail.set_ai_busy(
+            True,
+            "Guessing category with local AI…"
+            if operation == "category"
+            else "Guessing tags with local AI…",
+        )
+        QThreadPool.globalInstance().start(worker)
+
+    def _ensure_ollama_ready(self) -> bool:
+        status = OllamaClient(timeout=2).status()
+        if status.available and status.has_model(DEFAULT_MODEL):
+            return True
+        dialog = OllamaSetupDialog(self._start_owned_ollama, self, DEFAULT_MODEL)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        ready = OllamaClient(timeout=2).status()
+        if not ready.available or not ready.has_model(DEFAULT_MODEL):
+            QMessageBox.warning(
+                self,
+                "Local AI unavailable",
+                f"Ollama or {DEFAULT_MODEL} is not ready.",
+            )
+            return False
+        return True
+
+    def _start_owned_ollama(self) -> None:
+        if (
+            self._ollama_process is not None
+            and self._ollama_process.state() != QProcess.ProcessState.NotRunning
+        ):
+            return
+        process = QProcess(self)
+        process.setProgram("ollama")
+        process.setArguments(["serve"])
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        process.errorOccurred.connect(
+            lambda _error: QMessageBox.critical(
+                self,
+                "Could not start Ollama",
+                process.errorString() or "The ollama executable could not be started.",
+            )
+        )
+        self._ollama_process = process
+        process.start()
+
+    def _ai_guess_finished(self, operation: str, result) -> None:
+        asset_id = self._ai_asset_id
+        self._ai_guess_worker = None
+        self._ai_asset_id = ""
+        latest = self._asset_by_id(asset_id)
+        if latest is None:
+            self.detail.set_ai_result(
+                "The asset changed or was removed while classification was running.",
+                False,
+            )
+            return
+        preview = _classification_preview(latest)
+        if preview is None:
+            self.detail.set_ai_result(
+                "The asset preview changed while classification was running.", False
+            )
+            return
+        if self.detail._asset and self.detail._asset.id == asset_id:
+            self.detail.set_ai_busy(False, "Review the AI suggestion.")
+        dialog = GuessConfirmationDialog(latest, operation, result, preview, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            if self.detail._asset and self.detail._asset.id == asset_id:
+                self.detail.set_ai_result("No metadata changes were applied.", True)
+            return
+        refreshed = self._asset_by_id(asset_id)
+        if refreshed is None:
+            QMessageBox.warning(
+                self, "Asset unavailable", "The asset was removed before it could be updated."
+            )
+            return
+        if operation == "category":
+            category = result.category
+            tags = refreshed.tags
+        else:
+            category = refreshed.category
+            tags = _merge_ai_tags(refreshed.tags, result.tags)
+        applied = self._save_material_edit(
+            refreshed,
+            AssetMetadataUpdate(
+                name=refreshed.name,
+                category=category,
+                tags=tags,
+                author=refreshed.author,
+                description=refreshed.description,
+                physical_size=refreshed.physical_size,
+            ),
+        )
+        if applied and self.detail._asset and self.detail._asset.id == asset_id:
+            self.detail.set_ai_result(
+                "AI category applied." if operation == "category"
+                else "AI tags added.",
+                True,
+            )
+
+    def _ai_guess_failed(self, message: str) -> None:
+        asset_id = self._ai_asset_id
+        self._ai_guess_worker = None
+        self._ai_asset_id = ""
+        if self.detail._asset and self.detail._asset.id == asset_id:
+            self.detail.set_ai_result(message, False)
+        else:
+            QMessageBox.warning(self, "AI classification failed", message)
+
+    def _asset_by_id(self, asset_id: str) -> AssetRecord | None:
+        if not self._library_path:
+            return None
+        return next(
+            (
+                asset
+                for asset in LibraryRepository(self._library_path).list_assets()
+                if asset.id == asset_id
+            ),
+            None,
+        )
+
+    def shutdown_ai(self) -> None:
+        if self._ai_guess_worker is not None:
+            self._ai_guess_worker.cancel()
+        if (
+            self._ollama_process is not None
+            and self._ollama_process.state() != QProcess.ProcessState.NotRunning
+        ):
+            self._ollama_process.terminate()
+            if not self._ollama_process.waitForFinished(1800):
+                self._ollama_process.kill()
 
     def _show_empty(self, title: str, message: str, show_settings: bool) -> None:
         self.empty_title.setText(title)

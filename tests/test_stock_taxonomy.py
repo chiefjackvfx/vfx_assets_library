@@ -69,6 +69,15 @@ def test_loose_bokeh_and_snow_filenames_receive_useful_classification() -> None:
     assert snow.tags == ("falling", "snow", "weather")
 
 
+def test_promoted_library_aliases_are_bundled_defaults() -> None:
+    taxonomy = default_stock_taxonomy()
+
+    assert classify_stock_path("Fog/Cloud_01.mov", taxonomy).category == "Atmospheres"
+    assert classify_stock_path("Light Leaks/Anamorphic_Flare.mov", taxonomy).category == "Lens"
+    assert classify_stock_path("Smoke/Plume_01.mov", taxonomy).category == "Smoke"
+    assert classify_stock_path("Motion Graphics/Noise_01.mov", taxonomy).category == "Motion Graphics"
+
+
 def test_taxonomy_store_creates_portable_files_and_never_overwrites(tmp_path: Path) -> None:
     store = StockTaxonomyStore(tmp_path)
     taxonomy = store.ensure_defaults()
