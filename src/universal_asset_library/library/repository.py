@@ -10,7 +10,7 @@ import re
 import shutil
 import socket
 from threading import Event
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 from uuid import uuid4
 
 from PyQt6.QtCore import Qt
@@ -47,12 +47,19 @@ from universal_asset_library.importer.models import (
 )
 from universal_asset_library.importer.adapters import normalize_channel
 from universal_asset_library.importer.stock_taxonomy import StockTaxonomyStore, classify_stock_path
-from universal_asset_library.categories import CategoryConfigStore
+from universal_asset_library.categories import CategoryCatalog, CategoryConfigStore
 from universal_asset_library.previews import (
+    BlenderPreviewSession,
     HdriPreviewRequest,
     HdriPreviewResult,
+    TexturePreviewMap,
+    TexturePreviewRequest,
+    TexturePreviewResult,
     render_hdri_preview,
+    render_texture_preview,
     select_hdri_variant,
+    select_texture_maps,
+    select_texture_variant,
     generate_midpoint_thumbnail,
     generate_stock_preview,
     resolve_ffmpeg,
@@ -92,6 +99,9 @@ LAYOUT_VERSION = 2
 MODEL_LAYOUT_VERSION = 6
 STOCK_LAYOUT_VERSION = 2
 SPACE_CUSHION = 64 * 1024 * 1024
+AssetRecord = (
+    LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset
+)
 
 
 class LibraryError(RuntimeError):
@@ -130,6 +140,12 @@ class ImportSummary:
 class HdriPreviewUpdate:
     asset: LibraryHdriAsset
     render: HdriPreviewResult
+
+
+@dataclass(frozen=True, slots=True)
+class TexturePreviewUpdate:
+    asset: LibraryTextureAsset
+    render: TexturePreviewResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +204,23 @@ class AssetMetadataUpdate:
     physical_size: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class AssetMetadataPatch:
+    """Narrow metadata changes that preserve fields not named by the patch."""
+
+    category: str | None = None
+    add_tags: tuple[str, ...] = ()
+    rating: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataPatchOutcome:
+    """An updated asset together with its exact published manifest path."""
+
+    asset: AssetRecord
+    manifest_path: Path
+
+
 class CancelToken:
     def __init__(self) -> None:
         self._event = Event()
@@ -212,6 +245,9 @@ class LibraryRepository:
         blender_path: str = "",
         render_hdri_previews: bool = True,
         hdri_template_path: str | Path | None = None,
+        render_texture_previews: bool = True,
+        texture_template_path: str | Path | None = None,
+        save_texture_preview_blend: bool = False,
         ffmpeg_path: str = "",
     ) -> None:
         self.root = Path(root).expanduser().absolute()
@@ -219,6 +255,11 @@ class LibraryRepository:
         self.blender_path = blender_path
         self.render_hdri_previews = render_hdri_previews
         self.hdri_template_path = Path(hdri_template_path) if hdri_template_path else None
+        self.render_texture_previews = render_texture_previews
+        self.texture_template_path = (
+            Path(texture_template_path) if texture_template_path else None
+        )
+        self.save_texture_preview_blend = bool(save_texture_preview_blend)
         self.ffmpeg_path = ffmpeg_path
 
     def initialize(self) -> None:
@@ -242,39 +283,74 @@ class LibraryRepository:
             })
         CategoryConfigStore(self.root).ensure_defaults()
 
-    def list_assets(self) -> list[LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset]:
+    def list_assets(
+        self, asset_type: str | None = None
+    ) -> list[LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset]:
         self.last_warnings = []
         assets: list[LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset] = []
-        manifests = _asset_manifest_paths(self.root)
+        manifests = (
+            _asset_manifest_paths_for_type(self.root, asset_type)
+            if asset_type is not None
+            else _asset_manifest_paths(self.root)
+        )
         for manifest_path in sorted(manifests, key=lambda path: str(path).casefold()):
             try:
                 document = json.loads(manifest_path.read_text(encoding="utf-8"))
-                assets.append(_asset_from_manifest(document, manifest_path.parent))
+                asset = _asset_from_manifest(document, manifest_path.parent)
+                if asset_type is None or asset.asset_type == asset_type:
+                    assets.append(asset)
+                else:
+                    self.last_warnings.append(
+                        f"Could not load {manifest_path}: manifest type "
+                        f"{asset.asset_type!r} does not match {asset_type!r}"
+                    )
             except (OSError, ValueError, TypeError, json.JSONDecodeError, KeyError) as error:
                 self.last_warnings.append(f"Could not load {manifest_path}: {error}")
         assets.sort(key=lambda asset: asset.name.casefold())
         return assets
 
+    def list_assets_for_type(
+        self, asset_type: str
+    ) -> list[LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset]:
+        """Scan only the canonical container for one asset type."""
+        return self.list_assets(asset_type)
+
+    def manifest_paths_for_type(self, asset_type: str) -> list[Path]:
+        """Discover manifests only inside one canonical asset container."""
+        return _asset_manifest_paths_for_type(self.root, asset_type)
+
+    def load_asset_manifest(
+        self, manifest_path: str | Path, *, expected_type: str | None = None
+    ) -> LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset:
+        path = Path(manifest_path).absolute()
+        document = json.loads(path.read_text(encoding="utf-8"))
+        asset = _asset_from_manifest(document, path.parent)
+        if expected_type is not None and asset.asset_type != expected_type:
+            raise ValueError(
+                f"Manifest type {asset.asset_type!r} does not match {expected_type!r}"
+            )
+        return asset
+
     def list_texture_assets(self) -> list[LibraryTextureAsset]:
         return [
-            asset for asset in self.list_assets()
+            asset for asset in self.list_assets_for_type("texture_set")
             if isinstance(asset, LibraryTextureAsset) and asset.asset_type == "texture_set"
         ]
 
     def list_atlas_assets(self) -> list[LibraryTextureAsset]:
         return [
-            asset for asset in self.list_assets()
+            asset for asset in self.list_assets_for_type("atlas")
             if isinstance(asset, LibraryTextureAsset) and asset.asset_type == "atlas"
         ]
 
     def list_hdri_assets(self) -> list[LibraryHdriAsset]:
-        return [asset for asset in self.list_assets() if isinstance(asset, LibraryHdriAsset)]
+        return [asset for asset in self.list_assets_for_type("hdri") if isinstance(asset, LibraryHdriAsset)]
 
     def list_model_assets(self) -> list[LibraryModelAsset]:
-        return [asset for asset in self.list_assets() if isinstance(asset, LibraryModelAsset)]
+        return [asset for asset in self.list_assets_for_type("model") if isinstance(asset, LibraryModelAsset)]
 
     def list_stock_assets(self) -> list[LibraryStockAsset]:
-        return [asset for asset in self.list_assets() if isinstance(asset, LibraryStockAsset)]
+        return [asset for asset in self.list_assets_for_type("stock") if isinstance(asset, LibraryStockAsset)]
 
     def classify_uncategorized_stock(
         self,
@@ -319,7 +395,7 @@ class LibraryRepository:
                     ):
                         updated = self._update_flat_stock_metadata(
                             manifest_path, document, original_document
-                        )
+                        ).asset
                     else:
                         _asset_from_manifest(document, manifest_path.parent)
                         _atomic_json(manifest_path, document)
@@ -337,93 +413,124 @@ class LibraryRepository:
 
     def update_asset_metadata(
         self, asset_id: str, update: AssetMetadataUpdate
-    ) -> LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset:
+    ) -> AssetRecord:
+        self.initialize()
+        with _ImportLock(self.root / ".ual" / "import.lock"):
+            return self._update_asset_metadata_locked(asset_id, update).asset
+
+    def patch_asset_metadata(
+        self, asset_id: str, patch: AssetMetadataPatch
+    ) -> AssetRecord:
+        """Apply narrow metadata changes against the latest manifest."""
+        with self.metadata_patch_batch((asset_id,)) as batch:
+            return batch.patch(asset_id, patch).asset
+
+    def metadata_patch_batch(
+        self,
+        asset_ids: Iterable[str],
+        manifest_hints: Mapping[str, str | Path] | None = None,
+        cancel_token: CancelToken | None = None,
+    ) -> MetadataPatchBatch:
+        """Create one locked, indexed session for a sequence of metadata patches."""
+        return MetadataPatchBatch(
+            self,
+            tuple(dict.fromkeys(str(asset_id) for asset_id in asset_ids)),
+            manifest_hints or {},
+            cancel_token or CancelToken(),
+        )
+
+    def _update_asset_metadata_locked(
+        self,
+        asset_id: str,
+        update: AssetMetadataUpdate,
+        *,
+        manifest: tuple[Path, dict] | None = None,
+        category_catalog: CategoryCatalog | None = None,
+    ) -> MetadataPatchOutcome:
         name = update.name.strip()
         category = re.sub(r"\s+", " ", update.category.strip())
         if not name:
             raise LibraryError("Material name is required.")
         if not category:
             raise LibraryError("Material category is required.")
-        self.initialize()
-        with _ImportLock(self.root / ".ual" / "import.lock"):
-            manifest_path, document = self._manifest_by_id(asset_id)
-            asset_type = str(document.get("type", "texture_set"))
-            catalog = CategoryConfigStore(self.root).load(asset_type)
-            canonical_category = catalog.canonical_name(category)
-            if canonical_category is None:
-                raise LibraryError(
-                    f"Category {category!r} is not defined in {catalog.asset_type} categories."
-                )
-            category = canonical_category
-            original_document = json.loads(json.dumps(document))
-            source_dir = manifest_path.parent
-            document["name"] = name
-            document["slug"] = _slugify(name)
-            document["category"] = category
-            document.pop("categories", None)
-            document["tags"] = list(_clean_tags(update.tags))
-            document["author"] = update.author.strip()
-            document["description"] = update.description.strip()
-            document["physical_size"] = update.physical_size.strip()
-            document["updated_at"] = _utc_now()
-            if (
-                document.get("type") == "stock"
-                and int(document.get("layout_version", 1)) >= STOCK_LAYOUT_VERSION
-                and manifest_path.name != "asset.json"
-            ):
-                return self._update_flat_stock_metadata(
-                    manifest_path, document, original_document
-                )
-            container = _asset_container(str(document.get("type", "")))
-            target_parent = self.root / container / _slugify(category)
-            destination = source_dir
-            if source_dir.parent.resolve() != target_parent.resolve():
-                target_parent.mkdir(parents=True, exist_ok=True)
-                destination = _unique_asset_destination(target_parent, source_dir.name)
+        manifest_path, document = manifest or self._manifest_by_id(asset_id)
+        asset_type = str(document.get("type", "texture_set"))
+        catalog = category_catalog or CategoryConfigStore(self.root).load(asset_type)
+        canonical_category = catalog.canonical_name(category)
+        if canonical_category is None:
+            raise LibraryError(
+                f"Category {category!r} is not defined in {catalog.asset_type} categories."
+            )
+        category = canonical_category
+        original_document = json.loads(json.dumps(document))
+        source_dir = manifest_path.parent
+        document["name"] = name
+        document["slug"] = _slugify(name)
+        document["category"] = category
+        document.pop("categories", None)
+        document["tags"] = list(_clean_tags(update.tags))
+        document["author"] = update.author.strip()
+        document["description"] = update.description.strip()
+        document["physical_size"] = update.physical_size.strip()
+        document["updated_at"] = _utc_now()
+        if (
+            document.get("type") == "stock"
+            and int(document.get("layout_version", 1)) >= STOCK_LAYOUT_VERSION
+            and manifest_path.name != "asset.json"
+        ):
+            return self._update_flat_stock_metadata(
+                manifest_path, document, original_document
+            )
+        container = _asset_container(str(document.get("type", "")))
+        target_parent = self.root / container / _slugify(category)
+        destination = source_dir
+        if source_dir.parent.resolve() != target_parent.resolve():
+            target_parent.mkdir(parents=True, exist_ok=True)
+            destination = _unique_asset_destination(target_parent, source_dir.name)
 
-            # Validate while the payload is still at its original location.
-            # Every payload path is asset-relative and remains valid after the
-            # complete directory is moved.
-            updated = _asset_from_manifest(document, source_dir)
-            if destination == source_dir:
-                _atomic_json(manifest_path, document)
-                return updated
+        # Validate while the payload is still at its original location.
+        # Every payload path is asset-relative and remains valid after the
+        # complete directory is moved.
+        updated = _asset_from_manifest(document, source_dir)
+        if destination == source_dir:
+            _atomic_json(manifest_path, document)
+            return MetadataPatchOutcome(updated, manifest_path)
 
-            moved = False
-            try:
-                os.replace(source_dir, destination)
-                moved = True
-                _sync_directory(source_dir.parent)
-                _sync_directory(destination.parent)
-                _atomic_json(destination / "asset.json", document)
-                updated = _asset_from_manifest(document, destination)
-            except Exception as error:
-                if moved and destination.exists():
-                    try:
-                        # Restore the old sidecar before returning the directory
-                        # to its original category, even if publication failed
-                        # after the new sidecar had already been installed.
-                        _atomic_json(destination / "asset.json", original_document)
-                        os.replace(destination, source_dir)
-                        _sync_directory(source_dir.parent)
-                        _sync_directory(destination.parent)
-                    except Exception as rollback_error:
-                        raise LibraryError(
-                            "The category move failed and could not be rolled back: "
-                            f"{rollback_error}"
-                        ) from error
-                raise
-            container_root = self.root / container
-            if source_dir.parent != container_root:
+        moved = False
+        try:
+            os.replace(source_dir, destination)
+            moved = True
+            _sync_directory(source_dir.parent)
+            _sync_directory(destination.parent)
+            _atomic_json(destination / "asset.json", document)
+            updated = _asset_from_manifest(document, destination)
+        except Exception as error:
+            if moved and destination.exists():
                 try:
-                    source_dir.parent.rmdir()
-                except OSError:
-                    pass
-            return updated
+                    # Restore the old sidecar before returning the directory
+                    # to its original category, even if publication failed
+                    # after the new sidecar had already been installed.
+                    _atomic_json(destination / "asset.json", original_document)
+                    os.replace(destination, source_dir)
+                    _sync_directory(source_dir.parent)
+                    _sync_directory(destination.parent)
+                except Exception as rollback_error:
+                    raise LibraryError(
+                        "The category move failed and could not be rolled back: "
+                        f"{rollback_error}"
+                    ) from error
+            raise
+        container_root = self.root / container
+        if source_dir.parent != container_root:
+            try:
+                source_dir.parent.rmdir()
+            except OSError:
+                pass
+        return MetadataPatchOutcome(updated, destination / "asset.json")
 
     def _update_flat_stock_metadata(
         self, manifest_path: Path, document: dict, original_document: dict
-    ) -> LibraryStockAsset:
+    ) -> MetadataPatchOutcome:
         source_parent = manifest_path.parent
         category = str(document["category"])
         target_parent = self.root / "stock" / _slugify(category)
@@ -447,7 +554,7 @@ class LibraryRepository:
             updated = _asset_from_manifest(document, source_parent)
             if not isinstance(updated, LibraryStockAsset):
                 raise LibraryError("Updated manifest did not produce a Stock asset.")
-            return updated
+            return MetadataPatchOutcome(updated, manifest_path)
 
         required = sum(
             (source_parent / relative).stat().st_size for relative in old_relatives
@@ -542,7 +649,7 @@ class LibraryRepository:
                     source_parent.rmdir()
                 except OSError:
                     pass
-            return result
+            return MetadataPatchOutcome(result, target_parent / new_manifest_name)
         except Exception:
             for path in reversed(published):
                 path.unlink(missing_ok=True)
@@ -713,12 +820,201 @@ class LibraryRepository:
             if stage.exists():
                 shutil.rmtree(stage, ignore_errors=True)
 
+    def render_texture_preview(
+        self,
+        asset_id: str,
+        *,
+        progress: Callable[[str], None] | None = None,
+        cancel_token: CancelToken | None = None,
+        preview_session: BlenderPreviewSession | None = None,
+    ) -> TexturePreviewUpdate:
+        """Render outside the library lock and atomically publish a texture preview."""
+        self.initialize()
+        token = cancel_token or CancelToken()
+        manifest_path, original = self._manifest_by_id(asset_id)
+        asset = _asset_from_manifest(original, manifest_path.parent)
+        if not isinstance(asset, LibraryTextureAsset) or asset.asset_type != "texture_set":
+            raise LibraryError(
+                "Shader preview rendering is only available for texture-set assets."
+            )
+        selected = select_texture_variant(asset.resolutions)
+        if not selected:
+            raise LibraryError("The texture asset has no renderable resolution.")
+        resolution, variant = selected
+        selected_maps = select_texture_maps(variant)
+        if "Base Color" not in selected_maps:
+            raise LibraryError(
+                "The selected texture resolution has no Base Color map."
+            )
+        preview_maps = tuple(
+            TexturePreviewMap(
+                channel=channel,
+                path=asset.asset_dir / record.path,
+                source_relative=record.path,
+                sha256=record.sha256,
+                color_space=record.color_space,
+                normal_convention=record.normal_convention,
+                packed_channels=dict(record.packed_channels),
+            )
+            for channel, record in selected_maps.items()
+        )
+        manifest_stamp = str(original.get("updated_at", ""))
+        manifest_fingerprint = str(original.get("fingerprint", ""))
+        render_stage = (
+            self.root / ".ual" / "staging" / f"texture-preview-{uuid4()}"
+        )
+        request = TexturePreviewRequest(
+            output_dir=render_stage,
+            asset_name=asset.name,
+            resolution=resolution,
+            maps=preview_maps,
+            blender_path=self.blender_path,
+            template_path=self.texture_template_path,
+            save_blend_file=self.save_texture_preview_blend,
+        )
+        try:
+            result = render_texture_preview(
+                request,
+                progress=progress,
+                cancel_token=token,
+                session=preview_session,
+            )
+            if (
+                result.status != "ready"
+                or not result.thumbnail_path
+                or not result.hero_path
+            ):
+                return TexturePreviewUpdate(
+                    self._record_texture_render_status(asset_id, result.metadata),
+                    result,
+                )
+            token.check()
+            with _ImportLock(self.root / ".ual" / "import.lock"):
+                current_path, current = self._manifest_by_id(asset_id)
+                if (
+                    current_path != manifest_path
+                    or str(current.get("updated_at", "")) != manifest_stamp
+                    or str(current.get("fingerprint", "")) != manifest_fingerprint
+                ):
+                    raise StaleSourceError(
+                        "The texture manifest changed while its preview was rendering; "
+                        "the result was not published."
+                    )
+                current_asset = _asset_from_manifest(current, current_path.parent)
+                if (
+                    not isinstance(current_asset, LibraryTextureAsset)
+                    or current_asset.asset_type != "texture_set"
+                ):
+                    raise LibraryError("The asset is no longer a texture set.")
+                current_variant = current_asset.resolutions.get(resolution)
+                if current_variant is None:
+                    raise StaleSourceError(
+                        "The selected texture resolution is no longer available."
+                    )
+                for preview_map in preview_maps:
+                    current_record = next(
+                        (
+                            item
+                            for item in current_variant.maps.get(
+                                preview_map.channel, ()
+                            )
+                            if item.path == preview_map.source_relative
+                        ),
+                        None,
+                    )
+                    if (
+                        current_record is None
+                        or current_record.sha256 != preview_map.sha256
+                        or preview_map.sha256
+                        and _sha256_path(preview_map.path) != preview_map.sha256
+                    ):
+                        raise StaleSourceError(
+                            f"The selected {preview_map.channel} map changed while "
+                            "its preview was rendering; regenerate from the current file."
+                        )
+                preview_dir = current_asset.asset_dir / "previews"
+                preview_dir.mkdir(parents=True, exist_ok=True)
+                hero_target = preview_dir / result.hero_path.name
+                thumb_target = preview_dir / result.thumbnail_path.name
+                blend_target = (
+                    preview_dir / result.blend_path.name
+                    if result.blend_path is not None
+                    else None
+                )
+                rollback: dict[Path, Path | None] = {}
+                for index, target in enumerate(
+                    dict.fromkeys(
+                        target
+                        for target in (
+                            hero_target,
+                            thumb_target,
+                            blend_target,
+                        )
+                        if target is not None
+                    )
+                ):
+                    if target.exists():
+                        backup = (
+                            render_stage
+                            / f"published-backup-{index}{target.suffix}"
+                        )
+                        shutil.copyfile(target, backup)
+                        rollback[target] = backup
+                    else:
+                        rollback[target] = None
+                try:
+                    _publish_preview_files(
+                        result.hero_path,
+                        hero_target,
+                        result.thumbnail_path,
+                        thumb_target,
+                    )
+                    if result.blend_path is not None and blend_target is not None:
+                        os.replace(result.blend_path, blend_target)
+                        result.blend_path = blend_target
+                        result.metadata["debug_blend"] = (
+                            blend_target.relative_to(
+                                current_asset.asset_dir
+                            ).as_posix()
+                        )
+                    previews = current.setdefault("previews", {})
+                    previews["hero"] = hero_target.relative_to(
+                        current_asset.asset_dir
+                    ).as_posix()
+                    previews["thumbnail"] = thumb_target.relative_to(
+                        current_asset.asset_dir
+                    ).as_posix()
+                    previews["render"] = result.metadata
+                    current["updated_at"] = _utc_now()
+                    _asset_from_manifest(current, current_asset.asset_dir)
+                    _atomic_json(current_path, current)
+                except Exception:
+                    for target, backup in rollback.items():
+                        if backup is None:
+                            target.unlink(missing_ok=True)
+                        else:
+                            os.replace(backup, target)
+                    _sync_directory(preview_dir)
+                    raise
+                result.hero_path = hero_target
+                result.thumbnail_path = thumb_target
+                updated = _asset_from_manifest(current, current_asset.asset_dir)
+                if not isinstance(updated, LibraryTextureAsset):
+                    raise LibraryError(
+                        "The rendered manifest did not produce a texture asset."
+                    )
+                return TexturePreviewUpdate(updated, result)
+        finally:
+            if render_stage.exists():
+                shutil.rmtree(render_stage, ignore_errors=True)
+
     def render_hdri_preview(
         self,
         asset_id: str,
         *,
         progress: Callable[[str], None] | None = None,
         cancel_token: CancelToken | None = None,
+        preview_session: BlenderPreviewSession | None = None,
     ) -> HdriPreviewUpdate:
         """Render outside the library lock, then publish only if the manifest and source stayed unchanged."""
         self.initialize()
@@ -750,7 +1046,12 @@ class LibraryRepository:
             template_path=self.hdri_template_path,
         )
         try:
-            result = render_hdri_preview(request, progress=progress, cancel_token=token)
+            result = render_hdri_preview(
+                request,
+                progress=progress,
+                cancel_token=token,
+                session=preview_session,
+            )
             if result.status != "ready" or not result.thumbnail_path or not result.hero_path:
                 return HdriPreviewUpdate(self._record_hdri_render_status(asset_id, result.metadata), result)
             token.check()
@@ -1229,6 +1530,27 @@ class LibraryRepository:
             document["updated_at"] = _utc_now()
             _atomic_json(manifest_path, document)
             return _asset_from_manifest(document, manifest_path.parent)
+
+    def _record_texture_render_status(
+        self, asset_id: str, metadata: dict
+    ) -> LibraryTextureAsset:
+        with _ImportLock(self.root / ".ual" / "import.lock"):
+            manifest_path, document = self._manifest_by_id(asset_id)
+            asset = _asset_from_manifest(document, manifest_path.parent)
+            if (
+                not isinstance(asset, LibraryTextureAsset)
+                or asset.asset_type != "texture_set"
+            ):
+                raise LibraryError("The asset is no longer a texture set.")
+            document.setdefault("previews", {})["render"] = dict(metadata)
+            document["updated_at"] = _utc_now()
+            _atomic_json(manifest_path, document)
+            updated = _asset_from_manifest(document, manifest_path.parent)
+            if not isinstance(updated, LibraryTextureAsset):
+                raise LibraryError(
+                    "The updated manifest did not produce a texture asset."
+                )
+            return updated
 
     def _manifest_by_id(self, asset_id: str) -> tuple[Path, dict]:
         paths = _asset_manifest_paths(self.root)
@@ -2211,7 +2533,10 @@ class LibraryRepository:
             raise LibraryError("The library does not have enough free space for this import.")
         completed_bytes = 0
 
-        with _ImportLock(self.root / ".ual" / "import.lock"):
+        with (
+            BlenderPreviewSession(self.blender_path) as preview_session,
+            _ImportLock(self.root / ".ual" / "import.lock"),
+        ):
             existing = self.list_assets()
             provider_keys = {
                 (asset.asset_type, asset.provider.casefold(), asset.provider_id)
@@ -2235,7 +2560,14 @@ class LibraryRepository:
                     continue
                 try:
                     asset, used_bytes = self._import_one(
-                        material, completed_bytes, total_bytes, progress, token, fingerprints, preflight_item
+                        material,
+                        completed_bytes,
+                        total_bytes,
+                        progress,
+                        token,
+                        fingerprints,
+                        preflight_item,
+                        preview_session,
                     )
                 except ImportCancelled:
                     summary.canceled = True
@@ -2251,7 +2583,41 @@ class LibraryRepository:
                 fingerprints.add(asset.fingerprint)
                 if asset.provider_id:
                     provider_keys.add((asset.asset_type, asset.provider.casefold(), asset.provider_id))
+        self._cache_assets_best_effort(summary.imported)
         return summary
+
+    def _cache_assets_best_effort(
+        self,
+        assets: Iterable[
+            LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset
+        ],
+    ) -> None:
+        """Publish managed mutations to the disposable index without risking library writes."""
+        try:
+            from .catalog import CatalogIndex, CatalogRecord
+
+            index = CatalogIndex.for_library(self.root)
+            for asset in assets:
+                manifest = asset.asset_dir / "asset.json"
+                if not manifest.is_file():
+                    # Legacy flat Stock assets keep their manifest beside the
+                    # payload. They are uncommon and safe to discover here
+                    # because this runs only after a ShotBox mutation.
+                    manifest = next(
+                        (
+                            path
+                            for path in _stock_manifest_paths(self.root)
+                            if json.loads(path.read_text(encoding="utf-8-sig")).get("id")
+                            == asset.id
+                        ),
+                        manifest,
+                    )
+                if manifest.is_file():
+                    index.upsert(CatalogRecord.from_manifest(asset, manifest))
+        except Exception:
+            # Cache acceleration must never make an authoritative library
+            # mutation fail.
+            return
 
     def import_assets(self, assets: Iterable[MaterialCandidate], **kwargs) -> ImportSummary:
         """Type-neutral entry point; import_materials remains for compatibility."""
@@ -2281,6 +2647,7 @@ class LibraryRepository:
         token: CancelToken,
         existing_fingerprints: set[str],
         preflight: MaterialPreflight,
+        preview_session: BlenderPreviewSession | None = None,
     ) -> tuple[LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | None, int]:
         if isinstance(material, StockCandidate):
             return self._import_one_stock(
@@ -2295,7 +2662,7 @@ class LibraryRepository:
         if isinstance(material, HdriCandidate):
             return self._import_one_hdri(
                 material, completed_before, total_bytes, progress, token,
-                existing_fingerprints, preflight,
+                existing_fingerprints, preflight, preview_session,
             )
         asset_id = str(uuid4())
         _validate_archive_source(material, preflight.archive_sha256)
@@ -2401,6 +2768,224 @@ class LibraryRepository:
                 preview_original_paths[role] = relative_source
                 preview_sources[relative_source] = stored
 
+            texture_render: TexturePreviewResult | None = None
+            if material.asset_type == "texture_set":
+                selected_variant = select_texture_variant(manifest_resolutions)
+                selected_label = selected_variant[0] if selected_variant else ""
+                selected_maps = (
+                    select_texture_maps(selected_variant[1])
+                    if selected_variant
+                    else {}
+                )
+                request_maps = tuple(
+                    TexturePreviewMap(
+                        channel=channel,
+                        path=stage / str(record["path"]),
+                        source_relative=str(record["path"]),
+                        sha256=str(record.get("sha256", "")),
+                        color_space=str(record.get("color_space", "")),
+                        normal_convention=str(
+                            record.get("normal_convention", "")
+                        ),
+                        packed_channels=dict(
+                            record.get("packed_channels", {})
+                        ),
+                    )
+                    for channel, record in selected_maps.items()
+                )
+                has_source_preview = any(
+                    not preview.fallback
+                    for preview in material.previews
+                )
+                if has_source_preview:
+                    texture_render = TexturePreviewResult(
+                        "source",
+                        resolution=selected_label,
+                        sources={
+                            item.channel: item.source_relative
+                            for item in request_maps
+                        },
+                        diagnostic=(
+                            "A source preview was found; automatic Blender "
+                            "rendering was skipped."
+                        ),
+                        metadata={
+                            "type": "texture_shader",
+                            "status": "source",
+                            "resolution": selected_label,
+                            "sources": {
+                                item.channel: item.source_relative
+                                for item in request_maps
+                            },
+                            "generated_at": "",
+                            "blender_version": "",
+                            "template_sha256": "",
+                            "diagnostic": (
+                                "A source preview was found; automatic Blender "
+                                "rendering was skipped."
+                            ),
+                        },
+                    )
+                elif "Base Color" not in selected_maps:
+                    texture_render = TexturePreviewResult(
+                        "unsupported",
+                        resolution=selected_label,
+                        sources={
+                            item.channel: item.source_relative
+                            for item in request_maps
+                        },
+                        diagnostic=(
+                            "The selected texture resolution has no Base Color map."
+                        ),
+                        metadata={
+                            "type": "texture_shader",
+                            "status": "unsupported",
+                            "resolution": selected_label,
+                            "sources": {
+                                item.channel: item.source_relative
+                                for item in request_maps
+                            },
+                            "generated_at": "",
+                            "blender_version": "",
+                            "template_sha256": "",
+                            "diagnostic": (
+                                "The selected texture resolution has no Base Color map."
+                            ),
+                        },
+                    )
+                elif not self.render_texture_previews:
+                    texture_render = TexturePreviewResult(
+                        "pending",
+                        resolution=selected_label,
+                        sources={
+                            item.channel: item.source_relative
+                            for item in request_maps
+                        },
+                        diagnostic=(
+                            "Automatic texture preview rendering is disabled."
+                        ),
+                        metadata={
+                            "type": "texture_shader",
+                            "status": "pending",
+                            "resolution": selected_label,
+                            "sources": {
+                                item.channel: item.source_relative
+                                for item in request_maps
+                            },
+                            "generated_at": "",
+                            "blender_version": "",
+                            "template_sha256": "",
+                            "diagnostic": (
+                                "Automatic texture preview rendering is disabled."
+                            ),
+                        },
+                    )
+                else:
+                    render_stage = stage / ".texture-preview-render"
+                    request = TexturePreviewRequest(
+                        output_dir=render_stage,
+                        asset_name=material.name,
+                        resolution=selected_label,
+                        maps=request_maps,
+                        blender_path=self.blender_path,
+                        template_path=self.texture_template_path,
+                        save_blend_file=self.save_texture_preview_blend,
+                    )
+                    try:
+                        texture_render = render_texture_preview(
+                            request,
+                            progress=(
+                                lambda phase: progress(
+                                    ImportProgress(
+                                        material.name,
+                                        phase,
+                                        completed_before + copied_bytes,
+                                        total_bytes,
+                                    )
+                                )
+                            )
+                            if progress
+                            else None,
+                            cancel_token=token,
+                            session=preview_session,
+                        )
+                        if (
+                            texture_render.status == "ready"
+                            and texture_render.hero_path
+                            and texture_render.thumbnail_path
+                        ):
+                            preview_dir = stage / "previews"
+                            preview_dir.mkdir(parents=True, exist_ok=True)
+                            hero = preview_dir / texture_render.hero_path.name
+                            same_image = (
+                                texture_render.thumbnail_path
+                                == texture_render.hero_path
+                            )
+                            os.replace(texture_render.hero_path, hero)
+                            thumbnail = (
+                                hero
+                                if same_image
+                                else preview_dir
+                                / texture_render.thumbnail_path.name
+                            )
+                            if not same_image:
+                                os.replace(
+                                    texture_render.thumbnail_path, thumbnail
+                                )
+                            if texture_render.blend_path is not None:
+                                debug_blend = (
+                                    preview_dir
+                                    / texture_render.blend_path.name
+                                )
+                                os.replace(
+                                    texture_render.blend_path, debug_blend
+                                )
+                                texture_render.blend_path = debug_blend
+                                texture_render.metadata["debug_blend"] = (
+                                    debug_blend.relative_to(stage).as_posix()
+                                )
+                            texture_render.hero_path = hero
+                            texture_render.thumbnail_path = thumbnail
+                            preview_manifest["hero"] = hero.relative_to(
+                                stage
+                            ).as_posix()
+                            preview_manifest["thumbnail"] = thumbnail.relative_to(
+                                stage
+                            ).as_posix()
+                    except Exception as error:
+                        texture_render = TexturePreviewResult(
+                            "failed",
+                            resolution=selected_label,
+                            sources={
+                                item.channel: item.source_relative
+                                for item in request_maps
+                            },
+                            diagnostic=(
+                                f"Texture preview rendering failed: {error}"
+                            ),
+                            metadata={
+                                "type": "texture_shader",
+                                "status": "failed",
+                                "resolution": selected_label,
+                                "sources": {
+                                    item.channel: item.source_relative
+                                    for item in request_maps
+                                },
+                                "generated_at": _utc_now(),
+                                "blender_version": "",
+                                "template_sha256": "",
+                                "diagnostic": (
+                                    f"Texture preview rendering failed: {error}"
+                                ),
+                            },
+                        )
+                    finally:
+                        if render_stage.exists():
+                            shutil.rmtree(render_stage, ignore_errors=True)
+                    if texture_render.status == "canceled":
+                        token.cancel()
+                        token.check()
+
             metadata_manifest: list[str] = []
             metadata_original_paths: dict[str, str] = {}
             for relative_source in material.metadata_paths:
@@ -2437,8 +3022,27 @@ class LibraryRepository:
                 })
 
             now = _utc_now()
+            previews_manifest: dict = dict(preview_manifest)
+            if material.asset_type == "texture_set":
+                previews_manifest["render"] = (
+                    texture_render.metadata
+                    if texture_render
+                    else {
+                        "type": "texture_shader",
+                        "status": "unsupported",
+                        "resolution": "",
+                        "sources": {},
+                        "generated_at": "",
+                        "blender_version": "",
+                        "template_sha256": "",
+                        "diagnostic": (
+                            "No local texture resolution was available for preview rendering."
+                        ),
+                    }
+                )
             manifest = {
                 "schema_version": SCHEMA_VERSION,
+                "rating": 0,
                 "naming_version": NAMING_VERSION,
                 "id": asset_id,
                 "type": material.asset_type if material.asset_type == "atlas" else "texture_set",
@@ -2454,7 +3058,7 @@ class LibraryRepository:
                 "updated_at": now,
                 "source": _source_manifest(material, preflight.archive_sha256),
                 "resolutions": manifest_resolutions,
-                "previews": preview_manifest,
+                "previews": previews_manifest,
                 "preview_original_paths": preview_original_paths,
                 "source_metadata": metadata_manifest,
                 "source_metadata_original_paths": metadata_original_paths,
@@ -2575,6 +3179,7 @@ class LibraryRepository:
             info = material.media_info
             manifest = {
                 "schema_version": SCHEMA_VERSION,
+                "rating": 0,
                 "naming_version": NAMING_VERSION,
                 "layout_version": STOCK_LAYOUT_VERSION,
                 "id": asset_id,
@@ -2653,6 +3258,7 @@ class LibraryRepository:
         token: CancelToken,
         existing_fingerprints: set[str],
         preflight: MaterialPreflight,
+        preview_session: BlenderPreviewSession | None = None,
     ) -> tuple[LibraryHdriAsset | None, int]:
         asset_id = str(uuid4())
         stage = self.root / ".ual" / "staging" / asset_id
@@ -2759,6 +3365,7 @@ class LibraryRepository:
                                     material.name, phase, completed_before + copied_bytes, total_bytes,
                                 ))) if progress else None,
                                 cancel_token=token,
+                                session=preview_session,
                             )
                             if render_result.status == "ready" and render_result.hero_path and render_result.thumbnail_path:
                                 preview_dir = stage / "previews"
@@ -2842,6 +3449,7 @@ class LibraryRepository:
             now = _utc_now()
             manifest = {
                 "schema_version": SCHEMA_VERSION,
+                "rating": 0,
                 "naming_version": NAMING_VERSION,
                 "layout_version": LAYOUT_VERSION,
                 "id": asset_id,
@@ -3007,6 +3615,7 @@ class LibraryRepository:
             (stage / "usd").mkdir(parents=True, exist_ok=True)
             manifest = {
                 "schema_version": SCHEMA_VERSION,
+                "rating": 0,
                 "naming_version": NAMING_VERSION,
                 "layout_version": MODEL_LAYOUT_VERSION,
                 "id": asset_id,
@@ -3051,6 +3660,161 @@ class LibraryRepository:
             if stage.exists():
                 shutil.rmtree(stage)
             raise
+
+
+class MetadataPatchBatch:
+    """One initialized and locked metadata-patch session.
+
+    Manifest hints are accelerators only. They are constrained to the library,
+    read, and matched to their expected IDs before use.
+    """
+
+    def __init__(
+        self,
+        repository: LibraryRepository,
+        asset_ids: tuple[str, ...],
+        manifest_hints: Mapping[str, str | Path],
+        cancel_token: CancelToken,
+    ) -> None:
+        self.repository = repository
+        self.asset_ids = asset_ids
+        self.manifest_hints = dict(manifest_hints)
+        self.cancel_token = cancel_token
+        self._manifest_paths: dict[str, Path] = {}
+        self._manifest_documents: dict[str, dict] = {}
+        self._category_catalogs: dict[str, CategoryCatalog] = {}
+        self._lock: _ImportLock | None = None
+        self._entered = False
+
+    def __enter__(self) -> MetadataPatchBatch:
+        self.cancel_token.check()
+        self.repository.initialize()
+        lock = _ImportLock(self.repository.root / ".ual" / "import.lock")
+        lock.__enter__()
+        self._lock = lock
+        try:
+            self._prepare_manifest_paths()
+        except Exception:
+            self._release_lock()
+            raise
+        self._entered = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._entered = False
+        self._release_lock(exc_type, exc, tb)
+
+    def patch(
+        self, asset_id: str, patch: AssetMetadataPatch
+    ) -> MetadataPatchOutcome:
+        if not self._entered:
+            raise RuntimeError("Metadata patch batch is not active.")
+        manifest_path = self._manifest_paths.get(asset_id)
+        if manifest_path is None:
+            raise LibraryError(
+                f"Asset {asset_id} was not found in the configured library."
+            )
+        document = self._manifest_documents.pop(asset_id, None)
+        if document is None:
+            try:
+                document = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeError) as error:
+                raise LibraryError(
+                    f"Asset {asset_id} metadata could not be read: {error}"
+                ) from error
+        if not isinstance(document, dict) or str(document.get("id", "")) != asset_id:
+            raise LibraryError(
+                f"Asset {asset_id} no longer matches its catalog manifest."
+            )
+        if patch.rating is not None:
+            if isinstance(patch.rating, bool) or not isinstance(patch.rating, int):
+                raise LibraryError("Asset rating must be a whole number from 0 to 5.")
+            if not 0 <= patch.rating <= 5:
+                raise LibraryError("Asset rating must be between 0 and 5.")
+            document["rating"] = patch.rating
+        existing_tags = _clean_tags(document.get("tags", ()))
+        update = AssetMetadataUpdate(
+            name=str(document.get("name", "")).strip(),
+            category=(
+                str(document.get("category", ""))
+                if patch.category is None
+                else patch.category
+            ),
+            tags=_clean_tags((*existing_tags, *patch.add_tags)),
+            author=str(document.get("author", "")),
+            description=str(document.get("description", "")),
+            physical_size=str(document.get("physical_size", "")),
+        )
+        asset_type = str(document.get("type", "texture_set"))
+        catalog = self._category_catalogs.get(asset_type)
+        if catalog is None:
+            catalog = CategoryConfigStore(self.repository.root).load(asset_type)
+            self._category_catalogs[asset_type] = catalog
+        outcome = self.repository._update_asset_metadata_locked(
+            asset_id,
+            update,
+            manifest=(manifest_path, document),
+            category_catalog=catalog,
+        )
+        self._manifest_paths[asset_id] = outcome.manifest_path
+        return outcome
+
+    def _prepare_manifest_paths(self) -> None:
+        root = self.repository.root.resolve()
+        requested = set(self.asset_ids)
+        for asset_id in self.asset_ids:
+            self.cancel_token.check()
+            hint = self.manifest_hints.get(asset_id)
+            if hint is None:
+                continue
+            validated = self._validated_hint(root, asset_id, hint)
+            if validated is not None:
+                manifest_path, document = validated
+                self._manifest_paths[asset_id] = manifest_path
+                self._manifest_documents[asset_id] = document
+
+        unresolved = requested - self._manifest_paths.keys()
+        if not unresolved:
+            return
+        for manifest_path in _asset_manifest_paths(self.repository.root):
+            self.cancel_token.check()
+            try:
+                document = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                continue
+            asset_id = str(document.get("id", ""))
+            if asset_id not in unresolved:
+                continue
+            self._manifest_paths[asset_id] = manifest_path
+            self._manifest_documents[asset_id] = document
+            unresolved.remove(asset_id)
+            if not unresolved:
+                break
+
+    @staticmethod
+    def _validated_hint(
+        root: Path, asset_id: str, hint: str | Path
+    ) -> tuple[Path, dict] | None:
+        try:
+            path = Path(hint).expanduser().absolute().resolve()
+            path.relative_to(root)
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            json.JSONDecodeError,
+            UnicodeError,
+        ):
+            return None
+        if not isinstance(document, dict) or str(document.get("id", "")) != asset_id:
+            return None
+        return path, document
+
+    def _release_lock(self, exc_type=None, exc=None, tb=None) -> None:
+        lock, self._lock = self._lock, None
+        if lock is not None:
+            lock.__exit__(exc_type, exc, tb)
 
 
 class _ImportLock:
@@ -3212,6 +3976,12 @@ def _asset_from_manifest(
         source_metadata=source_metadata,
         provider_packages=provider_packages,
         asset_type=str(document.get("type", "texture_set")),
+        preview_render=(
+            dict(previews.get("render", {}))
+            if isinstance(previews.get("render", {}), dict)
+            else {}
+        ),
+        rating=_manifest_rating(document),
     )
 
 
@@ -3298,6 +4068,7 @@ def _stock_asset_from_manifest(document: dict, asset_dir: Path) -> LibraryStockA
         extra_files=tuple(extras),
         source_metadata=source_metadata,
         physical_size=str(document.get("physical_size", "")),
+        rating=_manifest_rating(document),
     )
 
 
@@ -3369,6 +4140,7 @@ def _hdri_asset_from_manifest(document: dict, asset_dir: Path) -> LibraryHdriAss
         extra_files=tuple(extras),
         source_metadata=source_metadata,
         preview_render=dict(previews.get("render", {})) if isinstance(previews.get("render", {}), dict) else {},
+        rating=_manifest_rating(document),
     )
 
 
@@ -3571,7 +4343,15 @@ def _model_asset_from_manifest(document: dict, asset_dir: Path) -> LibraryModelA
         excluded_files=tuple(excluded),
         provider_packages=provider_packages,
         usd_derivative=usd_derivative,
+        rating=_manifest_rating(document),
     )
+
+
+def _manifest_rating(document: dict) -> int:
+    rating = document.get("rating", 0)
+    if isinstance(rating, bool) or not isinstance(rating, int) or not 0 <= rating <= 5:
+        raise ValueError("Manifest rating must be a whole number from 0 to 5")
+    return rating
 
 
 def _validated_support_paths(asset_dir: Path, values) -> tuple[str, ...]:
@@ -4796,6 +5576,16 @@ def _asset_manifest_paths(library_root: Path) -> list[Path]:
         if container.is_dir():
             paths.update(container.glob("**/asset.json"))
     return sorted(paths, key=lambda item: str(item).casefold())
+
+
+def _asset_manifest_paths_for_type(library_root: Path, asset_type: str) -> list[Path]:
+    container_name = _asset_container(asset_type)
+    if asset_type == "stock":
+        return _stock_manifest_paths(library_root)
+    container = library_root / container_name
+    if not container.is_dir():
+        return []
+    return sorted(container.glob("**/asset.json"), key=lambda item: str(item).casefold())
 
 
 def _asset_container(asset_type: str) -> str:

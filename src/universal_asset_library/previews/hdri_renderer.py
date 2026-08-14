@@ -8,10 +8,12 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-from time import monotonic
-from typing import Callable, Mapping
+from typing import TYPE_CHECKING, Callable, Mapping
 
 from PyQt6.QtGui import QColor, QImage, QPainter
+
+if TYPE_CHECKING:
+    from .blender_preview_session import BlenderPreviewSession
 
 
 EXPECTED_SCENE_SIZE = (1024, 256)
@@ -119,73 +121,57 @@ def render_hdri_preview(
     request: HdriPreviewRequest,
     progress: Callable[[str], None] | None = None,
     cancel_token=None,
+    session: "BlenderPreviewSession | None" = None,
 ) -> HdriPreviewResult:
     executable = resolve_blender_executable(request.blender_path)
     if not executable:
         return _failure("unsupported", request, "Blender was not found. Configure its executable in Settings.")
-    valid, diagnostic, version = validate_blender_executable(executable)
-    if not valid:
-        return _failure("unsupported", request, diagnostic, blender_version=version)
     template = request.template_path or default_template_path()
     if not template.is_file():
-        return _failure("unsupported", request, f"HDRI preview template is missing: {template}", blender_version=version)
+        return _failure("unsupported", request, f"HDRI preview template is missing: {template}")
     if not request.hdri_path.is_file():
-        return _failure("failed", request, f"HDRI source is missing: {request.hdri_path}", blender_version=version)
+        return _failure("failed", request, f"HDRI source is missing: {request.hdri_path}")
     request.output_dir.mkdir(parents=True, exist_ok=True)
     scene_path = request.output_dir / "scene.png"
     panorama_path = request.output_dir / "panorama.png"
-    result_path = request.output_dir / "blender-result.json"
-    command = [
-        executable, "--background", "--factory-startup", "--disable-autoexec", "--python-exit-code", "1", str(template),
-        "--python", str(driver_path()), "--",
-        "--hdri", str(request.hdri_path),
-        "--scene-output", str(scene_path),
-        "--panorama-output", str(panorama_path),
-        "--result", str(result_path),
-    ]
-    if progress:
-        progress("Launching Blender")
-    started = monotonic()
+    from .blender_preview_session import (
+        BlenderPreviewSession,
+        BlenderPreviewSessionError,
+    )
+
+    owned_session = session is None
+    active_session = session or BlenderPreviewSession(executable)
+    metadata: dict = {}
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    except OSError as error:
-        return _failure("failed", request, f"Blender could not be launched: {error}", blender_version=version)
-    output = ""
-    while True:
-        if cancel_token is not None and getattr(cancel_token, "cancelled", False):
-            process.terminate()
-            try:
-                tail, _ = process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                tail, _ = process.communicate()
-            return _failure("canceled", request, "HDRI preview rendering was canceled.", blender_version=version, log=output + tail)
-        if monotonic() - started > request.timeout_seconds:
-            process.terminate()
-            try:
-                tail, _ = process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                tail, _ = process.communicate()
-            return _failure("failed", request, "Blender preview rendering timed out.", blender_version=version, log=output + tail)
-        try:
-            tail, _ = process.communicate(timeout=0.2)
-        except subprocess.TimeoutExpired as pending:
-            if pending.output:
-                output = pending.output if isinstance(pending.output, str) else pending.output.decode(errors="replace")
-            continue
-        output = (tail or output or "")[-20000:]
-        break
-    if process.returncode:
-        message = _last_log_line(output) or f"Blender exited with code {process.returncode}."
-        return _failure("failed", request, message, blender_version=version, log=output)
+        if progress:
+            progress("Starting Blender preview session")
+        metadata = active_session.render(
+            "hdri",
+            template,
+            {
+                "hdri": str(request.hdri_path.resolve()),
+                "scene_output": str(scene_path.resolve()),
+                "panorama_output": str(panorama_path.resolve()),
+            },
+            timeout_seconds=request.timeout_seconds,
+            progress=progress,
+            cancel_token=cancel_token,
+        )
+    except BlenderPreviewSessionError as error:
+        return _failure(
+            error.status,
+            request,
+            error.diagnostic,
+            blender_version=active_session.blender_version,
+            log=error.log,
+        )
+    finally:
+        if owned_session:
+            active_session.close()
+    version = active_session.blender_version
+    output = active_session.log
     if not scene_path.is_file() or not panorama_path.is_file():
         return _failure("failed", request, "Blender did not create both required render passes.", blender_version=version, log=output)
-    metadata = {}
-    try:
-        metadata = json.loads(result_path.read_text(encoding="utf-8")) if result_path.is_file() else {}
-    except (OSError, json.JSONDecodeError):
-        metadata = {}
     if progress:
         progress("Compositing HDRI preview")
     hero = request.output_dir / f"{_filename_token(request.asset_name)}_HDRI_Preview.jpg"
@@ -193,7 +179,7 @@ def render_hdri_preview(
         compose_hdri_preview(scene_path, panorama_path, hero, request.resolutions)
     except ValueError as error:
         return _failure("failed", request, str(error), blender_version=version, log=output)
-    template_hash = _sha256(template)
+    template_hash = active_session.template_hash(template)
     render_metadata = {
         "type": "hdri_composite", "status": "ready", "source": request.source_relative,
         "width": COMPOSITE_SIZE[0], "height": COMPOSITE_SIZE[1],

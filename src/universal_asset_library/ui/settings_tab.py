@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, Qt, QUrl, pyqtSignal
@@ -28,7 +29,14 @@ from PyQt6.QtWidgets import (
 
 from universal_asset_library.domain import MODEL_CATEGORIES, TEXTURE_CATEGORIES
 from universal_asset_library.settings import AppSettings, SettingsStore, validate_library_path
-from universal_asset_library.library import CancelToken, LibraryRepository, LibraryUpdateSummary, RepairProgress, RepairSummary
+from universal_asset_library.library import (
+    CancelToken,
+    LibraryRecoveryState,
+    LibraryRepository,
+    LibraryUpdateSummary,
+    RepairProgress,
+    RepairSummary,
+)
 from universal_asset_library.previews import resolve_blender_executable, validate_blender_executable
 from universal_asset_library.integrations.houdini import HoudiniBridgeClient, HoudiniInstallation, HoudiniPluginInstaller
 from universal_asset_library.integrations.blender import (
@@ -110,6 +118,52 @@ class MaintenanceWorker(QRunnable):
             self.signals.finished.emit(self.operation, result)
 
 
+@dataclass(frozen=True, slots=True)
+class LibraryInspectionResult:
+    legacy_count: int
+    library_update_count: int
+    recovery: LibraryRecoveryState
+
+
+class LibraryInspectionSignals(QObject):
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+
+class LibraryInspectionWorker(QRunnable):
+    """Inspect a potentially remote library without blocking the GUI thread."""
+
+    def __init__(self, library_path: str) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.library_path = library_path
+        self.signals = LibraryInspectionSignals()
+
+    def run(self) -> None:
+        try:
+            repository = LibraryRepository(self.library_path)
+            result = LibraryInspectionResult(
+                legacy_count=repository.legacy_asset_count(),
+                library_update_count=repository.library_update_count(),
+                recovery=repository.recovery_state(),
+            )
+        except Exception:
+            self._emit("failed", traceback.format_exc(limit=5))
+        else:
+            self._emit("finished", result)
+
+    def _emit(self, name: str, value: object) -> None:
+        """Ignore completion when Qt has already destroyed the receiver."""
+        try:
+            getattr(self.signals, name).emit(value)
+        except RuntimeError as error:
+            if "has been deleted" not in str(error):
+                raise
+
+
+_LIVE_INSPECTION_WORKERS: set[LibraryInspectionWorker] = set()
+
+
 class HoudiniBridgeSignals(QObject):
     finished = pyqtSignal(str, object)
     failed = pyqtSignal(str, str)
@@ -183,6 +237,11 @@ class SettingsTab(QWidget):
         self._library_update_count = 0
         self._update_worker: LibraryUpdateWorker | None = None
         self._maintenance_worker: MaintenanceWorker | None = None
+        self._inspection_worker: LibraryInspectionWorker | None = None
+        self._inspection_generation = 0
+        self._inspection_pending = False
+        self._inspection_shutdown = False
+        self._inspection_requested = False
         self._houdini_worker: HoudiniBridgeWorker | None = None
         self._blender_bridge_worker: BlenderBridgeWorker | None = None
 
@@ -282,8 +341,16 @@ class SettingsTab(QWidget):
         maintenance_layout = QVBoxLayout(maintenance_panel)
         maintenance_layout.setContentsMargins(18, 16, 18, 16)
         maintenance_layout.setSpacing(10)
+        maintenance_heading = QHBoxLayout()
         maintenance_title = QLabel("Library maintenance")
         maintenance_title.setObjectName("sectionTitle")
+        self.refresh_maintenance_button = QPushButton("Refresh status")
+        self.refresh_maintenance_button.clicked.connect(
+            self.refresh_maintenance_state
+        )
+        maintenance_heading.addWidget(maintenance_title)
+        maintenance_heading.addStretch()
+        maintenance_heading.addWidget(self.refresh_maintenance_button)
         maintenance_help = QLabel(
             "Validate the catalog, update older library layouts, or rename legacy assets without changing stable IDs or provider metadata."
         )
@@ -305,7 +372,7 @@ class SettingsTab(QWidget):
         maintenance_row.addWidget(self.repair_progress)
         maintenance_row.addWidget(self.repair_cancel)
         maintenance_row.addWidget(self.repair_button)
-        maintenance_layout.addWidget(maintenance_title)
+        maintenance_layout.addLayout(maintenance_heading)
         maintenance_layout.addWidget(maintenance_help)
         maintenance_layout.addLayout(maintenance_row)
         update_row = QHBoxLayout()
@@ -370,7 +437,7 @@ class SettingsTab(QWidget):
         tools_title = QLabel("Media and preview tools")
         tools_title.setObjectName("sectionTitle")
         tools_help = QLabel(
-            "Blender renders HDRI previews. FFmpeg probes Stock clips, generates playable 480p previews, "
+            "Blender renders texture and HDRI previews. FFmpeg probes Stock clips, generates playable 480p previews, "
             "and extracts midpoint thumbnails. Leave either executable empty to search PATH."
         )
         tools_help.setObjectName("mutedLabel")
@@ -392,6 +459,16 @@ class SettingsTab(QWidget):
         self.blender_status.setObjectName("mutedLabel")
         self.blender_status.setWordWrap(True)
         self.render_hdri_on_import = QCheckBox("Render composite previews automatically during HDRI import")
+        self.render_texture_on_import = QCheckBox(
+            "Render missing shader previews automatically during texture import"
+        )
+        self.save_texture_preview_blend = QCheckBox(
+            "Save a debug Blender file beside generated texture previews"
+        )
+        self.save_texture_preview_blend.setToolTip(
+            "Packs the selected maps into a .blend file in the asset's "
+            "previews folder. This is intended for troubleshooting."
+        )
         ffmpeg_row = QHBoxLayout()
         self.ffmpeg_path = QLineEdit()
         self.ffmpeg_path.setPlaceholderText("Auto-detect FFmpeg on PATH")
@@ -408,6 +485,8 @@ class SettingsTab(QWidget):
         tools_layout.addWidget(tools_help)
         tools_layout.addLayout(blender_row)
         tools_layout.addWidget(self.blender_status)
+        tools_layout.addWidget(self.render_texture_on_import)
+        tools_layout.addWidget(self.save_texture_preview_blend)
         tools_layout.addWidget(self.render_hdri_on_import)
         tools_layout.addLayout(ffmpeg_row)
         tools_layout.addWidget(self.ffmpeg_status)
@@ -522,8 +601,10 @@ class SettingsTab(QWidget):
         self.blender_path.textChanged.connect(self._changed)
         self.ffmpeg_path.textChanged.connect(self._changed)
         self.render_hdri_on_import.toggled.connect(self._changed)
+        self.render_texture_on_import.toggled.connect(self._changed)
+        self.save_texture_preview_blend.toggled.connect(self._changed)
         self._show(self._saved)
-        self._refresh_repair_state()
+        self._show_maintenance_unchecked()
 
     def _browse(self) -> None:
         current = self.library_path.text().strip()
@@ -798,6 +879,10 @@ class SettingsTab(QWidget):
             default_model_category=self.default_model_category.currentText(),
             blender_path=self.blender_path.text(),
             render_hdri_on_import=self.render_hdri_on_import.isChecked(),
+            render_texture_on_import=self.render_texture_on_import.isChecked(),
+            save_texture_preview_blend=(
+                self.save_texture_preview_blend.isChecked()
+            ),
             ffmpeg_path=self.ffmpeg_path.text(),
             stock_hover_previews=self.stock_hover_previews.isChecked(),
         ).normalized()
@@ -814,6 +899,12 @@ class SettingsTab(QWidget):
         self.blender_path.setText(settings.blender_path)
         self.ffmpeg_path.setText(settings.ffmpeg_path)
         self.render_hdri_on_import.setChecked(settings.render_hdri_on_import)
+        self.render_texture_on_import.setChecked(
+            settings.render_texture_on_import
+        )
+        self.save_texture_preview_blend.setChecked(
+            settings.save_texture_preview_blend
+        )
         self._loading = False
         detected = resolve_blender_executable(settings.blender_path)
         if detected:
@@ -885,65 +976,207 @@ class SettingsTab(QWidget):
         self.save_message.setText("Settings saved.")
         self.save_message.setStyleSheet("color: #78c995;")
         self.settings_saved.emit(self._saved)
-        self._refresh_repair_state()
+        self.refresh_maintenance_state()
 
     def _reset(self) -> None:
         self._show(self._saved)
 
-    def _refresh_repair_state(self) -> None:
+    def _show_maintenance_unchecked(self) -> None:
         self._legacy_count = 0
         self._library_update_count = 0
         path = self._saved.library_path
-        if path and os.path.isdir(path):
-            try:
-                repository = LibraryRepository(path)
-                self._legacy_count = repository.legacy_asset_count()
-                self._library_update_count = repository.library_update_count()
-                recovery = repository.recovery_state()
-            except Exception as error:
-                self.repair_status.setText(f"Could not inspect library: {error}")
-                self.repair_status.setStyleSheet("color: #ef7d7d;")
-                self.repair_button.setEnabled(False)
-                self.update_library_button.setEnabled(False)
-                return
-            staging_count = len(recovery.staging_directories)
-            if recovery.lock_owner:
-                stale = "stale local" if recovery.lock_is_local_stale else "active or remote"
-                age = _lock_age(recovery.lock_created_at)
-                self.recovery_status.setText(
-                    f"Library lock: PID {recovery.lock_owner} on {recovery.lock_host} ({stale}); "
-                    f"age {age}; {staging_count} staging folder(s)."
-                )
-            elif staging_count:
-                self.recovery_status.setText(f"Found {staging_count} abandoned staging folder(s).")
-            else:
-                self.recovery_status.setText("No abandoned staging data or library lock detected.")
-            self.cleanup_staging_button.setEnabled(staging_count > 0 and not recovery.lock_owner)
-            self.recover_lock_button.setEnabled(bool(recovery.lock_owner))
-            self.recover_lock_button.setProperty("localStale", recovery.lock_is_local_stale)
+        if path:
+            self.repair_status.setText("Maintenance status has not been checked yet.")
+            self.update_status.setText("Library layout status has not been checked yet.")
+            self.recovery_status.setText("Recovery status has not been checked yet.")
         else:
+            self.repair_status.setText("Configure and save a library path first.")
+            self.update_status.setText("Configure and save a library path first.")
             self.recovery_status.setText("Recovery checks require a saved library path.")
+        self.repair_status.setStyleSheet("color: #8792a1;")
+        self.update_status.setStyleSheet("color: #8792a1;")
+        self.recovery_status.setStyleSheet("color: #8792a1;")
+        self.repair_button.setText("Check asset names")
+        self.update_library_button.setText("Update / Fix Library")
+        self.repair_button.setEnabled(False)
+        self.update_library_button.setEnabled(False)
+        self.cleanup_staging_button.setEnabled(False)
+        self.recover_lock_button.setEnabled(False)
+        self.refresh_maintenance_button.setEnabled(bool(path))
+
+    def refresh_maintenance_state(self) -> None:
+        """Queue a coalesced maintenance inspection for the saved library."""
+        if self._inspection_shutdown:
+            return
+        self._inspection_requested = True
+        self._inspection_generation += 1
+        if self._inspection_worker is not None:
+            self._inspection_pending = True
+            self._set_inspection_busy(True)
+            return
+        self._start_maintenance_inspection(self._inspection_generation)
+
+    def start_initial_maintenance_inspection(self) -> None:
+        """Start the post-paint audit unless the user already requested one."""
+        if not self._inspection_requested:
+            self.refresh_maintenance_state()
+
+    def _start_maintenance_inspection(self, generation: int) -> None:
+        path = self._saved.library_path
+        self._inspection_pending = False
+        if not path:
+            self._show_maintenance_unchecked()
+            return
+        self._set_inspection_busy(True)
+        worker = LibraryInspectionWorker(path)
+        self._inspection_worker = worker
+        _LIVE_INSPECTION_WORKERS.add(worker)
+        worker.signals.finished.connect(
+            lambda result, active=worker: self._inspection_finished(
+                generation, path, result, active
+            )
+        )
+        worker.signals.failed.connect(
+            lambda details, active=worker: self._inspection_failed(
+                generation, path, details, active
+            )
+        )
+        worker.signals.finished.connect(
+            lambda _result, active=worker: _LIVE_INSPECTION_WORKERS.discard(active)
+        )
+        worker.signals.failed.connect(
+            lambda _details, active=worker: _LIVE_INSPECTION_WORKERS.discard(active)
+        )
+        QThreadPool.globalInstance().start(worker, -1)
+
+    def _set_inspection_busy(self, active: bool) -> None:
+        self.refresh_maintenance_button.setEnabled(
+            not active and bool(self._saved.library_path)
+        )
+        if active:
+            self.repair_status.setText("Checking library in background…")
+            self.update_status.setText("Checking library in background…")
+            self.recovery_status.setText("Checking library in background…")
+            for widget in (
+                self.repair_button,
+                self.update_library_button,
+                self.cleanup_staging_button,
+                self.recover_lock_button,
+            ):
+                widget.setEnabled(False)
+
+    def _inspection_finished(
+        self,
+        generation: int,
+        path: str,
+        result: LibraryInspectionResult,
+        worker: LibraryInspectionWorker,
+    ) -> None:
+        if self._inspection_worker is worker:
+            self._inspection_worker = None
+        if self._inspection_shutdown:
+            return
+        current = (
+            generation == self._inspection_generation
+            and path == self._saved.library_path
+        )
+        if current:
+            self._apply_inspection_result(result)
+        self._continue_pending_inspection()
+
+    def _inspection_failed(
+        self,
+        generation: int,
+        path: str,
+        details: str,
+        worker: LibraryInspectionWorker,
+    ) -> None:
+        if self._inspection_worker is worker:
+            self._inspection_worker = None
+        if self._inspection_shutdown:
+            return
+        current = (
+            generation == self._inspection_generation
+            and path == self._saved.library_path
+        )
+        if current:
+            message = (
+                details.strip().splitlines()[-1]
+                if details.strip()
+                else "Unknown library inspection error"
+            )
+            self.repair_status.setText(f"Could not inspect library: {message}")
+            self.repair_status.setStyleSheet("color: #ef7d7d;")
+            self.update_status.setText("Library maintenance status is unavailable.")
+            self.recovery_status.setText("Recovery status is unavailable.")
+            self._set_inspection_busy(False)
+            self.repair_button.setEnabled(False)
+            self.update_library_button.setEnabled(False)
             self.cleanup_staging_button.setEnabled(False)
             self.recover_lock_button.setEnabled(False)
-        if not path:
-            self.repair_status.setText("Configure and save a library path first.")
-        elif self._legacy_count:
-            self.repair_status.setText(f"{self._legacy_count} legacy asset(s) can be renamed.")
+        self._continue_pending_inspection()
+
+    def _continue_pending_inspection(self) -> None:
+        if self._inspection_pending and not self._inspection_shutdown:
+            self._start_maintenance_inspection(self._inspection_generation)
+
+    def _apply_inspection_result(self, result: LibraryInspectionResult) -> None:
+        self._legacy_count = result.legacy_count
+        self._library_update_count = result.library_update_count
+        recovery = result.recovery
+        staging_count = len(recovery.staging_directories)
+        if recovery.lock_owner:
+            stale = "stale local" if recovery.lock_is_local_stale else "active or remote"
+            age = _lock_age(recovery.lock_created_at)
+            self.recovery_status.setText(
+                f"Library lock: PID {recovery.lock_owner} on {recovery.lock_host} ({stale}); "
+                f"age {age}; {staging_count} staging folder(s)."
+            )
+        elif staging_count:
+            self.recovery_status.setText(
+                f"Found {staging_count} abandoned staging folder(s)."
+            )
         else:
-            self.repair_status.setText("Asset names already use the current convention.")
+            self.recovery_status.setText(
+                "No abandoned staging data or library lock detected."
+            )
+        self.cleanup_staging_button.setEnabled(
+            staging_count > 0 and not recovery.lock_owner
+        )
+        self.recover_lock_button.setEnabled(bool(recovery.lock_owner))
+        self.recover_lock_button.setProperty(
+            "localStale", recovery.lock_is_local_stale
+        )
+        self.repair_status.setText(
+            f"{self._legacy_count} legacy asset(s) can be renamed."
+            if self._legacy_count
+            else "Asset names already use the current convention."
+        )
         self.repair_status.setStyleSheet("color: #8792a1;")
-        if not path:
-            self.update_status.setText("Configure and save a library path first.")
-        elif self._library_update_count:
-            self.update_status.setText(f"{self._library_update_count} asset or manifest issue(s) need attention.")
-        else:
-            self.update_status.setText("Library layout is current; the button can run a validation check.")
+        self.update_status.setText(
+            f"{self._library_update_count} asset or manifest issue(s) need attention."
+            if self._library_update_count
+            else "Library layout is current; the button can run a validation check."
+        )
+        self.update_status.setStyleSheet("color: #8792a1;")
+        self.recovery_status.setStyleSheet("color: #8792a1;")
+        self._set_inspection_busy(False)
         self._update_repair_button(self._draft(), validate_library_path(self._draft().library_path)[0])
+
+    def _refresh_repair_state(self) -> None:
+        """Compatibility wrapper for callers that request a maintenance refresh."""
+        self.refresh_maintenance_state()
+
+    def shutdown_maintenance(self) -> None:
+        self._inspection_shutdown = True
+        self._inspection_pending = False
+        self._inspection_generation += 1
 
     def _update_repair_button(self, draft: AppSettings, valid: bool) -> None:
         saved_path = self._saved.library_path
         ready = (
             not self._repairing
+            and self._inspection_worker is None
             and valid
             and bool(saved_path)
             and draft.library_path == saved_path
@@ -955,6 +1188,7 @@ class SettingsTab(QWidget):
         self.repair_button.setEnabled(ready)
         update_ready = (
             not self._repairing
+            and self._inspection_worker is None
             and valid
             and bool(saved_path)
             and draft.library_path == saved_path
@@ -1124,6 +1358,7 @@ class SettingsTab(QWidget):
             self.update_library_button,
             self.cleanup_staging_button,
             self.recover_lock_button,
+            self.refresh_maintenance_button,
         ):
             widget.setEnabled(not active)
         self.repair_cancel.setEnabled(active)

@@ -360,7 +360,7 @@ def test_texture_material_is_created_unassigned_and_updated_by_asset_id(tmp_path
     assert "created unassigned" in first["diagnostic"]
     material = bpy.data.materials[0]
     assert material.get("shotbox_asset_id") == "stone-id"
-    assert material.displacement_method == "BOTH"
+    assert material.displacement_method == "DISPLACEMENT"
     assert any(node.type == "BSDF_PRINCIPLED" for node in material.node_tree.nodes)
     assert any(node.type == "SEPARATE_COLOR" for node in material.node_tree.nodes)
     texture_coordinates = next(

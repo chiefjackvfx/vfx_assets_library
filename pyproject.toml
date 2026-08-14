@@ -22,6 +22,7 @@ packages = ["src/universal_asset_library", "src/shotbox_assets"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "templates/hdri_preview.blend" = "universal_asset_library/previews/templates/hdri_preview.blend"
+"templates/shader_preview.blend" = "universal_asset_library/previews/templates/shader_preview.blend"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

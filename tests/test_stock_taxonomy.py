@@ -78,6 +78,25 @@ def test_promoted_library_aliases_are_bundled_defaults() -> None:
     assert classify_stock_path("Motion Graphics/Noise_01.mov", taxonomy).category == "Motion Graphics"
 
 
+@pytest.mark.parametrize(
+    "path",
+    (
+        "Film FX/Leader_01.mov",
+        "Transfers/8mm_Grain.mov",
+        "Transfers/Super_8_Gate_Weave.mov",
+        "Transfers/16mm_Film_Scratch.mov",
+        "Transfers/Super16_Light_Leak.mov",
+        "Transfers/35_mm_Film_Burn.mov",
+        "Transfers/65mm_Damaged_Film.mov",
+        "Transfers/70mm_Celluloid.mov",
+    ),
+)
+def test_film_fx_formats_and_artifacts_are_classified(path: str) -> None:
+    result = classify_stock_path(path, default_stock_taxonomy())
+
+    assert result.category == "Film FX"
+
+
 def test_taxonomy_store_creates_portable_files_and_never_overwrites(tmp_path: Path) -> None:
     store = StockTaxonomyStore(tmp_path)
     taxonomy = store.ensure_defaults()
@@ -120,6 +139,31 @@ def test_custom_taxonomy_round_trip_and_corrupt_fallback(tmp_path: Path) -> None
     assert "at-camera" in fallback.tag_names
     assert any("Built-in tags" in warning for warning in store.last_warnings)
     assert store.tags_path.read_text(encoding="utf-8") == "{broken"
+
+
+def test_taxonomy_upgrade_moves_film_aliases_out_of_lens(tmp_path: Path) -> None:
+    store = StockTaxonomyStore(tmp_path)
+    store.ensure_defaults()
+    document = json.loads(store.categories_path.read_text(encoding="utf-8"))
+    document["defaults_version"] = 3
+    document["categories"] = [
+        category for category in document["categories"]
+        if category["name"] != "Film FX"
+    ]
+    lens = next(category for category in document["categories"] if category["name"] == "Lens")
+    lens["aliases"].extend(["film burn", "light leaks"])
+    store.categories_path.write_text(json.dumps(document), encoding="utf-8")
+
+    taxonomy = store.ensure_defaults()
+    upgraded = json.loads(store.categories_path.read_text(encoding="utf-8"))
+    upgraded_lens = next(
+        category for category in upgraded["categories"] if category["name"] == "Lens"
+    )
+
+    assert "Film FX" in taxonomy.category_names
+    assert "film burn" not in upgraded_lens["aliases"]
+    assert "light leaks" not in upgraded_lens["aliases"]
+    assert classify_stock_path("Transfers/16mm_Film_Burn.mov", taxonomy).category == "Film FX"
 
 
 def test_duplicate_alias_uses_defaults_with_warning(tmp_path: Path) -> None:

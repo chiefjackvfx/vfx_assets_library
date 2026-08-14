@@ -82,6 +82,8 @@ class LibraryTextureAsset:
     asset_type: str = "texture_set"
     source_metadata: tuple[str, ...] = ()
     provider_packages: tuple[LibraryProviderPackage, ...] = ()
+    preview_render: dict = field(default_factory=dict)
+    rating: int = 0
 
     @property
     def extras(self) -> tuple[LibraryExtraFile, ...]:
@@ -159,6 +161,7 @@ class LibraryHdriAsset:
     source_metadata: tuple[str, ...] = ()
     preview_render: dict = field(default_factory=dict)
     provider_packages: tuple[LibraryProviderPackage, ...] = ()
+    rating: int = 0
 
     @property
     def extras(self) -> tuple[LibraryExtraFile, ...]:
@@ -242,6 +245,7 @@ class LibraryStockAsset:
     hero_path: Path | None = None
     source_metadata: tuple[str, ...] = ()
     provider_packages: tuple[LibraryProviderPackage, ...] = ()
+    rating: int = 0
 
     @property
     def extras(self) -> tuple[LibraryExtraFile, ...]:
@@ -359,6 +363,7 @@ class LibraryModelAsset:
     usd_derivative: LibraryUsdDerivative | None = None
     palette: tuple[str, str] = ("#67588b", "#29243a")
     asset_type: str = "model"
+    rating: int = 0
 
     @property
     def extras(self) -> tuple[LibraryExtraFile, ...]:

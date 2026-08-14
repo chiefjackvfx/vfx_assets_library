@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "shotbox_assets_bridge"
-version = "0.4.1"
+version = "0.4.2"
 name = "ShotBox Assets Bridge"
 tagline = "Send managed HDRIs, PBR materials, and USD models into Blender"
 maintainer = "ShotBox Assets"

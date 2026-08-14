@@ -14,6 +14,18 @@ from .stock_video import (
     generate_stock_preview,
     resolve_ffmpeg,
 )
+from .texture_renderer import (
+    TexturePreviewMap,
+    TexturePreviewRequest,
+    TexturePreviewResult,
+    render_texture_preview,
+    select_texture_maps,
+    select_texture_variant,
+)
+from .blender_preview_session import (
+    BlenderPreviewSession,
+    BlenderPreviewSessionError,
+)
 
 __all__ = [
     "HdriPreviewRequest",
@@ -28,4 +40,12 @@ __all__ = [
     "generate_midpoint_thumbnail",
     "generate_stock_preview",
     "resolve_ffmpeg",
+    "TexturePreviewMap",
+    "TexturePreviewRequest",
+    "TexturePreviewResult",
+    "render_texture_preview",
+    "select_texture_maps",
+    "select_texture_variant",
+    "BlenderPreviewSession",
+    "BlenderPreviewSessionError",
 ]

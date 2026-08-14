@@ -9,10 +9,13 @@ import unicodedata
 
 
 SCHEMA_VERSION = 1
-DEFAULTS_VERSION = 3
+DEFAULTS_VERSION = 4
 CATEGORY_FILENAME = "stock_categories.json"
 TAG_FILENAME = "stock_tags.json"
-SPECIALIST_CATEGORIES = {"Lens", "Magic", "Motion Graphics"}
+SPECIALIST_CATEGORIES = {"Film FX", "Lens", "Magic", "Motion Graphics"}
+FILM_FX_REASSIGNED_ALIASES = {
+    "film burn", "film burns", "light leak", "light leaks",
+}
 RELATED_TAGS = {
     "rain": ("weather",),
     "snow": ("weather",),
@@ -65,14 +68,25 @@ DEFAULT_CATEGORY_RULES = (
     StockCategoryRule("Electricity", ("electricity", "electric")),
     StockCategoryRule("Explosions", ("explosion", "explosions", "blast", "blasts", "charge", "charges", "fireball", "fireballs")),
     StockCategoryRule("Fire", ("fire", "flame", "flames", "torch")),
+    StockCategoryRule("Film FX", (
+        "film", "film fx", "film effect", "film effects", "analog film",
+        "analogue film", "celluloid", "8mm", "8 mm", "super 8", "super8",
+        "super 8mm", "super8mm", "16mm", "16 mm", "super 16", "super16",
+        "super 16mm", "super16mm", "35mm", "35 mm", "65mm", "65 mm",
+        "70mm", "70 mm", "film grain", "grain", "film dust", "film scratch",
+        "film scratches", "film damage", "damaged film", "film burn",
+        "film burns", "light leak", "light leaks", "gate weave", "film jitter",
+        "film flicker", "film leader", "film countdown", "sprocket hole",
+        "sprocket holes", "film perforation", "film perforations", "film reel",
+        "film scan", "film scans", "negative film", "reversal film",
+    )),
     StockCategoryRule("Glass", ("glass", "windshield", "windshields")),
     StockCategoryRule("Impacts", ("impact", "impacts", "hit", "hits", "couch hit", "couch hits", "wall hit", "wall hits", "particle hit", "particle hits", "powder hit", "powder hits")),
     StockCategoryRule("Lasers", ("laser", "lasers")),
     StockCategoryRule("Lens", (
-        "lens", "lens effect", "lens effects", "bokeh", "light leak",
-        "light leaks", "film burn", "film burns", "lens flare", "lens flares",
+        "lens", "lens effect", "lens effects", "bokeh", "lens flare", "lens flares",
         "anamorphic flare", "anamorphic flares", "optical flare",
-        "optical flares", "light streak", "light streaks", "Light Leaks",
+        "optical flares", "light streak", "light streaks",
     )),
     StockCategoryRule("Magic", ("magic", "magical", "spell", "spells")),
     StockCategoryRule("Meteors", ("meteor", "meteors")),
@@ -248,6 +262,7 @@ class StockTaxonomyStore:
         defaults = default_stock_taxonomy()
         try:
             category_document = _read_json(self.categories_path)
+            category_document = _migrate_category_defaults(category_document)
             categories = _merge_rules(defaults.categories, _parse_categories(category_document))
             upgraded_categories = _categories_document(
                 StockTaxonomy(categories, defaults.tags, defaults.stop_words)
@@ -423,6 +438,25 @@ def _parse_categories(document: dict) -> tuple[StockCategoryRule, ...]:
     if "uncategorized" not in names or "miscellaneous" not in names:
         raise ValueError("categories must include Miscellaneous and Uncategorized")
     return rules
+
+
+def _migrate_category_defaults(document: dict) -> dict:
+    version = document.get("defaults_version")
+    if isinstance(version, int) and version >= DEFAULTS_VERSION:
+        return document
+    values = document.get("categories")
+    if not isinstance(values, list):
+        return document
+    for value in values:
+        if not isinstance(value, dict) or _normalize(value.get("name", "")) == "film fx":
+            continue
+        aliases = value.get("aliases")
+        if isinstance(aliases, list):
+            value["aliases"] = [
+                alias for alias in aliases
+                if _normalize(alias) not in FILM_FX_REASSIGNED_ALIASES
+            ]
+    return document
 
 
 def _parse_tags(document: dict) -> tuple[tuple[StockTagRule, ...], tuple[str, ...]]:

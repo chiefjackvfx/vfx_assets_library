@@ -16,7 +16,7 @@ from .protocol import encode_message, receive_message
 
 
 PROTOCOL_VERSION = 1
-BRIDGE_VERSION = "0.4.1"
+BRIDGE_VERSION = "0.4.2"
 REQUEST_TIMEOUT = 300.0
 
 

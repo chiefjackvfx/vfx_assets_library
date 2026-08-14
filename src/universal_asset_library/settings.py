@@ -55,6 +55,8 @@ class AppSettings:
     default_model_category: str = DEFAULT_IMPORT_CATEGORY
     blender_path: str = ""
     render_hdri_on_import: bool = True
+    render_texture_on_import: bool = True
+    save_texture_preview_blend: bool = False
     ffmpeg_path: str = ""
     stock_hover_previews: bool = True
 
@@ -73,6 +75,10 @@ class AppSettings:
             default_model_category=model_category,
             blender_path=normalize_executable_path(self.blender_path),
             render_hdri_on_import=bool(self.render_hdri_on_import),
+            render_texture_on_import=bool(self.render_texture_on_import),
+            save_texture_preview_blend=bool(
+                self.save_texture_preview_blend
+            ),
             ffmpeg_path=normalize_executable_path(self.ffmpeg_path),
             stock_hover_previews=bool(self.stock_hover_previews),
         )
@@ -90,6 +96,14 @@ class SettingsStore:
             default_model_category=str(self._settings.value("import/default_model_category", DEFAULT_IMPORT_CATEGORY)),
             blender_path=str(self._settings.value("tools/blender_path", "") or ""),
             render_hdri_on_import=_setting_bool(self._settings.value("previews/render_hdri_on_import", True)),
+            render_texture_on_import=_setting_bool(
+                self._settings.value("previews/render_texture_on_import", True)
+            ),
+            save_texture_preview_blend=_setting_bool(
+                self._settings.value(
+                    "previews/save_texture_preview_blend", False
+                )
+            ),
             ffmpeg_path=str(self._settings.value("tools/ffmpeg_path", "") or ""),
             stock_hover_previews=_setting_bool(
                 self._settings.value("display/stock_hover_previews", True)
@@ -107,6 +121,14 @@ class SettingsStore:
         self._settings.setValue("import/default_model_category", normalized.default_model_category)
         self._settings.setValue("tools/blender_path", normalized.blender_path)
         self._settings.setValue("previews/render_hdri_on_import", normalized.render_hdri_on_import)
+        self._settings.setValue(
+            "previews/render_texture_on_import",
+            normalized.render_texture_on_import,
+        )
+        self._settings.setValue(
+            "previews/save_texture_preview_blend",
+            normalized.save_texture_preview_blend,
+        )
         self._settings.setValue("tools/ffmpeg_path", normalized.ffmpeg_path)
         self._settings.setValue(
             "display/stock_hover_previews", normalized.stock_hover_previews

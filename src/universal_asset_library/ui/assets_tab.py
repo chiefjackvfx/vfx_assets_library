@@ -3,9 +3,12 @@ from __future__ import annotations
 import html
 import re
 import traceback
+import weakref
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from PyQt6.QtCore import QAbstractListModel, QEvent, QModelIndex, QObject, QPoint, QPersistentModelIndex, QProcess, QRect, QRectF, QRunnable, QSettings, QSize, Qt, QSortFilterProxyModel, QThreadPool, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QAbstractListModel, QEvent, QItemSelectionModel, QModelIndex, QObject, QPoint, QPersistentModelIndex, QProcess, QRect, QRectF, QRunnable, QSettings, QSize, Qt, QSortFilterProxyModel, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -40,6 +43,7 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -57,7 +61,11 @@ from universal_asset_library.domain import (
     TEXTURE_CATEGORIES,
 )
 from universal_asset_library.library import (
+    AssetMetadataPatch,
     AssetMetadataUpdate,
+    CatalogIndex,
+    CatalogRecord,
+    CatalogRefreshWorker,
     CancelToken,
     CategoryConfigStore,
     LibraryRepository,
@@ -91,12 +99,19 @@ from universal_asset_library.integrations import (
     prepare_texture_export,
     validate_model_conversion_blender,
 )
+from universal_asset_library.previews import BlenderPreviewSession
 from .asset_type_tabs import AssetTypeTabs
 from .category_rail import CategoryRail
 from .ai_classification import (
+    AiOrganiserDialog,
     AiGuessWorker,
     GuessConfirmationDialog,
     OllamaSetupDialog,
+)
+from .batch_metadata import (
+    BatchMetadataRequest,
+    BatchMetadataResult,
+    BatchMetadataWorker,
 )
 
 
@@ -740,6 +755,9 @@ class TextureListModel(QAbstractListModel):
     def __init__(self, assets: list[AssetRecord] | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.assets = assets or []
+        self._rows_by_id = {
+            asset.id: row for row, asset in enumerate(self.assets)
+        }
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.assets)
@@ -757,7 +775,23 @@ class TextureListModel(QAbstractListModel):
     def replace(self, assets: list[AssetRecord]) -> None:
         self.beginResetModel()
         self.assets = assets
+        self._rows_by_id = {
+            asset.id: row for row, asset in enumerate(self.assets)
+        }
         self.endResetModel()
+
+    def replace_asset(self, updated: AssetRecord) -> bool:
+        row = self._rows_by_id.get(updated.id)
+        if row is None:
+            return False
+        self.assets[row] = updated
+        index = self.index(row, 0)
+        self.dataChanged.emit(
+            index,
+            index,
+            [int(Qt.ItemDataRole.DisplayRole), ASSET_ROLE],
+        )
+        return True
 
 
 class TextureFilterModel(QSortFilterProxyModel):
@@ -766,6 +800,7 @@ class TextureFilterModel(QSortFilterProxyModel):
         self.query = ""
         self.category = "All"
         self.channel = "All"
+        self.rating_filter = "All ratings"
         self.sort_mode = "Name"
         self.category_catalog = default_category_catalog("texture_set")
 
@@ -773,6 +808,8 @@ class TextureFilterModel(QSortFilterProxyModel):
         index = self.sourceModel().index(source_row, 0, source_parent)
         asset = self.sourceModel().data(index, ASSET_ROLE)
         if not asset or not asset.matches(self.query, "All", self.channel):
+            return False
+        if not _rating_filter_matches(asset.rating, self.rating_filter):
             return False
         return (
             self.category == "All"
@@ -793,10 +830,23 @@ class TextureFilterModel(QSortFilterProxyModel):
             return a.created_at < b.created_at
         if self.sort_mode == "Category":
             return (a.category.casefold(), a.name.casefold()) < (b.category.casefold(), b.name.casefold())
+        if self.sort_mode == "Rating":
+            if a.rating != b.rating:
+                return a.rating < b.rating
+            # Rating uses descending proxy order; reverse the tie comparison so
+            # names remain ascending within the same rating.
+            return a.name.casefold() > b.name.casefold()
         return a.name.casefold() < b.name.casefold()
 
-    def set_filters(self, query: str, category: str, channel: str) -> None:
+    def set_filters(
+        self,
+        query: str,
+        category: str,
+        channel: str,
+        rating_filter: str = "All ratings",
+    ) -> None:
         self.query, self.category, self.channel = query, category, channel
+        self.rating_filter = rating_filter
         self.invalidateFilter()
 
     def set_category_catalog(self, catalog: CategoryCatalog) -> None:
@@ -806,28 +856,48 @@ class TextureFilterModel(QSortFilterProxyModel):
     def set_sort_mode(self, mode: str) -> None:
         self.sort_mode = mode
         self.invalidate()
-        self.sort(0)
+        self.sort(
+            0,
+            Qt.SortOrder.DescendingOrder
+            if mode == "Rating"
+            else Qt.SortOrder.AscendingOrder,
+        )
 
 
 class TextureCardDelegate(QStyledItemDelegate):
+    retry_requested = pyqtSignal(str)
+    rating_requested = pyqtSignal(object, int)
+
     PRESETS = {
-        "small": (QSize(198, 210), 146),
-        "medium": (QSize(238, 245), 180),
-        "large": (QSize(286, 285), 218),
+        "small": (QSize(198, 228), 146),
+        "medium": (QSize(238, 263), 180),
+        "large": (QSize(286, 303), 218),
     }
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.card_size, self.preview_height = self.PRESETS["medium"]
-        self._pixmaps: dict[str, QPixmap] = {}
+        self._pixmaps: OrderedDict[str, QPixmap] = OrderedDict()
+        self._cache_limit = 256
         self._hover_asset_id = ""
         self._hover_pixmap = QPixmap()
+        self._rating_enabled = True
+        self._task_states: dict[str, tuple[str, str]] = {}
+        self._task_angle = 0
+        self._task_timer = QTimer(self)
+        self._task_timer.setInterval(55)
+        self._task_timer.timeout.connect(self._advance_task_animation)
 
     def set_thumbnail_size(self, size: str) -> None:
         self.card_size, self.preview_height = self.PRESETS.get(size, self.PRESETS["medium"])
 
     def clear_cache(self) -> None:
         self._pixmaps.clear()
+
+    def retain_cache_paths(self, paths: set[str]) -> None:
+        for key in list(self._pixmaps):
+            if key.split("|", 1)[0] not in paths:
+                del self._pixmaps[key]
 
     def set_hover_frame(self, asset_id: str, pixmap: QPixmap) -> None:
         self._hover_asset_id = asset_id
@@ -836,6 +906,83 @@ class TextureCardDelegate(QStyledItemDelegate):
     def clear_hover_frame(self) -> None:
         self._hover_asset_id = ""
         self._hover_pixmap = QPixmap()
+
+    def set_rating_enabled(self, enabled: bool) -> None:
+        self._rating_enabled = bool(enabled)
+
+    @property
+    def task_animation_active(self) -> bool:
+        return self._task_timer.isActive()
+
+    def task_state(self, asset_id: str) -> tuple[str, str] | None:
+        return self._task_states.get(asset_id)
+
+    def set_task_state(
+        self, asset_id: str, state: str, message: str = ""
+    ) -> None:
+        if state not in {
+            "queued",
+            "moving",
+            "saving",
+            "failed",
+            "preview_queued",
+            "preview_rendering",
+        }:
+            raise ValueError(f"Unsupported card task state: {state}")
+        self._task_states[asset_id] = (state, message)
+        self._sync_task_animation()
+        self._update_asset(asset_id)
+
+    def clear_task_state(self, asset_id: str) -> None:
+        if self._task_states.pop(asset_id, None) is not None:
+            self._sync_task_animation()
+            self._update_asset(asset_id)
+
+    def clear_task_states(self, asset_ids: set[str] | None = None) -> None:
+        if asset_ids is None:
+            changed = set(self._task_states)
+            self._task_states.clear()
+        else:
+            changed = set(asset_ids) & set(self._task_states)
+            for asset_id in changed:
+                self._task_states.pop(asset_id, None)
+        self._sync_task_animation()
+        for asset_id in changed:
+            self._update_asset(asset_id)
+
+    def _sync_task_animation(self) -> None:
+        active = any(
+            state in {
+                "queued",
+                "moving",
+                "saving",
+                "preview_queued",
+                "preview_rendering",
+            }
+            for state, _message in self._task_states.values()
+        )
+        if active and not self._task_timer.isActive():
+            self._task_timer.start()
+        elif not active:
+            self._task_timer.stop()
+
+    def _advance_task_animation(self) -> None:
+        self._task_angle = (self._task_angle - 24) % 360
+        parent = self.parent()
+        if isinstance(parent, QListView):
+            parent.viewport().update()
+
+    def _update_asset(self, asset_id: str) -> None:
+        parent = self.parent()
+        if not isinstance(parent, QListView):
+            return
+        model = parent.model()
+        for row in range(model.rowCount()):
+            index = model.index(row, 0)
+            asset = index.data(ASSET_ROLE)
+            if asset and asset.id == asset_id:
+                parent.update(index)
+                break
 
     def sizeHint(self, option, index) -> QSize:
         return self.card_size
@@ -860,7 +1007,20 @@ class TextureCardDelegate(QStyledItemDelegate):
             else self._thumbnail(asset)
         )
         if pixmap and not pixmap.isNull():
-            scaled = pixmap.scaled(preview.size().toSize(), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            # Provider model previews are not consistently square.  Keep the
+            # whole render visible instead of cropping portrait or panoramic
+            # images to the card's preview frame.
+            aspect_mode = (
+                Qt.AspectRatioMode.KeepAspectRatio
+                if isinstance(asset, LibraryModelAsset)
+                else Qt.AspectRatioMode.KeepAspectRatioByExpanding
+            )
+            painter.fillRect(preview, QColor("#15191F"))
+            scaled = pixmap.scaled(
+                preview.size().toSize(),
+                aspect_mode,
+                Qt.TransformationMode.SmoothTransformation,
+            )
             x = preview.left() + (preview.width() - scaled.width()) / 2
             y = preview.top() + (preview.height() - scaled.height()) / 2
             painter.drawPixmap(int(x), int(y), scaled)
@@ -908,6 +1068,24 @@ class TextureCardDelegate(QStyledItemDelegate):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             meta,
         )
+        stars = self._rating_rect(outer, preview)
+        painter.setPen(QPen(QColor("#343B47"), 1))
+        painter.setBrush(QColor("#171A20"))
+        painter.drawRoundedRect(stars, 9, 9)
+        star_font = QFont(option.font)
+        star_font.setPointSize(10)
+        painter.setFont(star_font)
+        for position in range(1, 6):
+            cell = QRectF(
+                stars.left() + (position - 1) * stars.width() / 5,
+                stars.top(),
+                stars.width() / 5,
+                stars.height(),
+            )
+            painter.setPen(QColor(
+                "#FFD166" if position <= asset.rating else "#535D6B"
+            ))
+            painter.drawText(cell, Qt.AlignmentFlag.AlignCenter, "★")
         if selected:
             marker = QRectF(preview.left() + 8, preview.top() + 8, 18, 18)
             painter.setPen(Qt.PenStyle.NoPen)
@@ -922,14 +1100,136 @@ class TextureCardDelegate(QStyledItemDelegate):
                 int(marker.left() + 8), int(marker.bottom() - 5),
                 int(marker.right() - 4), int(marker.top() + 5),
             )
+        task_state = self._task_states.get(asset.id)
+        if task_state:
+            state, _message = task_state
+            if state in {
+                "queued",
+                "moving",
+                "preview_queued",
+                "preview_rendering",
+            }:
+                self._paint_task_spinner(painter, preview)
+            elif state == "failed":
+                self._paint_failed_badge(painter, preview)
         painter.restore()
+
+    def _paint_task_spinner(self, painter: QPainter, preview: QRectF) -> None:
+        center = preview.center()
+        background = QRectF(center.x() - 24, center.y() - 24, 48, 48)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(12, 16, 21, 215))
+        painter.drawEllipse(background)
+        pen = QPen(QColor("#FF6B35"), 5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        arc = background.adjusted(8, 8, -8, -8)
+        painter.drawArc(arc, self._task_angle * 16, 255 * 16)
+
+    def _failed_badge_rect(self, preview: QRectF) -> QRectF:
+        return QRectF(preview.left() + 8, preview.bottom() - 31, 62, 23)
+
+    @staticmethod
+    def _rating_rect(outer: QRectF, preview: QRectF) -> QRectF:
+        return QRectF(outer.left() + 8, preview.bottom() + 46, 94, 21)
+
+    def _paint_failed_badge(self, painter: QPainter, preview: QRectF) -> None:
+        badge = self._failed_badge_rect(preview)
+        painter.setPen(QPen(QColor("#FF8A8A"), 1))
+        painter.setBrush(QColor(110, 24, 30, 225))
+        painter.drawRoundedRect(badge, 3, 3)
+        painter.setPen(QColor("#FFFFFF"))
+        font = painter.font()
+        font.setPointSize(8)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, "Retry")
+
+    def editorEvent(self, event, model, option, index: QModelIndex) -> bool:
+        asset = index.data(ASSET_ROLE)
+        task_state = self._task_states.get(asset.id) if asset else None
+        if (
+            asset
+            and self._rating_enabled
+            and event.type() == QEvent.Type.MouseButtonRelease
+        ):
+            outer = QRectF(option.rect.adjusted(4, 4, -4, -4))
+            preview = QRectF(
+                outer.left() + 1,
+                outer.top() + 1,
+                outer.width() - 2,
+                self.preview_height,
+            )
+            stars = self._rating_rect(outer, preview)
+            if stars.contains(event.position()):
+                position = min(
+                    5,
+                    max(1, int((event.position().x() - stars.left()) * 5 / stars.width()) + 1),
+                )
+                view = self.parent()
+                if isinstance(view, QListView):
+                    view.setCurrentIndex(index)
+                self.rating_requested.emit(
+                    asset, 0 if position == asset.rating else position
+                )
+                return True
+        if (
+            task_state
+            and task_state[0] == "failed"
+            and event.type() == QEvent.Type.MouseButtonRelease
+        ):
+            outer = QRectF(option.rect.adjusted(4, 4, -4, -4))
+            preview = QRectF(
+                outer.left() + 1,
+                outer.top() + 1,
+                outer.width() - 2,
+                self.preview_height,
+            )
+            if self._failed_badge_rect(preview).contains(event.position()):
+                self.retry_requested.emit(asset.id)
+                return True
+        return super().editorEvent(event, model, option, index)
+
+    def helpEvent(self, event, view, option, index: QModelIndex) -> bool:
+        asset = index.data(ASSET_ROLE)
+        task_state = self._task_states.get(asset.id) if asset else None
+        if task_state and task_state[0] == "failed" and task_state[1]:
+            QToolTip.showText(
+                event.globalPos(),
+                f"Asset update failed: {task_state[1]}\nClick Retry to try again.",
+                view,
+                option.rect,
+            )
+            return True
+        return super().helpEvent(event, view, option, index)
 
     def _thumbnail(self, asset: AssetRecord) -> QPixmap | None:
         if not asset.thumbnail_path:
             return None
-        key = str(asset.thumbnail_path)
+        path = str(asset.thumbnail_path)
+        target_width = max(1, self.card_size.width() - 10)
+        aspect_mode = (
+            Qt.AspectRatioMode.KeepAspectRatio
+            if isinstance(asset, LibraryModelAsset)
+            else Qt.AspectRatioMode.KeepAspectRatioByExpanding
+        )
+        key = f"{path}|{target_width}x{self.preview_height}|{aspect_mode.value}"
         if key not in self._pixmaps:
-            self._pixmaps[key] = QPixmap(key)
+            original = QPixmap(path)
+            pixmap = (
+                original.scaled(
+                    QSize(target_width, self.preview_height),
+                    aspect_mode,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                if not original.isNull()
+                else QPixmap()
+            )
+            self._pixmaps[key] = pixmap
+            while len(self._pixmaps) > self._cache_limit:
+                self._pixmaps.popitem(last=False)
+        self._pixmaps.move_to_end(key)
         return self._pixmaps[key]
 
 
@@ -1029,7 +1329,7 @@ class StockHoverPreviewController(QObject):
         self._update_index(previous)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self._viewport and event.type() in {
+        if watched is getattr(self, "_viewport", None) and event.type() in {
             QEvent.Type.Leave,
             QEvent.Type.Hide,
             QEvent.Type.Wheel,
@@ -1123,8 +1423,83 @@ class CollapsibleSection(QFrame):
         self.toggle.setText(title)
 
 
+class StarRatingWidget(QWidget):
+    rating_changed = pyqtSignal(int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("ratingControl")
+        self.setMaximumWidth(175)
+        self._rating = 0
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 7, 10, 7)
+        layout.setSpacing(4)
+        layout.addStretch()
+        self.buttons: list[QToolButton] = []
+        for position in range(1, 6):
+            button = QToolButton(self)
+            button.setObjectName("ratingStar")
+            button.setFixedSize(27, 27)
+            button.setText("★")
+            button.setProperty("ratingValue", position)
+            button.installEventFilter(self)
+            button.setAccessibleName(f"{position} star rating")
+            button.setToolTip(f"Rate {position} star{'s' if position != 1 else ''}")
+            button.clicked.connect(
+                lambda _checked=False, value=position: self._clicked(value)
+            )
+            self.buttons.append(button)
+            layout.addWidget(button)
+        layout.addStretch()
+        self.set_rating(0)
+
+    @property
+    def rating(self) -> int:
+        return self._rating
+
+    def set_rating(self, rating: int) -> None:
+        self._rating = rating
+        self._render(rating)
+        self.setToolTip("Unrated" if rating == 0 else f"Rated {rating} of 5 stars")
+
+    def set_save_state(self, state: str = "") -> None:
+        pass
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched in self.buttons and self.isEnabled():
+            if event.type() == QEvent.Type.Enter:
+                preview = int(watched.property("ratingValue"))
+                self._render(preview)
+            elif event.type() == QEvent.Type.Leave:
+                self._render(self._rating)
+        return super().eventFilter(watched, event)
+
+    def _clicked(self, value: int) -> None:
+        button = self.buttons[value - 1]
+        button.setProperty("popped", True)
+        button.style().unpolish(button)
+        button.style().polish(button)
+        QTimer.singleShot(140, lambda target=button: self._clear_pop(target))
+        self.rating_changed.emit(0 if value == self._rating else value)
+
+    @staticmethod
+    def _clear_pop(button: QToolButton) -> None:
+        button.setProperty("popped", False)
+        button.style().unpolish(button)
+        button.style().polish(button)
+
+    def _render(self, rating: int) -> None:
+        for position, button in enumerate(self.buttons, 1):
+            button.setProperty("filled", position <= rating)
+            button.setText("★" if position <= rating else "☆")
+            button.style().unpolish(button)
+            button.style().polish(button)
+            button.update()
+
+
 class DetailPanel(QFrame):
     edit_requested = pyqtSignal(object)
+    rating_requested = pyqtSignal(object, int)
     ai_guess_requested = pyqtSignal(object, str)
     model_convert_requested = pyqtSignal(object)
     model_convert_canceled = pyqtSignal()
@@ -1145,6 +1520,8 @@ class DetailPanel(QFrame):
         super().__init__()
         self._asset: AssetRecord | None = None
         self._ai_busy = False
+        self._library_mutation_busy = False
+        self._asset_task_busy = False
         self._houdini_sessions: list[HoudiniSession] = []
         self._blender_sessions: list[BlenderSession] = []
         self.setObjectName("panel")
@@ -1230,6 +1607,11 @@ class DetailPanel(QFrame):
         self.description = QLabel("Select an imported asset to inspect it here.")
         self.description.setObjectName("mutedLabel")
         self.description.setWordWrap(True)
+        self.star_rating = StarRatingWidget()
+        self.star_rating.rating_changed.connect(
+            lambda rating: self._asset
+            and self.rating_requested.emit(self._asset, rating)
+        )
         self.metadata = QLabel("")
         self.metadata.setTextFormat(Qt.TextFormat.RichText)
         self.metadata.setWordWrap(True)
@@ -1477,6 +1859,7 @@ class DetailPanel(QFrame):
         layout.addWidget(self.eyebrow)
         layout.addWidget(self.name)
         layout.addWidget(self.description)
+        layout.addWidget(self.star_rating)
         layout.addLayout(primary_actions)
         layout.addWidget(self.ai_status)
         layout.addLayout(asset_actions)
@@ -1512,6 +1895,8 @@ class DetailPanel(QFrame):
         self.hero.setText("No preview")
         self.name.setText("No asset selected")
         self.description.setText("Choose an imported asset to inspect it.")
+        self.star_rating.set_rating(0)
+        self.star_rating.setEnabled(False)
         self.metadata.clear()
         self.technical_details.clear()
         self.channels.setText("—")
@@ -1592,6 +1977,8 @@ class DetailPanel(QFrame):
             self.hero.setPixmap(pixmap.scaled(self.hero.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         self.name.setText(asset.name)
         self.description.setText(asset.description or "No description provided.")
+        self.star_rating.set_rating(asset.rating)
+        self.star_rating.setEnabled(True)
         provider = asset.provider + (f" · {asset.provider_id}" if asset.provider_id else "")
         self.metadata.setText(
             f"<span style='color:#8792a1'>Category</span>  {asset.category}<br>"
@@ -1794,6 +2181,27 @@ class DetailPanel(QFrame):
                 for channel in asset.channels
             ))
             self.edit_button.setText("Edit atlas…" if asset.asset_type == "atlas" else "Edit material…")
+            if asset.asset_type == "texture_set":
+                render = asset.preview_render
+                status = str(render.get("status", "pending"))
+                diagnostic = str(render.get("diagnostic", ""))
+                self.hdri_render_button.setText(
+                    "Regenerate preview" if status == "ready" else "Render preview"
+                )
+                self.hdri_render_button.show()
+                self.hdri_render_button.setEnabled(True)
+                self.hdri_cancel_button.hide()
+                self.hdri_render_status.setText(
+                    "Shader preview ready"
+                    if status == "ready"
+                    else diagnostic or f"Preview render: {status}"
+                )
+                self.hdri_render_status.setStyleSheet(
+                    "color:#78c995;"
+                    if status == "ready"
+                    else "color:#e6b566;"
+                )
+                self.hdri_render_status.show()
             self._configure_texture_dcc(asset)
         if not isinstance(asset, LibraryModelAsset):
             self.view_3d_button.hide()
@@ -1825,6 +2233,54 @@ class DetailPanel(QFrame):
         self.guess_category_button.show()
         self.guess_tags_button.show()
         self._update_ai_controls()
+        self._apply_library_mutation_gate()
+
+    def set_library_mutation_busy(self, active: bool) -> None:
+        changed = self._library_mutation_busy != bool(active)
+        self._library_mutation_busy = bool(active)
+        if changed and not active and self._asset is not None:
+            self.show_asset(self._asset)
+        else:
+            self._apply_library_mutation_gate()
+
+    def set_asset_task_busy(self, active: bool) -> None:
+        changed = self._asset_task_busy != bool(active)
+        self._asset_task_busy = bool(active)
+        if changed and not active and self._asset is not None:
+            self.show_asset(self._asset)
+        else:
+            self._apply_library_mutation_gate()
+
+    def _apply_library_mutation_gate(self) -> None:
+        self.star_rating.setEnabled(
+            self._asset is not None
+            and not self._library_mutation_busy
+            and not self._asset_task_busy
+        )
+        if self._library_mutation_busy:
+            for widget in (
+                self.edit_button,
+                self.guess_category_button,
+                self.guess_tags_button,
+                self.model_convert_button,
+                self.model_rescan_button,
+                self.hdri_render_button,
+                self.polyhaven_check_button,
+                self.polyhaven_resolution,
+                self.polyhaven_maps_button,
+                self.polyhaven_mtlx_button,
+                self.polyhaven_usd_button,
+                self.polyhaven_hdri_button,
+            ):
+                widget.setEnabled(False)
+        if self._asset_task_busy:
+            for widget in (
+                self.path_button,
+                self.reveal_button,
+                self.houdini_send_button,
+                self.blender_send_button,
+            ):
+                widget.setEnabled(False)
 
     def set_ai_busy(self, active: bool, message: str = "") -> None:
         self._ai_busy = active
@@ -1845,7 +2301,9 @@ class DetailPanel(QFrame):
 
     def _update_ai_controls(self) -> None:
         preview = _classification_preview(self._asset) if self._asset else None
-        enabled = bool(preview and not self._ai_busy)
+        enabled = bool(
+            preview and not self._ai_busy and not self._library_mutation_busy
+        )
         self.guess_category_button.setEnabled(enabled)
         self.guess_tags_button.setEnabled(enabled)
         tooltip = (
@@ -1938,10 +2396,19 @@ class DetailPanel(QFrame):
         options = getattr(self, "_polyhaven_options", None)
         if not isinstance(options, PolyHavenOptions):
             return
-        self.polyhaven_maps_button.setEnabled(label in options.map_resolutions)
-        self.polyhaven_mtlx_button.setEnabled(label in options.materialx_resolutions)
-        self.polyhaven_usd_button.setEnabled(label in options.usd_resolutions)
-        self.polyhaven_hdri_button.setEnabled(label in options.hdri_resolutions)
+        available = not self._library_mutation_busy
+        self.polyhaven_maps_button.setEnabled(
+            available and label in options.map_resolutions
+        )
+        self.polyhaven_mtlx_button.setEnabled(
+            available and label in options.materialx_resolutions
+        )
+        self.polyhaven_usd_button.setEnabled(
+            available and label in options.usd_resolutions
+        )
+        self.polyhaven_hdri_button.setEnabled(
+            available and label in options.hdri_resolutions
+        )
 
     def apply_polyhaven_options(self, options: PolyHavenOptions) -> None:
         self._polyhaven_options = options
@@ -2158,7 +2625,11 @@ class DetailPanel(QFrame):
         self.export_footer.show()
 
     def set_hdri_rendering(self, active: bool, message: str = "") -> None:
-        if not isinstance(self._asset, LibraryHdriAsset):
+        if not (
+            isinstance(self._asset, LibraryHdriAsset)
+            or isinstance(self._asset, LibraryTextureAsset)
+            and self._asset.asset_type == "texture_set"
+        ):
             return
         self.hdri_render_button.setEnabled(not active)
         self.hdri_cancel_button.setVisible(active)
@@ -2282,26 +2753,78 @@ class HdriRenderSignals(QObject):
     failed = pyqtSignal(str)
 
 
+@dataclass(frozen=True, slots=True)
+class PreviewRenderJob:
+    library_path: str
+    asset_id: str
+    asset_type: str
+    asset_name: str
+    notify_failure: bool = False
+
+
 class HdriRenderWorker(QRunnable):
-    def __init__(self, library_path: str, asset_id: str, blender_path: str, token: CancelToken) -> None:
+    def __init__(
+        self,
+        library_path: str,
+        asset_id: str,
+        blender_path: str,
+        token: CancelToken,
+        asset_type: str = "hdri",
+        save_texture_preview_blend: bool = False,
+        preview_session: BlenderPreviewSession | None = None,
+    ) -> None:
         super().__init__()
         self.library_path = library_path
         self.asset_id = asset_id
         self.blender_path = blender_path
         self.token = token
+        self.asset_type = asset_type
+        self.save_texture_preview_blend = bool(
+            save_texture_preview_blend
+        )
+        self.preview_session = preview_session
         self.signals = HdriRenderSignals()
 
     def run(self) -> None:
         try:
-            result = LibraryRepository(self.library_path, blender_path=self.blender_path).render_hdri_preview(
+            repository = LibraryRepository(
+                self.library_path,
+                blender_path=self.blender_path,
+                save_texture_preview_blend=(
+                    self.save_texture_preview_blend
+                ),
+            )
+            renderer = (
+                repository.render_texture_preview
+                if self.asset_type == "texture_set"
+                else repository.render_hdri_preview
+            )
+            result = renderer(
                 self.asset_id,
                 progress=self.signals.progress.emit,
                 cancel_token=self.token,
+                preview_session=self.preview_session,
             )
         except Exception:
-            self.signals.failed.emit(traceback.format_exc(limit=5))
+            self._emit("failed", traceback.format_exc(limit=5))
         else:
-            self.signals.finished.emit(result)
+            self._emit("finished", result)
+
+    def _emit(self, name: str, value: object) -> None:
+        try:
+            getattr(self.signals, name).emit(value)
+        except RuntimeError as error:
+            if "has been deleted" not in str(error):
+                raise
+
+
+class PreviewSessionCloseWorker(QRunnable):
+    def __init__(self, session: BlenderPreviewSession) -> None:
+        super().__init__()
+        self.session = session
+
+    def run(self) -> None:
+        self.session.close()
 
 
 class ModelConversionSignals(QObject):
@@ -2550,16 +3073,200 @@ class BlenderWorker(QRunnable):
             self.signals.finished.emit(self.operation, result)
 
 
+class MetadataUpdateSignals(QObject):
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+
+class MetadataUpdateWorker(QRunnable):
+    """Apply metadata and filesystem moves away from the GUI thread."""
+
+    def __init__(
+        self,
+        library_path: str,
+        asset_id: str,
+        update: AssetMetadataUpdate,
+        catalog_index: CatalogIndex | None,
+    ) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.library_path = library_path
+        self.asset_id = asset_id
+        self.update = update
+        self.catalog_index = catalog_index
+        self.signals = MetadataUpdateSignals()
+
+    def run(self) -> None:
+        try:
+            updated = LibraryRepository(self.library_path).update_asset_metadata(
+                self.asset_id, self.update
+            )
+            if self.catalog_index is not None:
+                manifest = updated.asset_dir / "asset.json"
+                if (
+                    isinstance(updated, LibraryStockAsset)
+                    and not manifest.is_file()
+                ):
+                    manifest = updated.source_path.with_suffix(".json")
+                if manifest.is_file():
+                    try:
+                        self.catalog_index.upsert(
+                            CatalogRecord.from_manifest(updated, manifest)
+                        )
+                    except Exception:
+                        # The local index is disposable; the background catalog
+                        # refresh will repair it without failing the library edit.
+                        pass
+        except Exception as error:
+            self.signals.failed.emit(str(error))
+        else:
+            self.signals.finished.emit(updated)
+
+
+_LIVE_METADATA_UPDATE_WORKERS: set[MetadataUpdateWorker] = set()
+
+
+class RatingUpdateWorker(QRunnable):
+    """Persist one rating without overwriting unrelated manifest metadata."""
+
+    def __init__(
+        self,
+        library_path: str,
+        asset_id: str,
+        rating: int,
+        catalog_index: CatalogIndex | None,
+    ) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.library_path = library_path
+        self.asset_id = asset_id
+        self.rating = rating
+        self.catalog_index = catalog_index
+        self.signals = MetadataUpdateSignals()
+
+    def run(self) -> None:
+        try:
+            updated = LibraryRepository(self.library_path).patch_asset_metadata(
+                self.asset_id, AssetMetadataPatch(rating=self.rating)
+            )
+            if self.catalog_index is not None:
+                manifest = updated.asset_dir / "asset.json"
+                if isinstance(updated, LibraryStockAsset) and not manifest.is_file():
+                    manifest = updated.source_path.with_suffix(".json")
+                if manifest.is_file():
+                    try:
+                        self.catalog_index.upsert(
+                            CatalogRecord.from_manifest(updated, manifest)
+                        )
+                    except Exception:
+                        pass
+        except Exception as error:
+            self.signals.failed.emit(str(error))
+        else:
+            self.signals.finished.emit(updated)
+
+
+_LIVE_RATING_UPDATE_WORKERS: set[RatingUpdateWorker] = set()
+
+
+class CircularSpinner(QWidget):
+    """Small indeterminate spinner drawn with the current ShotBox accent."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(48, 48)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(40)
+        self._timer.timeout.connect(self._advance)
+
+    @property
+    def animation_active(self) -> bool:
+        return self._timer.isActive()
+
+    def start(self) -> None:
+        self._timer.start()
+        self.update()
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def _advance(self) -> None:
+        self._angle = (self._angle - 24) % 360
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#FF6B35"), 5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        bounds = QRectF(self.rect()).adjusted(7, 7, -7, -7)
+        painter.drawArc(bounds, self._angle * 16, 255 * 16)
+
+
+class BusyOverlay(QWidget):
+    """Input-blocking overlay that leaves the rest of the application usable."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("busyOverlay")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "QWidget#busyOverlay { background-color: rgba(12, 16, 21, 205); }"
+            "QFrame#busyPanel { background:#1E2228; border:1px solid #404754; "
+            "border-radius:6px; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.addStretch()
+        panel = QFrame()
+        panel.setObjectName("busyPanel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(34, 24, 34, 24)
+        panel_layout.setSpacing(12)
+        self.spinner = CircularSpinner(panel)
+        self.message = QLabel()
+        self.message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.message.setStyleSheet("color:#F2F5F8; font-weight:600;")
+        panel_layout.addWidget(
+            self.spinner, 0, Qt.AlignmentFlag.AlignHCenter
+        )
+        panel_layout.addWidget(self.message)
+        layout.addWidget(panel, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addStretch()
+        self.hide()
+
+    def start(self, message: str) -> None:
+        self.message.setText(message)
+        self.setGeometry(self.parentWidget().rect())
+        self.raise_()
+        self.show()
+        self.spinner.start()
+
+    def stop(self) -> None:
+        self.spinner.stop()
+        self.hide()
+
+
 class AssetsTab(QWidget):
     open_settings_requested = pyqtSignal()
     material_updated = pyqtSignal(object)
+    library_mutation_busy_changed = pyqtSignal(bool)
 
     def __init__(self) -> None:
         super().__init__()
         self._library_path = ""
         self._blender_path = ""
+        self._save_texture_preview_blend = False
+        self._render_hdri_previews_on_import = True
+        self._render_texture_previews_on_import = True
         self._hdri_render_worker: HdriRenderWorker | None = None
         self._hdri_render_token: CancelToken | None = None
+        self._preview_render_jobs: list[PreviewRenderJob] = []
+        self._preview_render_ids: set[str] = set()
+        self._active_preview_render_job: PreviewRenderJob | None = None
+        self._preview_session: BlenderPreviewSession | None = None
         self._model_conversion_worker: ModelConversionWorker | None = None
         self._model_conversion_token: CancelToken | None = None
         self._model_rescan_worker: ModelRescanWorker | None = None
@@ -2574,8 +3281,44 @@ class AssetsTab(QWidget):
         self._polyhaven_asset_id = ""
         self._ai_guess_worker: AiGuessWorker | None = None
         self._ai_asset_id = ""
+        self._metadata_update_worker: MetadataUpdateWorker | None = None
+        self._metadata_update_asset_id = ""
+        self._metadata_update_library_path = ""
+        self._metadata_update_origin = ""
+        self._metadata_update_value: AssetMetadataUpdate | None = None
+        self._rating_update_worker: RatingUpdateWorker | None = None
+        self._rating_update_asset_id = ""
+        self._rating_update_value = 0
+        self._pending_rating_updates: OrderedDict[str, int] = OrderedDict()
+        self._rating_confirmed_assets: dict[str, AssetRecord] = {}
+        self._batch_metadata_worker: BatchMetadataWorker | None = None
+        self._batch_metadata_origin = ""
+        self._failed_batch_requests: dict[str, BatchMetadataRequest] = {}
+        self._failed_batch_origin = ""
+        self._failed_single_update: tuple[
+            AssetRecord, AssetMetadataUpdate, str
+        ] | None = None
+        self._library_mutation_busy = False
         self._ollama_process: QProcess | None = None
         self._all_assets: list[AssetRecord] = []
+        self._all_asset_rows: dict[str, int] = {}
+        self._catalog_index: CatalogIndex | None = None
+        self._catalog_worker: CatalogRefreshWorker | None = None
+        self._catalog_workers: set[CatalogRefreshWorker] = set()
+        self._catalog_token: CancelToken | None = None
+        self._catalog_generation = 0
+        self._catalog_refreshing = False
+        self._section_selections: dict[str, str] = {}
+        self._section_warnings: dict[str, list[str]] = {}
+        self._category_count_cache: dict[str, int] = {}
+        self._catalog_start_timer = QTimer(self)
+        self._catalog_start_timer.setSingleShot(True)
+        catalog_owner = weakref.ref(self)
+        self._catalog_start_timer.timeout.connect(
+            lambda owner=catalog_owner: (
+                owner()._start_catalog_refresh() if owner() is not None else None
+            )
+        )
         self._category_catalogs = {
             asset_type: default_category_catalog(asset_type)
             for asset_type in ("texture_set", "atlas", "hdri", "model", "stock")
@@ -2602,8 +3345,15 @@ class AssetsTab(QWidget):
         self.category.hide()
         self.channel = QComboBox()
         self.channel.addItems(["All", *PBR_CHANNELS])
+        self.rating_filter = QComboBox()
+        self.rating_filter.addItems([
+            "All ratings", "Rated", "2+", "3+", "4+", "5 stars", "Unrated",
+        ])
+        self.rating_filter.setToolTip("Filter assets by their shared library rating")
         self.sort = QComboBox()
-        self.sort.addItems(["Name", "Category", "Resolution", "Duration", "Import Date"])
+        self.sort.addItems([
+            "Name", "Rating", "Category", "Resolution", "Duration", "Import Date",
+        ])
         self.toolbar = QFrame()
         self.toolbar.setObjectName("assetsToolbar")
         toolbar_layout = QHBoxLayout(self.toolbar)
@@ -2612,7 +3362,36 @@ class AssetsTab(QWidget):
         toolbar_layout.addWidget(self.section)
         toolbar_layout.addWidget(self.search, 1)
         toolbar_layout.addWidget(self.channel)
+        toolbar_layout.addWidget(self.rating_filter)
         toolbar_layout.addWidget(self.sort)
+        self.refresh_catalog_button = QPushButton("Refresh Catalog")
+        self.refresh_catalog_button.setToolTip(
+            "Check the library for assets changed outside ShotBox."
+        )
+        self.refresh_catalog_button.clicked.connect(self.refresh_catalog)
+        toolbar_layout.addWidget(self.refresh_catalog_button)
+        self.ai_organise_button = QPushButton("AI Organise")
+        self.ai_organise_button.setToolTip(
+            "Categorise and tag fallback-category assets with local AI."
+        )
+        self.ai_organise_button.clicked.connect(self._open_ai_organiser)
+        toolbar_layout.addWidget(self.ai_organise_button)
+        self.catalog_status = QLabel()
+        self.catalog_status.setObjectName("mutedLabel")
+        toolbar_layout.addWidget(self.catalog_status)
+        self.preview_queue_status = QLabel()
+        self.preview_queue_status.setObjectName("mutedLabel")
+        self.preview_queue_status.hide()
+        toolbar_layout.addWidget(self.preview_queue_status)
+        self.preview_queue_clear = QPushButton("Clear Queue")
+        self.preview_queue_clear.setToolTip(
+            "Remove all pending preview renders. The active render continues."
+        )
+        self.preview_queue_clear.clicked.connect(
+            self._clear_pending_preview_renders
+        )
+        self.preview_queue_clear.hide()
+        toolbar_layout.addWidget(self.preview_queue_clear)
         toolbar_layout.addWidget(self.count)
         root.addWidget(self.toolbar)
 
@@ -2624,12 +3403,14 @@ class AssetsTab(QWidget):
         self.view = QListView()
         self.view.setModel(self.proxy)
         self.card_delegate = TextureCardDelegate(self.view)
+        self.card_delegate.retry_requested.connect(self._retry_failed_asset)
+        self.card_delegate.rating_requested.connect(self._rate_asset)
         self.view.setItemDelegate(self.card_delegate)
         self.view.setViewMode(QListView.ViewMode.IconMode)
         self.view.setResizeMode(QListView.ResizeMode.Adjust)
         self.view.setMovement(QListView.Movement.Static)
         self.view.setSpacing(2)
-        self.view.setSelectionMode(QListView.SelectionMode.SingleSelection)
+        self.view.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
         self.view.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
         self.stock_hover_previews = StockHoverPreviewController(
             self.view, self.card_delegate
@@ -2639,6 +3420,7 @@ class AssetsTab(QWidget):
             self.stock_hover_previews.set_suspended
         )
         self.detail.edit_requested.connect(self._edit_material)
+        self.detail.rating_requested.connect(self._rate_asset)
         self.detail.ai_guess_requested.connect(self._guess_asset_metadata)
         self.detail.model_convert_requested.connect(self._convert_model_to_usd)
         self.detail.model_convert_canceled.connect(self._cancel_model_conversion)
@@ -2673,7 +3455,77 @@ class AssetsTab(QWidget):
         catalog_layout.setContentsMargins(0, 0, 0, 0)
         catalog_layout.setSpacing(8)
         catalog_layout.addWidget(self.category_rail)
-        catalog_layout.addWidget(self.splitter, 1)
+        catalog_body = QWidget()
+        catalog_body_layout = QVBoxLayout(catalog_body)
+        catalog_body_layout.setContentsMargins(0, 0, 0, 0)
+        catalog_body_layout.setSpacing(8)
+        self.task_strip = QFrame()
+        self.task_strip.setObjectName("assetsToolbar")
+        task_layout = QHBoxLayout(self.task_strip)
+        task_layout.setContentsMargins(10, 7, 10, 7)
+        task_layout.setSpacing(8)
+        self.task_status = QLabel("Asset updates")
+        self.task_status.setObjectName("mutedLabel")
+        task_layout.addWidget(self.task_status, 1)
+        self.task_progress = QProgressBar()
+        self.task_progress.setTextVisible(False)
+        self.task_progress.setFixedWidth(180)
+        self.task_progress.setRange(0, 1)
+        task_layout.addWidget(self.task_progress)
+        self.task_cancel_button = QPushButton("Cancel")
+        self.task_cancel_button.clicked.connect(self._cancel_batch_metadata)
+        task_layout.addWidget(self.task_cancel_button)
+        self.task_retry_button = QPushButton("Retry Failed")
+        self.task_retry_button.clicked.connect(self._retry_failed_updates)
+        self.task_retry_button.hide()
+        task_layout.addWidget(self.task_retry_button)
+        self.task_dismiss_button = QPushButton("Dismiss")
+        self.task_dismiss_button.clicked.connect(self._dismiss_task_results)
+        self.task_dismiss_button.hide()
+        task_layout.addWidget(self.task_dismiss_button)
+        self.task_strip.hide()
+        self._task_hide_timer = QTimer(self)
+        self._task_hide_timer.setSingleShot(True)
+        self._task_hide_timer.timeout.connect(self._dismiss_task_results)
+        catalog_body_layout.addWidget(self.task_strip)
+        self.bulk_bar = QFrame()
+        self.bulk_bar.setObjectName("assetsToolbar")
+        bulk_layout = QHBoxLayout(self.bulk_bar)
+        bulk_layout.setContentsMargins(10, 7, 10, 7)
+        bulk_layout.setSpacing(8)
+        self.bulk_count = QLabel("0 selected")
+        self.bulk_count.setObjectName("mutedLabel")
+        bulk_layout.addWidget(self.bulk_count)
+        bulk_layout.addWidget(QLabel("Category"))
+        self.bulk_category = QComboBox()
+        self.bulk_category.setMinimumWidth(170)
+        bulk_layout.addWidget(self.bulk_category)
+        self.bulk_change_button = QPushButton("Change Category")
+        self.bulk_change_button.setObjectName("primaryButton")
+        self.bulk_change_button.clicked.connect(self._change_selected_category)
+        bulk_layout.addWidget(self.bulk_change_button)
+        self.bulk_ai_button = QPushButton("AI Organise Selected")
+        self.bulk_ai_button.clicked.connect(
+            lambda: self._open_ai_organiser(initial_scope="selected")
+        )
+        bulk_layout.addWidget(self.bulk_ai_button)
+        self.bulk_preview_button = QPushButton("Queue Previews")
+        self.bulk_preview_button.setToolTip(
+            "Add the selected texture or HDRI previews to the Blender queue."
+        )
+        self.bulk_preview_button.clicked.connect(
+            self._queue_selected_previews
+        )
+        self.bulk_preview_button.hide()
+        bulk_layout.addWidget(self.bulk_preview_button)
+        self.bulk_clear_button = QPushButton("Clear Selection")
+        self.bulk_clear_button.clicked.connect(self._clear_asset_selection)
+        bulk_layout.addWidget(self.bulk_clear_button)
+        bulk_layout.addStretch()
+        self.bulk_bar.hide()
+        catalog_body_layout.addWidget(self.bulk_bar)
+        catalog_body_layout.addWidget(self.splitter, 1)
+        catalog_layout.addWidget(catalog_body, 1)
 
         empty = QWidget()
         empty_layout = QVBoxLayout(empty)
@@ -2697,74 +3549,372 @@ class AssetsTab(QWidget):
         self.stack = QStackedWidget()
         self.stack.addWidget(self.catalog)
         self.stack.addWidget(empty)
+
+        loading = QWidget()
+        loading_layout = QVBoxLayout(loading)
+        loading_layout.addStretch()
+        self.loading_title = QLabel("Loading asset catalog…")
+        self.loading_title.setObjectName("pageTitle")
+        self.loading_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.loading_phase = QLabel("Discovering manifests")
+        self.loading_phase.setObjectName("mutedLabel")
+        self.loading_phase.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.loading_progress = QProgressBar()
+        self.loading_progress.setRange(0, 0)
+        self.loading_progress.setMaximumWidth(440)
+        loading_progress_row = QHBoxLayout()
+        loading_progress_row.addStretch()
+        loading_progress_row.addWidget(self.loading_progress, 1)
+        loading_progress_row.addStretch()
+        loading_layout.addWidget(self.loading_title)
+        loading_layout.addWidget(self.loading_phase)
+        loading_layout.addLayout(loading_progress_row)
+        loading_layout.addStretch()
+        self.stack.addWidget(loading)
+
+        error_page = QWidget()
+        error_layout = QVBoxLayout(error_page)
+        error_layout.addStretch()
+        self.catalog_error_title = QLabel("Could not load the asset catalog")
+        self.catalog_error_title.setObjectName("pageTitle")
+        self.catalog_error_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.catalog_error_message = QLabel()
+        self.catalog_error_message.setObjectName("mutedLabel")
+        self.catalog_error_message.setWordWrap(True)
+        self.catalog_error_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.retry_catalog_button = QPushButton("Retry")
+        self.retry_catalog_button.clicked.connect(self.refresh_catalog)
+        retry_row = QHBoxLayout()
+        retry_row.addStretch()
+        retry_row.addWidget(self.retry_catalog_button)
+        retry_row.addStretch()
+        error_layout.addWidget(self.catalog_error_title)
+        error_layout.addWidget(self.catalog_error_message)
+        error_layout.addLayout(retry_row)
+        error_layout.addStretch()
+        self.stack.addWidget(error_page)
         root.addWidget(self.stack, 1)
 
         self.search.textChanged.connect(self._filter)
         self.category.currentTextChanged.connect(self._filter)
         self.category_rail.category_changed.connect(self._rail_category_changed)
         self.channel.currentTextChanged.connect(self._filter)
+        self.rating_filter.currentTextChanged.connect(self._filter)
         self.sort.currentTextChanged.connect(self.proxy.set_sort_mode)
         self.view.clicked.connect(self._selected)
+        self.view.selectionModel().selectionChanged.connect(
+            self._selection_changed
+        )
         self.proxy.rowsInserted.connect(self._update_count)
         self.proxy.rowsRemoved.connect(self._update_count)
         self.proxy.modelReset.connect(self._update_count)
         self.stack.setCurrentIndex(1)
+        self.metadata_overlay = BusyOverlay(self)
         # Discovery is started when a supported asset is selected or the user
         # presses Refresh. Avoid keeping network workers alive for empty,
         # Stock-only, or short-lived catalog widgets.
 
+    @property
+    def metadata_update_active(self) -> bool:
+        return (
+            self._metadata_update_worker is not None
+            or self._batch_metadata_worker is not None
+            or self._rating_update_worker is not None
+            or bool(self._pending_rating_updates)
+        )
+
+    def _set_library_mutation_busy(self, active: bool) -> None:
+        active = bool(active)
+        changed = self._library_mutation_busy != active
+        self._library_mutation_busy = active
+        self.refresh_catalog_button.setEnabled(
+            not active and not self._catalog_refreshing
+        )
+        self.ai_organise_button.setEnabled(not active)
+        self.bulk_category.setEnabled(not active)
+        self.bulk_change_button.setEnabled(not active)
+        self.bulk_ai_button.setEnabled(not active)
+        self.bulk_preview_button.setEnabled(not active)
+        self.detail.set_library_mutation_busy(active)
+        self.card_delegate.set_rating_enabled(not active)
+        if changed:
+            self.library_mutation_busy_changed.emit(active)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self.metadata_overlay.isVisible():
+            self.metadata_overlay.setGeometry(self.rect())
+
     def load_library(self, path: str, selected_id: str = "") -> None:
         self.stock_hover_previews.stop()
+        previous_path = self._library_path
+        if path != previous_path:
+            self._clear_preview_render_queue(cancel_active=True)
+        self._cancel_catalog_refresh()
         self._library_path = path
-        assets: list[AssetRecord] = []
-        warnings: list[str] = []
+        self._catalog_index = None
+        self._section_warnings = {}
+        self._section_selections = {}
+        self._category_count_cache = {}
+        if path != previous_path:
+            self.card_delegate.clear_cache()
+        self._all_assets = []
+        self._all_asset_rows = {}
+        self.source_model.replace([])
         if path and LibraryRepository(path).root.is_dir():
-            repository = LibraryRepository(path)
-            category_store = CategoryConfigStore(path)
-            category_store.ensure_defaults()
-            self._category_catalogs = category_store.load_all()
-            assets = repository.list_assets()
-            warnings = [*repository.last_warnings, *category_store.last_warnings]
-        self._all_assets = assets
-        visible_assets = [asset for asset in assets if asset.asset_type == self._section_type()]
-        self.card_delegate.clear_cache()
+            try:
+                category_store = CategoryConfigStore(path)
+                category_store.ensure_defaults()
+                self._category_catalogs = category_store.load_all()
+                self._catalog_index = CatalogIndex.for_library(path)
+                sections = self._catalog_index.sections()
+                self._all_assets = [
+                    asset for asset_type in ("texture_set", "atlas", "hdri", "model", "stock")
+                    for asset in sections.get(asset_type, ())
+                ]
+                self._reindex_all_assets()
+            except Exception as error:
+                self._show_catalog_error(str(error))
+                return
+        if not path:
+            self._show_empty("No library configured", "Choose a writable library folder in Settings.", True)
+        else:
+            if selected_id:
+                self._section_selections[self._section_type()] = selected_id
+            self._display_section()
+            self._schedule_catalog_refresh()
+
+    def reload_library(self) -> None:
+        self.refresh_catalog()
+
+    def refresh_catalog(self) -> None:
+        if not self._library_path or self.metadata_update_active:
+            return
+        self._cancel_catalog_refresh()
+        self._schedule_catalog_refresh()
+
+    def _schedule_catalog_refresh(self) -> None:
+        if not self._library_path or self._catalog_index is None:
+            return
+        self._catalog_refreshing = True
+        self.refresh_catalog_button.setEnabled(False)
+        self.catalog_status.setText("Refreshing catalog…")
+        if not self.source_model.assets:
+            self._show_loading("Discovering manifests")
+        # Give short-lived dialogs/tests a chance to disappear before owning a
+        # worker, while remaining imperceptible during a normal application launch.
+        self._catalog_start_timer.start(250)
+
+    def _start_catalog_refresh(self) -> None:
+        if not self._library_path or self._catalog_index is None:
+            return
+        if not self.isVisible():
+            self._catalog_start_timer.start(250)
+            return
+        repository = LibraryRepository(self._library_path)
+        token = CancelToken()
+        worker = CatalogRefreshWorker(
+            repository, self._catalog_index, self._section_type(), token
+        )
+        self._catalog_generation += 1
+        generation = self._catalog_generation
+        self._catalog_token = token
+        self._catalog_worker = worker
+        self._catalog_workers.add(worker)
+        self._catalog_refreshing = True
+        self.refresh_catalog_button.setEnabled(False)
+        self.catalog_status.setText("Refreshing catalog…")
+        if not self.source_model.assets:
+            self._show_loading("Discovering manifests")
+        worker.signals.phase.connect(
+            lambda asset_type, phase: self._catalog_phase(
+                generation, asset_type, phase
+            )
+        )
+        worker.signals.progress.connect(
+            lambda asset_type, discovered, processed: self._catalog_progress(
+                generation, asset_type, discovered, processed
+            )
+        )
+        worker.signals.section_ready.connect(
+            lambda asset_type, assets, warnings: self._catalog_section_ready(
+                generation, asset_type, assets, warnings
+            )
+        )
+        worker.signals.finished.connect(
+            lambda results, active=worker: self._catalog_finished(
+                generation, results, active
+            )
+        )
+        worker.signals.failed.connect(
+            lambda message, active=worker: self._catalog_failed(
+                generation, message, active
+            )
+        )
+        worker.signals.canceled.connect(
+            lambda active=worker: self._catalog_canceled(active)
+        )
+        QThreadPool.globalInstance().start(worker)
+
+    def _cancel_catalog_refresh(self) -> None:
+        self._catalog_start_timer.stop()
+        if self._catalog_token is not None:
+            self._catalog_token.cancel()
+        self._catalog_generation += 1
+        self._catalog_token = None
+        self._catalog_worker = None
+        self._catalog_refreshing = False
+        self.refresh_catalog_button.setEnabled(True)
+        self.catalog_status.clear()
+
+    def _catalog_phase(self, generation: int, asset_type: str, phase: str) -> None:
+        if generation != self._catalog_generation:
+            return
+        if asset_type == self._section_type() and not self.source_model.assets:
+            self._show_loading(phase)
+
+    def _catalog_progress(
+        self, generation: int, asset_type: str, discovered: int, processed: int
+    ) -> None:
+        if generation != self._catalog_generation or asset_type != self._section_type():
+            return
+        if not self.source_model.assets:
+            self.loading_progress.setRange(0, max(1, discovered))
+            self.loading_progress.setValue(processed)
+            self.loading_phase.setText(
+                f"Processed {processed} of {discovered} manifests"
+            )
+
+    def _catalog_section_ready(
+        self,
+        generation: int,
+        asset_type: str,
+        assets: list[AssetRecord],
+        warnings: list[str],
+    ) -> None:
+        if generation != self._catalog_generation:
+            return
+        self._section_warnings[asset_type] = list(warnings)
+        self._all_assets = [
+            asset for asset in self._all_assets if asset.asset_type != asset_type
+        ] + list(assets)
+        self._reindex_all_assets()
+        self.card_delegate.retain_cache_paths({
+            str(asset.thumbnail_path)
+            for asset in self._all_assets
+            if asset.thumbnail_path
+        })
+        if asset_type == self._section_type():
+            self._display_section()
+
+    def _catalog_finished(
+        self,
+        generation: int,
+        _results: object,
+        worker: CatalogRefreshWorker,
+    ) -> None:
+        self._catalog_workers.discard(worker)
+        if generation != self._catalog_generation:
+            return
+        self._catalog_worker = None
+        self._catalog_token = None
+        self._catalog_refreshing = False
+        self.refresh_catalog_button.setEnabled(True)
+        warning_count = sum(len(values) for values in self._section_warnings.values())
+        self.catalog_status.setText(
+            f"Catalog ready · {warning_count} warning{'s' if warning_count != 1 else ''}"
+            if warning_count else "Catalog ready"
+        )
+        self._display_section()
+
+    def _catalog_failed(
+        self,
+        generation: int,
+        message: str,
+        worker: CatalogRefreshWorker,
+    ) -> None:
+        self._catalog_workers.discard(worker)
+        if generation != self._catalog_generation:
+            return
+        self._catalog_worker = None
+        self._catalog_token = None
+        self._catalog_refreshing = False
+        self.refresh_catalog_button.setEnabled(True)
+        if self._all_assets:
+            self.catalog_status.setText("Catalog refresh failed")
+            self.catalog_status.setToolTip(message)
+            self._display_section()
+        else:
+            self._show_catalog_error(message)
+
+    def _catalog_canceled(self, worker: CatalogRefreshWorker) -> None:
+        self._catalog_workers.discard(worker)
+
+    def _display_section(self) -> None:
+        asset_type = self._section_type()
+        visible_assets = [
+            asset for asset in self._all_assets if asset.asset_type == asset_type
+        ]
+        selected_id = self._section_selections.get(asset_type, "")
         self.source_model.replace(visible_assets)
         self._rebuild_categories()
         self._rebuild_facets()
-        if not path:
-            self._show_empty("No library configured", "Choose a writable library folder in Settings.", True)
-        elif not visible_assets:
-            kind = (
-                "model" if self._section_type() == "model"
-                else "HDRI" if self._section_type() == "hdri"
-                else "atlas" if self._section_type() == "atlas"
-                else "Stock clip" if self._section_type() == "stock"
-                else "texture"
-            )
-            message = f"Use the Importer tab to add your first {kind} asset."
-            if warnings:
-                message = f"No valid assets found. {len(warnings)} manifest warning(s)."
-            self._show_empty(f"Your {kind} library is empty", message, False)
-        else:
+        warnings = self._section_warnings.get(asset_type, [])
+        if visible_assets:
             self.stack.setCurrentIndex(0)
-            noun = (
-                "models" if self._section_type() == "model"
-                else "HDRIs" if self._section_type() == "hdri"
-                else "atlases" if self._section_type() == "atlas"
-                else "Stock clips" if self._section_type() == "stock"
-                else "texture sets"
+            self.count.setText(
+                f"{len(visible_assets)} asset{'s' if len(visible_assets) != 1 else ''}"
             )
-            self.count.setText(f"{len(visible_assets)} asset{'s' if len(visible_assets) != 1 else ''}")
             self.count.setToolTip(
-                f"{len(visible_assets)} imported {noun}" + (f" · {len(warnings)} manifest warnings" if warnings else "")
+                f"{len(visible_assets)} indexed assets"
+                + (f" · {len(warnings)} manifest warnings" if warnings else "")
             )
-            selected = self._proxy_index_for_id(selected_id) if selected_id else self.proxy.index(0, 0)
+            selected = (
+                self._proxy_index_for_id(selected_id)
+                if selected_id else self.proxy.index(0, 0)
+            )
             if selected.isValid():
                 self.view.setCurrentIndex(selected)
-                self.detail.show_asset(selected.data(ASSET_ROLE))
+                asset = selected.data(ASSET_ROLE)
+                self._section_selections[asset_type] = asset.id
+                self.detail.show_asset(asset)
+                self._sync_detail_task_state()
+            return
+        if self._catalog_refreshing:
+            self._show_loading("Waiting for this section…")
+            return
+        kind = self._section_label(asset_type)
+        message = f"Use the Importer tab to add your first {kind} asset."
+        if warnings:
+            message = f"No valid assets found. {len(warnings)} manifest warning(s)."
+        self._show_empty(f"Your {kind} library is empty", message, False)
 
-    def reload_library(self) -> None:
-        self.load_library(self._library_path)
+    def _show_loading(self, phase: str) -> None:
+        self.loading_title.setText(
+            f"Loading {self._section_label(self._section_type())} catalog…"
+        )
+        self.loading_phase.setText(phase)
+        self.loading_progress.setRange(0, 0)
+        self.stack.setCurrentIndex(2)
+        self.count.setText("Loading…")
+        self.detail.clear()
+
+    def _show_catalog_error(self, message: str) -> None:
+        self.catalog_error_message.setText(message or "The catalog refresh failed.")
+        self.stack.setCurrentIndex(3)
+        self.count.setText("Catalog unavailable")
+        self.catalog_status.setText("Refresh failed")
+        self.detail.clear()
+
+    @staticmethod
+    def _section_label(asset_type: str) -> str:
+        return {
+            "model": "model",
+            "hdri": "HDRI",
+            "atlas": "atlas",
+            "stock": "Stock clip",
+            "texture_set": "texture",
+        }.get(asset_type, "asset")
 
     def _proxy_index_for_id(self, asset_id: str) -> QModelIndex:
         for row in range(self.proxy.rowCount()):
@@ -2775,6 +3925,8 @@ class AssetsTab(QWidget):
         return QModelIndex()
 
     def _edit_material(self, asset: AssetRecord) -> None:
+        if self.metadata_update_active:
+            return
         dialog = MaterialEditDialog(
             asset,
             self,
@@ -2784,15 +3936,474 @@ class AssetsTab(QWidget):
             return
         self._save_material_edit(asset, dialog.metadata_update())
 
-    def _save_material_edit(self, asset: AssetRecord, update: AssetMetadataUpdate) -> bool:
-        try:
-            updated = LibraryRepository(self._library_path).update_asset_metadata(asset.id, update)
-        except Exception as error:
-            QMessageBox.critical(self, "Could not update material", str(error))
+    def _save_material_edit(
+        self,
+        asset: AssetRecord,
+        update: AssetMetadataUpdate,
+        *,
+        origin: str = "manual",
+    ) -> bool:
+        if self.metadata_update_active or not self._library_path:
             return False
-        self.load_library(self._library_path, selected_id=updated.id)
-        self.material_updated.emit(updated)
+        self._dismiss_task_results()
+        moving = asset.category.casefold() != update.category.casefold()
+        message = (
+            f"Moving {asset.name} to {update.category}…"
+            if moving
+            else f"Saving changes to {asset.name}…"
+        )
+        library_path = self._library_path
+        worker = MetadataUpdateWorker(
+            library_path, asset.id, update, self._catalog_index
+        )
+        _LIVE_METADATA_UPDATE_WORKERS.add(worker)
+        self._metadata_update_worker = worker
+        self._metadata_update_asset_id = asset.id
+        self._metadata_update_library_path = library_path
+        self._metadata_update_origin = origin
+        self._metadata_update_value = update
+        self._cancel_catalog_refresh()
+        self._task_hide_timer.stop()
+        self._failed_single_update = None
+        self.card_delegate.set_task_state(asset.id, "moving")
+        self._sync_detail_task_state()
+        self._show_active_task(message, 0, 1, cancelable=False)
+        self._set_library_mutation_busy(True)
+        self.stock_hover_previews.stop()
+        worker.signals.finished.connect(
+            lambda updated, active=worker: self._metadata_update_finished(
+                updated, active
+            )
+        )
+        worker.signals.failed.connect(
+            lambda message, active=worker: self._metadata_update_failed(
+                message, active
+            )
+        )
+        worker.signals.finished.connect(
+            lambda _updated, active=worker: _LIVE_METADATA_UPDATE_WORKERS.discard(
+                active
+            )
+        )
+        worker.signals.failed.connect(
+            lambda _message, active=worker: _LIVE_METADATA_UPDATE_WORKERS.discard(
+                active
+            )
+        )
+        QThreadPool.globalInstance().start(worker)
         return True
+
+    def _rate_asset(self, asset: AssetRecord, rating: int) -> bool:
+        if (
+            self._metadata_update_worker is not None
+            or self._batch_metadata_worker is not None
+            or not self._library_path
+        ):
+            return False
+        if isinstance(rating, bool) or not isinstance(rating, int) or not 0 <= rating <= 5:
+            return False
+        if self._rating_update_worker is None and not self._pending_rating_updates:
+            self._dismiss_task_results()
+        current = self._asset_by_id(asset.id) or asset
+        self._rating_confirmed_assets.setdefault(asset.id, current)
+        self._pending_rating_updates[asset.id] = rating
+        optimistic = replace(current, rating=rating)
+        self.card_delegate.clear_task_state(asset.id)
+        self.apply_asset_update_incremental(optimistic)
+        if self.detail._asset and self.detail._asset.id == asset.id:
+            self.detail.star_rating.set_save_state("saving")
+        self._start_next_rating_update()
+        return True
+
+    def _start_next_rating_update(self) -> None:
+        if self._rating_update_worker is not None or not self._pending_rating_updates:
+            return
+        asset_id, rating = self._pending_rating_updates.popitem(last=False)
+        worker = RatingUpdateWorker(
+            self._library_path, asset_id, rating, self._catalog_index
+        )
+        _LIVE_RATING_UPDATE_WORKERS.add(worker)
+        self._rating_update_worker = worker
+        self._rating_update_asset_id = asset_id
+        self._rating_update_value = rating
+        self._cancel_catalog_refresh()
+        if self.detail._asset and self.detail._asset.id == asset_id:
+            self.detail.star_rating.set_save_state("saving")
+        worker.signals.finished.connect(
+            lambda updated, active=worker: self._rating_update_finished(
+                updated, active
+            )
+        )
+        worker.signals.failed.connect(
+            lambda message, active=worker: self._rating_update_failed(
+                message, active
+            )
+        )
+        worker.signals.finished.connect(
+            lambda _updated, active=worker: _LIVE_RATING_UPDATE_WORKERS.discard(active)
+        )
+        worker.signals.failed.connect(
+            lambda _message, active=worker: _LIVE_RATING_UPDATE_WORKERS.discard(active)
+        )
+        QThreadPool.globalInstance().start(worker)
+
+    def _finish_rating_update_ui(
+        self, worker: RatingUpdateWorker
+    ) -> tuple[str, int] | None:
+        if self._rating_update_worker is not worker:
+            return None
+        context = (self._rating_update_asset_id, self._rating_update_value)
+        self._rating_update_worker = None
+        self._rating_update_asset_id = ""
+        self._rating_update_value = 0
+        return context
+
+    def _rating_update_finished(
+        self, updated: AssetRecord, worker: RatingUpdateWorker
+    ) -> None:
+        context = self._finish_rating_update_ui(worker)
+        if context is None:
+            return
+        asset_id, _rating = context
+        self._rating_confirmed_assets[asset_id] = updated
+        if asset_id not in self._pending_rating_updates:
+            self.apply_asset_update_incremental(updated)
+            self._rating_confirmed_assets.pop(asset_id, None)
+            if self.detail._asset and self.detail._asset.id == asset_id:
+                self.detail.star_rating.set_save_state("saved")
+        self.material_updated.emit(updated)
+        self._start_next_rating_update()
+
+    def _rating_update_failed(
+        self, message: str, worker: RatingUpdateWorker
+    ) -> None:
+        context = self._finish_rating_update_ui(worker)
+        if context is None:
+            return
+        asset_id, _rating = context
+        if asset_id not in self._pending_rating_updates:
+            previous = self._rating_confirmed_assets.pop(asset_id, None)
+            if previous is not None:
+                self.apply_asset_update_incremental(previous)
+            self.card_delegate.clear_task_state(asset_id)
+            self._sync_detail_task_state()
+            if self.detail._asset and self.detail._asset.id == asset_id:
+                self.detail.star_rating.setToolTip(
+                    f"Rating was not saved: {message}"
+                )
+            self.task_strip.hide()
+        self._start_next_rating_update()
+
+    def _finish_metadata_update_ui(
+        self, worker: MetadataUpdateWorker
+    ) -> tuple[str, str, str, AssetMetadataUpdate] | None:
+        if self._metadata_update_worker is not worker:
+            return None
+        update = self._metadata_update_value
+        if update is None:
+            return None
+        context = (
+            self._metadata_update_asset_id,
+            self._metadata_update_library_path,
+            self._metadata_update_origin,
+            update,
+        )
+        self._metadata_update_worker = None
+        self._metadata_update_asset_id = ""
+        self._metadata_update_library_path = ""
+        self._metadata_update_origin = ""
+        self._metadata_update_value = None
+        return context
+
+    def _metadata_update_finished(
+        self, updated: AssetRecord, worker: MetadataUpdateWorker
+    ) -> None:
+        context = self._finish_metadata_update_ui(worker)
+        if context is None:
+            return
+        asset_id, library_path, origin, _update = context
+        self.card_delegate.clear_task_state(asset_id)
+        self._sync_detail_task_state()
+        if library_path == self._library_path:
+            self.apply_asset_update_incremental(updated)
+        self.material_updated.emit(updated)
+        self._set_library_mutation_busy(False)
+        self._show_completed_task("Updated 1 asset.", auto_hide=True)
+        if origin.startswith("ai:"):
+            operation = origin.partition(":")[2]
+            if (
+                self.detail._asset
+                and self.detail._asset.id == asset_id
+                and library_path == self._library_path
+            ):
+                self.detail.set_ai_result(
+                    "AI category applied."
+                    if operation == "category"
+                    else "AI tags added.",
+                    True,
+                )
+
+    def _metadata_update_failed(
+        self, message: str, worker: MetadataUpdateWorker
+    ) -> None:
+        context = self._finish_metadata_update_ui(worker)
+        if context is None:
+            return
+        asset_id, _library_path, origin, update = context
+        asset = self._asset_by_id(asset_id)
+        if asset is not None:
+            self._failed_single_update = (asset, update, origin)
+        self.card_delegate.set_task_state(asset_id, "failed", message)
+        self._sync_detail_task_state()
+        self._set_library_mutation_busy(False)
+        self._show_failed_task(1, {asset_id: message})
+        if origin.startswith("ai:"):
+            if self.detail._asset and self.detail._asset.id == asset_id:
+                self.detail.set_ai_result(message, False)
+
+    def _start_batch_metadata(
+        self,
+        requests: tuple[BatchMetadataRequest, ...],
+        *,
+        origin: str,
+        title: str,
+    ) -> bool:
+        if not requests or self.metadata_update_active or not self._library_path:
+            return False
+        self._dismiss_task_results()
+        worker = BatchMetadataWorker(
+            self._library_path,
+            requests,
+            self._catalog_index,
+        )
+        self._task_hide_timer.stop()
+        self._failed_batch_requests = {}
+        self._failed_batch_origin = origin
+        self._failed_single_update = None
+        self._batch_metadata_worker = worker
+        self._batch_metadata_origin = origin
+        self._cancel_catalog_refresh()
+        for index, request in enumerate(requests):
+            self.card_delegate.set_task_state(
+                request.asset_id, "moving" if index == 0 else "queued"
+            )
+        self._sync_detail_task_state()
+        worker.signals.item_finished.connect(
+            lambda result, active=worker: self._batch_metadata_item_finished(
+                result, active
+            )
+        )
+        worker.signals.finished.connect(
+            lambda result, active=worker: self._batch_metadata_finished(
+                result, active
+            )
+        )
+        self.stock_hover_previews.stop()
+        self._show_active_task(title, 0, len(requests), cancelable=True)
+        self._set_library_mutation_busy(True)
+        QThreadPool.globalInstance().start(worker)
+        return True
+
+    def _batch_metadata_item_finished(self, result, worker: BatchMetadataWorker) -> None:
+        if worker is not self._batch_metadata_worker:
+            return
+        request = result.request
+        if result.updated is not None:
+            self.card_delegate.clear_task_state(request.asset_id)
+            self.apply_asset_update_incremental(result.updated)
+            self.material_updated.emit(result.updated)
+        else:
+            self._failed_batch_requests[request.asset_id] = request
+            self.card_delegate.set_task_state(
+                request.asset_id, "failed", result.error
+            )
+        self._sync_detail_task_state()
+        if result.completed < len(worker.requests):
+            next_request = worker.requests[result.completed]
+            state = self.card_delegate.task_state(next_request.asset_id)
+            if state and state[0] == "queued":
+                self.card_delegate.set_task_state(next_request.asset_id, "moving")
+        self.task_progress.setRange(0, result.total)
+        self.task_progress.setValue(result.completed)
+        self.task_status.setText(
+            f"Updating {request.asset_name} "
+            f"({result.completed} of {result.total})"
+        )
+
+    def _batch_metadata_finished(
+        self, result: BatchMetadataResult, worker: BatchMetadataWorker
+    ) -> None:
+        if worker is not self._batch_metadata_worker:
+            return
+        origin = self._batch_metadata_origin
+        self._batch_metadata_worker = None
+        self._batch_metadata_origin = ""
+        processed_ids = {
+            asset.id for asset in result.updated
+        } | set(result.failures)
+        unprocessed_ids = {
+            request.asset_id for request in worker.requests
+        } - processed_ids
+        self.card_delegate.clear_task_states(unprocessed_ids)
+        if result.updated:
+            self._rebuild_categories()
+            self._rebuild_facets()
+        self._sync_detail_task_state()
+        self._set_library_mutation_busy(False)
+        if result.failures:
+            self._failed_batch_origin = origin
+            self._show_failed_task(len(result.updated), result.failures)
+        elif result.canceled:
+            self._show_completed_task(
+                f"Updated {len(result.updated)} asset(s); remaining moves canceled.",
+                auto_hide=False,
+            )
+        else:
+            self._show_completed_task(
+                f"Updated {len(result.updated)} asset(s).", auto_hide=True
+            )
+
+    def _show_active_task(
+        self, message: str, completed: int, total: int, *, cancelable: bool
+    ) -> None:
+        self.task_status.setText(message)
+        self.task_status.setToolTip("")
+        self.task_progress.setRange(0, max(1, total))
+        self.task_progress.setValue(completed)
+        self.task_progress.show()
+        self.task_cancel_button.setVisible(cancelable)
+        self.task_cancel_button.setEnabled(cancelable)
+        self.task_retry_button.hide()
+        self.task_dismiss_button.hide()
+        self.task_strip.show()
+
+    def _show_completed_task(self, message: str, *, auto_hide: bool) -> None:
+        self.task_status.setText(message)
+        self.task_status.setToolTip("")
+        self.task_progress.hide()
+        self.task_cancel_button.hide()
+        self.task_retry_button.hide()
+        self.task_dismiss_button.show()
+        self.task_strip.show()
+        if auto_hide:
+            self._task_hide_timer.start(3500)
+
+    def _show_failed_task(
+        self, succeeded: int, failures: dict[str, str]
+    ) -> None:
+        self.task_status.setText(
+            f"Updated {succeeded} asset(s); {len(failures)} failed."
+        )
+        self.task_status.setToolTip("\n".join(failures.values()))
+        self.task_progress.hide()
+        self.task_cancel_button.hide()
+        self.task_retry_button.show()
+        self.task_dismiss_button.show()
+        self.task_strip.show()
+
+    def _cancel_batch_metadata(self) -> None:
+        if self._batch_metadata_worker is not None:
+            self._batch_metadata_worker.cancel()
+            self.task_cancel_button.setEnabled(False)
+            self.task_status.setText("Canceling after the current asset…")
+
+    def _retry_failed_updates(self) -> None:
+        if self.metadata_update_active:
+            return
+        if self._failed_batch_requests:
+            requests = tuple(self._failed_batch_requests.values())
+            origin = self._failed_batch_origin or "manual-category"
+            self._start_batch_metadata(
+                requests,
+                origin=origin,
+                title=f"Retrying {len(requests)} failed asset update(s)",
+            )
+            return
+        if self._failed_single_update is not None:
+            asset, update, origin = self._failed_single_update
+            self._save_material_edit(asset, update, origin=origin)
+            return
+
+    def _retry_failed_asset(self, asset_id: str) -> None:
+        if self.metadata_update_active:
+            self.task_status.setText(
+                "Retry is available after the current queue finishes."
+            )
+            return
+        request = self._failed_batch_requests.get(asset_id)
+        if request is not None:
+            self._start_batch_metadata(
+                (request,),
+                origin=self._failed_batch_origin or "manual-category",
+                title=f"Retrying {request.asset_name}",
+            )
+            return
+        if (
+            self._failed_single_update is not None
+            and self._failed_single_update[0].id == asset_id
+        ):
+            asset, update, origin = self._failed_single_update
+            self._save_material_edit(asset, update, origin=origin)
+            return
+
+    def _dismiss_task_results(self) -> None:
+        if self.metadata_update_active:
+            return
+        failed_ids = set(self._failed_batch_requests)
+        if self._failed_single_update is not None:
+            failed_ids.add(self._failed_single_update[0].id)
+        self.card_delegate.clear_task_states(failed_ids)
+        self._sync_detail_task_state()
+        self._failed_batch_requests = {}
+        self._failed_batch_origin = ""
+        self._failed_single_update = None
+        self.task_strip.hide()
+
+    def _open_ai_organiser(self, *, initial_scope: str = "all_fallback") -> None:
+        if self.metadata_update_active or not self._library_path:
+            return
+        selected_ids = {asset.id for asset in self._selected_assets()}
+        if initial_scope == "selected" and not selected_ids:
+            QMessageBox.information(
+                self,
+                "No assets selected",
+                "Select one or more assets before opening the selected-assets scope.",
+            )
+            return
+        if not self._ensure_ollama_ready():
+            return
+        try:
+            vocabularies = {
+                asset_type: load_tag_vocabulary(asset_type, self._library_path)
+                for asset_type in self._category_catalogs
+            }
+        except Exception as error:
+            QMessageBox.warning(
+                self, "Could not load AI tag vocabulary", str(error)
+            )
+            return
+        dialog = AiOrganiserDialog(
+            tuple(self._all_assets),
+            self._category_catalogs,
+            vocabularies,
+            _classification_preview,
+            current_asset_type=self._section_type(),
+            selected_ids=selected_ids,
+            initial_scope=initial_scope,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        approved = dialog.approved_patches()
+        requests = tuple(
+            BatchMetadataRequest(asset.id, asset.name, patch)
+            for asset, patch in approved
+        )
+        self._start_batch_metadata(
+            requests,
+            origin="ai-organiser",
+            title=f"Applying {len(requests)} AI classifications",
+        )
 
     def _guess_asset_metadata(self, asset: AssetRecord, operation: str) -> None:
         if self._ai_guess_worker is not None:
@@ -2924,12 +4535,11 @@ class AssetsTab(QWidget):
                 description=refreshed.description,
                 physical_size=refreshed.physical_size,
             ),
+            origin=f"ai:{operation}",
         )
-        if applied and self.detail._asset and self.detail._asset.id == asset_id:
+        if not applied and self.detail._asset and self.detail._asset.id == asset_id:
             self.detail.set_ai_result(
-                "AI category applied." if operation == "category"
-                else "AI tags added.",
-                True,
+                "Another asset update is already running.", False
             )
 
     def _ai_guess_failed(self, message: str) -> None:
@@ -2942,20 +4552,19 @@ class AssetsTab(QWidget):
             QMessageBox.warning(self, "AI classification failed", message)
 
     def _asset_by_id(self, asset_id: str) -> AssetRecord | None:
-        if not self._library_path:
-            return None
-        return next(
-            (
-                asset
-                for asset in LibraryRepository(self._library_path).list_assets()
-                if asset.id == asset_id
-            ),
-            None,
-        )
+        row = self._all_asset_rows.get(asset_id)
+        return self._all_assets[row] if row is not None else None
+
+    def _reindex_all_assets(self) -> None:
+        self._all_asset_rows = {
+            asset.id: row for row, asset in enumerate(self._all_assets)
+        }
 
     def shutdown_ai(self) -> None:
         if self._ai_guess_worker is not None:
             self._ai_guess_worker.cancel()
+        if self._batch_metadata_worker is not None:
+            self._batch_metadata_worker.cancel()
         if (
             self._ollama_process is not None
             and self._ollama_process.state() != QProcess.ProcessState.NotRunning
@@ -2963,6 +4572,62 @@ class AssetsTab(QWidget):
             self._ollama_process.terminate()
             if not self._ollama_process.waitForFinished(1800):
                 self._ollama_process.kill()
+
+    def shutdown_catalog(self) -> None:
+        self._cancel_catalog_refresh()
+
+    def apply_asset_updates(self, assets, *, update_index: bool = True) -> None:
+        """Apply ShotBox-managed mutations immediately without rescanning."""
+        updated = list(assets)
+        if not updated:
+            return
+        by_id = {asset.id: asset for asset in updated}
+        self._all_assets = [
+            asset for asset in self._all_assets if asset.id not in by_id
+        ] + updated
+        self._reindex_all_assets()
+        self.card_delegate.retain_cache_paths({
+            str(asset.thumbnail_path)
+            for asset in self._all_assets
+            if asset.thumbnail_path
+        })
+        if update_index and self._catalog_index is not None:
+            for asset in updated:
+                manifest = asset.asset_dir / "asset.json"
+                if manifest.is_file():
+                    try:
+                        self._catalog_index.upsert(
+                            CatalogRecord.from_manifest(asset, manifest)
+                        )
+                    except Exception:
+                        pass
+        for asset in updated:
+            self._section_selections[asset.asset_type] = asset.id
+        self._display_section()
+
+    def apply_asset_update_incremental(self, updated: AssetRecord) -> None:
+        """Replace one catalog record without resetting the visible grid."""
+        scroll_value = self.view.verticalScrollBar().value()
+        row = self._all_asset_rows.get(updated.id)
+        if row is None:
+            return
+        previous = self._all_assets[row]
+        self._all_assets[row] = updated
+        self._section_selections[updated.asset_type] = updated.id
+        if (
+            updated.asset_type == self._section_type()
+            and self.source_model.replace_asset(updated)
+        ):
+            self._update_categories_for_asset_change(previous, updated)
+            self.view.verticalScrollBar().setValue(scroll_value)
+        self.card_delegate.retain_cache_paths({
+            str(asset.thumbnail_path)
+            for asset in self._all_assets
+            if asset.thumbnail_path
+        })
+        if self.detail._asset and self.detail._asset.id == updated.id:
+            self.detail.show_asset(updated)
+        self._update_count()
 
     def _show_empty(self, title: str, message: str, show_settings: bool) -> None:
         self.empty_title.setText(title)
@@ -2982,6 +4647,8 @@ class AssetsTab(QWidget):
             for asset in self.source_model.assets
             for category in _asset_filter_categories(asset, catalog)
         }
+        if current and current != "All":
+            used.add(current)
         ordered = catalog.ordered_used(used)
         self.category.blockSignals(True)
         self.category.clear()
@@ -2996,6 +4663,47 @@ class AssetsTab(QWidget):
             selected=self.category.currentText(),
         )
         self._filter()
+
+    def _update_categories_for_asset_change(
+        self, previous: AssetRecord, updated: AssetRecord
+    ) -> None:
+        counts = dict(self._category_count_cache or self._category_counts())
+        catalog = self._category_catalogs[self._section_type()]
+        query = self.search.text()
+        facet = self.channel.currentText()
+
+        def adjust(asset: AssetRecord, amount: int) -> None:
+            if not asset.matches(query, "All", facet):
+                return
+            counts["All"] = max(0, counts.get("All", 0) + amount)
+            for category in _asset_filter_categories(asset, catalog):
+                counts[category] = max(0, counts.get(category, 0) + amount)
+
+        adjust(previous, -1)
+        adjust(updated, 1)
+        self._category_count_cache = counts
+        current = self.category.currentText()
+        used = {
+            category
+            for category, count in counts.items()
+            if category != "All" and count > 0
+        }
+        if current and current != "All":
+            used.add(current)
+        ordered = catalog.ordered_used(used)
+        self.category.blockSignals(True)
+        self.category.clear()
+        self.category.addItems(["All", *ordered])
+        self.category.setCurrentText(
+            current if self.category.findText(current) >= 0 else "All"
+        )
+        self.category.blockSignals(False)
+        self.category_rail.set_categories(
+            ordered,
+            {name: catalog.icon_for(name) for name in ordered},
+            counts,
+            selected=self.category.currentText(),
+        )
 
     def _rebuild_facets(self) -> None:
         current = self.channel.currentText()
@@ -3045,11 +4753,126 @@ class AssetsTab(QWidget):
     def _selected(self, index: QModelIndex) -> None:
         asset = index.data(ASSET_ROLE)
         if asset:
+            self._section_selections[asset.asset_type] = asset.id
             self.detail.show_asset(asset)
+            self._sync_detail_task_state()
+            self._sync_preview_render_status()
+
+    def _sync_detail_task_state(self) -> None:
+        asset = self.detail._asset
+        state = self.card_delegate.task_state(asset.id) if asset else None
+        self.detail.set_asset_task_busy(
+            bool(state and state[0] in {"queued", "moving", "saving"})
+        )
+
+    def _selected_assets(self) -> tuple[AssetRecord, ...]:
+        indexes = sorted(
+            self.view.selectionModel().selectedIndexes(),
+            key=lambda index: index.row(),
+        )
+        return tuple(
+            asset
+            for index in indexes
+            if (asset := index.data(ASSET_ROLE)) is not None
+        )
+
+    def _selection_changed(self, *_args) -> None:
+        assets = self._selected_assets()
+        count = len(assets)
+        self.bulk_count.setText(f"{count} assets selected")
+        self.bulk_bar.setVisible(count > 1)
+        renderable_count = sum(
+            isinstance(asset, LibraryHdriAsset)
+            or isinstance(asset, LibraryTextureAsset)
+            and asset.asset_type == "texture_set"
+            for asset in assets
+        )
+        self.bulk_preview_button.setText(
+            f"Queue Previews ({renderable_count})"
+        )
+        self.bulk_preview_button.setVisible(
+            count > 1 and renderable_count > 0
+        )
+        if count == 1:
+            asset = assets[0]
+            self._section_selections[asset.asset_type] = asset.id
+            self.detail.show_asset(asset)
+        elif count == 0:
+            self.detail.clear()
+        self._sync_detail_task_state()
+        self._sync_preview_render_status()
+        self._rebuild_bulk_categories()
+
+    def _rebuild_bulk_categories(self) -> None:
+        current = self.bulk_category.currentText()
+        names = self._category_catalogs[self._section_type()].names
+        self.bulk_category.blockSignals(True)
+        self.bulk_category.clear()
+        self.bulk_category.addItems(names)
+        if current and self.bulk_category.findText(current) >= 0:
+            self.bulk_category.setCurrentText(current)
+        self.bulk_category.blockSignals(False)
+
+    def _clear_asset_selection(self) -> None:
+        self.view.clearSelection()
+        self.view.setCurrentIndex(QModelIndex())
+        self.detail.clear()
+
+    def _queue_selected_previews(self) -> None:
+        selected = self._selected_assets()
+        renderable = tuple(
+            asset
+            for asset in selected
+            if isinstance(asset, LibraryHdriAsset)
+            or isinstance(asset, LibraryTextureAsset)
+            and asset.asset_type == "texture_set"
+        )
+        added = self.queue_preview_renders(
+            renderable, automatic=False
+        )
+        skipped = len(renderable) - added
+        message = f"Added {added} preview render(s)"
+        if skipped:
+            message += f"; {skipped} already queued or active"
+        self.preview_queue_status.setToolTip(message + ".")
+
+    def _change_selected_category(self) -> None:
+        assets = self._selected_assets()
+        if len(assets) < 2 or self.metadata_update_active:
+            return
+        category = self.bulk_category.currentText().strip()
+        if not category:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Change asset category",
+            f"Move {len(assets)} selected assets to {category}? "
+            "Managed asset folders will move to the matching category folder.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        requests = tuple(
+            BatchMetadataRequest(
+                asset.id,
+                asset.name,
+                AssetMetadataPatch(category=category),
+            )
+            for asset in assets
+        )
+        self._start_batch_metadata(
+            requests,
+            origin="manual-category",
+            title=f"Changing {len(requests)} asset categories",
+        )
 
     def _filter(self, *_args) -> None:
         self.stock_hover_previews.stop()
-        self.proxy.set_filters(self.search.text(), self.category.currentText(), self.channel.currentText())
+        self.proxy.set_filters(
+            self.search.text(),
+            self.category.currentText(),
+            self.channel.currentText(),
+            self.rating_filter.currentText(),
+        )
         self.category_rail.set_counts(self._category_counts())
         current = self.view.currentIndex()
         if not current.isValid() and self.proxy.rowCount():
@@ -3067,12 +4890,17 @@ class AssetsTab(QWidget):
         for asset in self.source_model.assets:
             if not asset.matches(query, "All", facet):
                 continue
+            if not _rating_filter_matches(
+                asset.rating, self.rating_filter.currentText()
+            ):
+                continue
             counts["All"] += 1
             for category in _asset_filter_categories(
                 asset,
                 self._category_catalogs[self._section_type()],
             ):
                 counts[category] = counts.get(category, 0) + 1
+        self._category_count_cache = counts
         return counts
 
     def _rail_category_changed(self, category: str) -> None:
@@ -3104,8 +4932,25 @@ class AssetsTab(QWidget):
     def _save_splitter_state(self, *_args) -> None:
         QSettings().setValue("assets/splitter_state", self.splitter.saveState())
 
-    def set_hdri_preview_settings(self, blender_path: str) -> None:
+    def set_hdri_preview_settings(
+        self,
+        blender_path: str,
+        save_texture_preview_blend: bool = False,
+        render_hdri_on_import: bool = True,
+        render_texture_on_import: bool = True,
+    ) -> None:
+        if blender_path != self._blender_path and self._preview_session is not None:
+            self._clear_preview_render_queue(cancel_active=True)
         self._blender_path = blender_path
+        self._save_texture_preview_blend = bool(
+            save_texture_preview_blend
+        )
+        self._render_hdri_previews_on_import = bool(
+            render_hdri_on_import
+        )
+        self._render_texture_previews_on_import = bool(
+            render_texture_on_import
+        )
 
     def refresh_houdini_sessions(self) -> None:
         if self._houdini_worker is not None:
@@ -3295,7 +5140,7 @@ class AssetsTab(QWidget):
         asset = getattr(result, "asset", None)
         if asset is not None:
             skipped = bool(getattr(result, "skipped", False))
-            self.load_library(self._library_path, selected_id=asset.id)
+            self.apply_asset_updates((asset,))
             self.detail.set_polyhaven_result(
                 "The selected package is already complete." if skipped else
                 f"Downloaded {getattr(result, 'kind', 'files').upper()} {getattr(result, 'resolution', '')}.",
@@ -3314,41 +5159,296 @@ class AssetsTab(QWidget):
             self.detail.set_polyhaven_busy(True, "Canceling download safely…")
 
     def _render_hdri_preview(self, asset: AssetRecord) -> None:
-        if not isinstance(asset, LibraryHdriAsset) or self._hdri_render_worker is not None:
+        self.queue_preview_renders((asset,), automatic=False)
+
+    def queue_import_previews(self, assets) -> int:
+        """Queue missing previews after imports have been published."""
+        eligible = []
+        for asset in assets:
+            status = str(getattr(asset, "preview_render", {}).get(
+                "status", ""
+            ))
+            if status != "pending":
+                continue
+            if (
+                isinstance(asset, LibraryHdriAsset)
+                and self._render_hdri_previews_on_import
+            ) or (
+                isinstance(asset, LibraryTextureAsset)
+                and asset.asset_type == "texture_set"
+                and self._render_texture_previews_on_import
+            ):
+                eligible.append(asset)
+        return self.queue_preview_renders(eligible, automatic=True)
+
+    def queue_preview_renders(
+        self, assets, *, automatic: bool = False
+    ) -> int:
+        added = 0
+        new_jobs = []
+        for asset in assets:
+            renderable = isinstance(asset, LibraryHdriAsset) or (
+                isinstance(asset, LibraryTextureAsset)
+                and asset.asset_type == "texture_set"
+            )
+            if (
+                not renderable
+                or not self._library_path
+                or asset.id in self._preview_render_ids
+            ):
+                continue
+            new_jobs.append(
+                PreviewRenderJob(
+                    self._library_path,
+                    asset.id,
+                    asset.asset_type,
+                    asset.name,
+                    notify_failure=not automatic,
+                )
+            )
+            self._preview_render_ids.add(asset.id)
+            self.card_delegate.set_task_state(
+                asset.id,
+                "preview_queued",
+                "Preview render queued",
+            )
+            added += 1
+        if automatic:
+            self._preview_render_jobs.extend(new_jobs)
+        else:
+            self._preview_render_jobs[0:0] = new_jobs
+        self._start_next_preview_render()
+        self._update_preview_queue_controls()
+        self._sync_preview_render_status()
+        return added
+
+    def _start_next_preview_render(self) -> None:
+        if self._hdri_render_worker is not None:
             return
+        while self._preview_render_jobs:
+            job = self._preview_render_jobs.pop(0)
+            if (
+                job.library_path != self._library_path
+                or self._asset_by_id(job.asset_id) is None
+            ):
+                self._preview_render_ids.discard(job.asset_id)
+                self.card_delegate.clear_task_state(job.asset_id)
+                continue
+            break
+        else:
+            self._active_preview_render_job = None
+            self._retire_preview_session()
+            self._update_preview_queue_controls()
+            self._sync_preview_render_status()
+            return
+        self._active_preview_render_job = job
+        self.card_delegate.set_task_state(
+            job.asset_id,
+            "preview_rendering",
+            "Rendering preview in Blender",
+        )
         token = CancelToken()
-        worker = HdriRenderWorker(self._library_path, asset.id, self._blender_path, token)
+        if self._preview_session is None:
+            self._preview_session = BlenderPreviewSession(self._blender_path)
+        worker = HdriRenderWorker(
+            job.library_path,
+            job.asset_id,
+            self._blender_path,
+            token,
+            job.asset_type,
+            self._save_texture_preview_blend,
+            self._preview_session,
+        )
         self._hdri_render_token = token
         self._hdri_render_worker = worker
-        self.detail.set_hdri_rendering(True, "Starting Blender…")
-        worker.signals.progress.connect(lambda message: self.detail.set_hdri_rendering(True, message))
+        self._update_preview_queue_controls()
+        worker.signals.progress.connect(
+            lambda message, asset_id=job.asset_id:
+            self._preview_render_progressed(asset_id, message)
+        )
         worker.signals.finished.connect(self._hdri_render_finished)
         worker.signals.failed.connect(self._hdri_render_failed)
+        self._sync_preview_render_status("Starting Blender…")
         QThreadPool.globalInstance().start(worker)
 
     def _cancel_hdri_render(self) -> None:
-        if self._hdri_render_token:
+        asset = self.detail._asset
+        if asset is None:
+            return
+        active = self._active_preview_render_job
+        if (
+            active is not None
+            and active.asset_id == asset.id
+            and self._hdri_render_token
+        ):
             self._hdri_render_token.cancel()
             self.detail.set_hdri_rendering(True, "Canceling Blender safely…")
+            return
+        before = len(self._preview_render_jobs)
+        self._preview_render_jobs = [
+            job
+            for job in self._preview_render_jobs
+            if job.asset_id != asset.id
+        ]
+        if len(self._preview_render_jobs) != before:
+            self._preview_render_ids.discard(asset.id)
+            self.card_delegate.clear_task_state(asset.id)
+            self._update_preview_queue_controls()
+            self.detail.show_asset(asset)
+            self.detail.set_hdri_rendering(
+                False, "Preview render removed from the queue."
+            )
+
+    def _preview_render_progressed(
+        self, asset_id: str, message: str
+    ) -> None:
+        if self.detail._asset and self.detail._asset.id == asset_id:
+            remaining = len(self._preview_render_jobs)
+            suffix = f" · {remaining} queued" if remaining else ""
+            self.detail.set_hdri_rendering(True, message + suffix)
+
+    def _sync_preview_render_status(self, message: str = "") -> None:
+        asset = self.detail._asset
+        if asset is None:
+            return
+        active = self._active_preview_render_job
+        if active is not None and active.asset_id == asset.id:
+            remaining = len(self._preview_render_jobs)
+            suffix = f" · {remaining} queued" if remaining else ""
+            self.detail.set_hdri_rendering(
+                True, (message or "Rendering preview…") + suffix
+            )
+            return
+        for position, job in enumerate(self._preview_render_jobs, start=1):
+            if job.asset_id == asset.id:
+                self.detail.set_hdri_rendering(
+                    True, f"Preview queued · position {position}"
+                )
+                return
 
     def _hdri_render_finished(self, update) -> None:
+        job = self._active_preview_render_job
         self._hdri_render_worker = None
         self._hdri_render_token = None
-        self.load_library(self._library_path, selected_id=update.asset.id)
+        self._active_preview_render_job = None
+        if job is not None:
+            self._preview_render_ids.discard(job.asset_id)
+            self.card_delegate.clear_task_state(job.asset_id)
+        self._update_preview_queue_controls()
+        if job is not None and job.library_path == self._library_path:
+            self.apply_asset_update_incremental(update.asset)
+            if self._catalog_index is not None:
+                manifest = update.asset.asset_dir / "asset.json"
+                if manifest.is_file():
+                    try:
+                        self._catalog_index.upsert(
+                            CatalogRecord.from_manifest(
+                                update.asset, manifest
+                            )
+                        )
+                    except Exception:
+                        pass
         if update.render.status != "ready":
-            dialog = QMessageBox(self)
-            dialog.setIcon(QMessageBox.Icon.Warning)
-            dialog.setWindowTitle("HDRI preview not rendered")
-            dialog.setText(update.render.diagnostic or update.render.status)
-            if update.render.log:
-                dialog.setDetailedText(update.render.log)
-            dialog.exec()
+            self.preview_queue_status.setToolTip(
+                update.render.diagnostic
+                or f"Preview render ended with {update.render.status}."
+            )
+        QTimer.singleShot(0, self._start_next_preview_render)
 
     def _hdri_render_failed(self, details: str) -> None:
+        job = self._active_preview_render_job
         self._hdri_render_worker = None
         self._hdri_render_token = None
-        self.detail.set_hdri_rendering(False, "Preview rendering failed; the previous preview was retained.")
-        QMessageBox.critical(self, "Could not render HDRI preview", details)
+        self._active_preview_render_job = None
+        if job is not None:
+            self._preview_render_ids.discard(job.asset_id)
+            self.card_delegate.clear_task_state(job.asset_id)
+        self._update_preview_queue_controls()
+        if (
+            job is not None
+            and self.detail._asset
+            and self.detail._asset.id == job.asset_id
+        ):
+            self.detail.set_hdri_rendering(
+                False,
+                "Preview rendering failed; the previous preview was retained.",
+            )
+        self.preview_queue_status.setToolTip(
+            details.strip().splitlines()[-1]
+            if details.strip()
+            else "Preview rendering failed."
+        )
+        QTimer.singleShot(0, self._start_next_preview_render)
+
+    def _clear_preview_render_queue(
+        self, *, cancel_active: bool
+    ) -> None:
+        cleared_ids = set(self._preview_render_ids)
+        self._preview_render_jobs.clear()
+        active = self._active_preview_render_job
+        self._preview_render_ids = (
+            {active.asset_id} if active is not None else set()
+        )
+        if cancel_active and self._hdri_render_token is not None:
+            self._hdri_render_token.cancel()
+        if cancel_active:
+            self.card_delegate.clear_task_states(cleared_ids)
+        else:
+            self.card_delegate.clear_task_states(
+                cleared_ids - self._preview_render_ids
+            )
+        self._update_preview_queue_controls()
+
+    def _clear_pending_preview_renders(self) -> None:
+        pending_ids = {
+            job.asset_id for job in self._preview_render_jobs
+        }
+        self._preview_render_jobs.clear()
+        self._preview_render_ids.difference_update(pending_ids)
+        self.card_delegate.clear_task_states(pending_ids)
+        selected = self.detail._asset
+        if selected is not None and selected.id in pending_ids:
+            self.detail.show_asset(selected)
+            self.detail.set_hdri_rendering(
+                False, "Pending preview renders were cleared."
+            )
+        self._update_preview_queue_controls()
+
+    def _update_preview_queue_controls(self) -> None:
+        active = self._active_preview_render_job
+        pending = len(self._preview_render_jobs)
+        total = pending + (1 if active is not None else 0)
+        if total:
+            current = (
+                f" · rendering {active.asset_name}"
+                if active is not None
+                else ""
+            )
+            self.preview_queue_status.setText(
+                f"Preview queue: {total}{current}"
+            )
+            self.preview_queue_status.show()
+        else:
+            self.preview_queue_status.clear()
+            self.preview_queue_status.hide()
+        self.preview_queue_clear.setVisible(pending > 0)
+
+    def shutdown_preview_queue(self) -> None:
+        self._clear_preview_render_queue(cancel_active=True)
+        if self._hdri_render_worker is None:
+            self._retire_preview_session(asynchronous=False)
+
+    def _retire_preview_session(self, *, asynchronous: bool = True) -> None:
+        session = self._preview_session
+        self._preview_session = None
+        if session is None:
+            return
+        if asynchronous:
+            QThreadPool.globalInstance().start(
+                PreviewSessionCloseWorker(session)
+            )
+        else:
+            session.close()
 
     def _convert_model_to_usd(self, asset: AssetRecord) -> None:
         if (
@@ -3389,7 +5489,7 @@ class AssetsTab(QWidget):
     def _model_conversion_finished(self, update) -> None:
         self._model_conversion_worker = None
         self._model_conversion_token = None
-        self.load_library(self._library_path, selected_id=update.asset.id)
+        self.apply_asset_updates((update.asset,))
         self.detail.set_model_conversion_result(
             f"Published preferred USDC with {update.conversion.mesh_count} mesh(es) "
             f"and {update.conversion.material_count} material binding(s).",
@@ -3465,7 +5565,7 @@ class AssetsTab(QWidget):
         self._model_rescan_worker = None
         self._model_rescan_token = None
         changes = len(update.added) + len(update.refreshed) + len(update.removed)
-        self.load_library(self._library_path, selected_id=update.asset.id)
+        self.apply_asset_updates((update.asset,))
         self.detail.set_model_rescan_result(
             f"Updated {changes} model file{'s' if changes != 1 else ''}.", True,
         )
@@ -3487,6 +5587,8 @@ class AssetsTab(QWidget):
 
     def _section_changed(self, _index: int) -> None:
         mode = self._section_type()
+        self.bulk_bar.hide()
+        self._rebuild_bulk_categories()
         is_hdri = mode == "hdri"
         is_model = mode == "model"
         is_atlas = mode == "atlas"
@@ -3504,7 +5606,7 @@ class AssetsTab(QWidget):
         )
         self.category.setCurrentText("All")
         self.category_rail.set_current("All", emit=False)
-        self.load_library(self._library_path)
+        self._display_section()
         if is_hdri:
             self.refresh_houdini_sessions()
 
@@ -3530,6 +5632,15 @@ def _asset_filter_categories(
 ) -> tuple[str, ...]:
     primary = catalog.canonical_name(asset.category) or asset.category.strip() or "Uncategorized"
     return (primary,)
+
+
+def _rating_filter_matches(rating: int, rating_filter: str) -> bool:
+    if rating_filter == "Unrated":
+        return rating == 0
+    if rating_filter == "Rated":
+        return rating >= 1
+    minimums = {"2+": 2, "3+": 3, "4+": 4, "5 stars": 5}
+    return rating >= minimums.get(rating_filter, 0)
 
 
 def _resolution_number(label: str) -> int:

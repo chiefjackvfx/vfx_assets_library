@@ -39,6 +39,13 @@ QLabel#inspectorHero { background: #141619; border: 1px solid #2F3542; border-ra
 QFrame#inspectorSection { background: #1A1D23; border: 1px solid #2F3542; border-radius: 2px; }
 QToolButton#inspectorSectionToggle { background: #23272D; color: #D4D4D4; border: 0; padding: 9px 10px; font-weight: bold; text-align: left; }
 QToolButton#inspectorSectionToggle:hover { background: #2B3038; color: #FFFFFF; }
+QWidget#ratingControl { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #30232D, stop:1 #24252D); border: 1px solid #684457; border-radius: 18px; }
+QToolButton#ratingStar { background: #292631; color: #796875; border: 1px solid #493B47; border-radius: 13px; font-size: 18px; padding: 0; }
+QToolButton#ratingStar[filled="true"] { color: #FFD86B; background: #5A3B49; border-color: #A8667C; }
+QToolButton#ratingStar:hover { color: #FFE9A8; background: #724B5C; border-color: #E18AA7; }
+QToolButton#ratingStar[popped="true"] { color: #FFF4C7; background: #8A596D; border: 2px solid #FFB5CC; }
+QToolButton#ratingStar:pressed { background: #86576A; }
+QToolButton#ratingStar:disabled { color: #59616D; background: transparent; border-color: transparent; }
 QWidget#inspectorSectionBody { background: #1A1D23; border: 0; }
 QFrame#exportFooter { background: #171A1F; border: 0; border-top: 1px solid #3A404A; }
 QFrame#exportFooter QComboBox { padding: 6px 8px; }

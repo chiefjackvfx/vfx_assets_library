@@ -7,7 +7,7 @@ from PyQt6.QtGui import QColor, QImage
 
 from universal_asset_library.importer import scan_texture_folder
 from universal_asset_library.importer import TextureMap
-from universal_asset_library.library import AssetMetadataUpdate, CancelToken, LibraryError, LibraryLockedError, LibraryRepository
+from universal_asset_library.library import AssetMetadataPatch, AssetMetadataUpdate, CancelToken, LibraryError, LibraryLockedError, LibraryRepository
 import universal_asset_library.library.repository as repository_module
 
 
@@ -110,6 +110,33 @@ def test_content_duplicate_is_skipped_without_visible_copy(tmp_path) -> None:
     assert len(duplicate.skipped) == 1
     assert len(repository.list_assets()) == 1
     assert not list((library / ".ual" / "staging").iterdir())
+
+
+def test_targeted_texture_listing_does_not_discover_other_containers(
+    tmp_path, monkeypatch,
+) -> None:
+    _source, candidate = source_material(tmp_path)
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    imported = repository.import_materials([candidate]).imported
+    monkeypatch.setattr(
+        repository_module,
+        "_asset_manifest_paths",
+        lambda _root: pytest.fail("full-library discovery should not run"),
+    )
+    monkeypatch.setattr(
+        repository_module,
+        "_stock_manifest_paths",
+        lambda _root: pytest.fail("Stock discovery should not run"),
+    )
+
+    assert repository.list_assets_for_type("texture_set") == imported
+
+
+def test_targeted_listing_rejects_unknown_asset_type(tmp_path) -> None:
+    with pytest.raises(LibraryError, match="Unsupported asset type"):
+        LibraryRepository(tmp_path).list_assets_for_type("unknown")
 
 
 def test_provider_id_duplicate_skips_before_copy(tmp_path) -> None:
@@ -467,6 +494,212 @@ def test_metadata_tag_edit_does_not_move_asset(tmp_path) -> None:
 
     assert updated.asset_dir == asset.asset_dir
     assert updated.tags[-1] == "secondary"
+
+
+def test_asset_rating_patch_round_trips_and_preserves_other_metadata(tmp_path) -> None:
+    _source, candidate = source_material(tmp_path)
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    asset = repository.import_materials([candidate]).imported[0]
+    manifest_path = asset.asset_dir / "asset.json"
+    original = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert original["rating"] == 0
+
+    updated = repository.patch_asset_metadata(
+        asset.id, AssetMetadataPatch(rating=5)
+    )
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert updated.rating == 5
+    assert document["rating"] == 5
+    assert document["name"] == original["name"]
+    assert document["tags"] == original["tags"]
+    assert document["category"] == original["category"]
+    assert document["updated_at"] != original["updated_at"]
+
+    document.pop("rating")
+    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+    assert repository.list_assets()[0].rating == 0
+
+    document["rating"] = 6
+    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+    assert repository.list_assets() == []
+    assert "rating" in repository.last_warnings[0].casefold()
+
+
+@pytest.mark.parametrize("rating", [-1, 6, 1.5, True])
+def test_asset_rating_patch_rejects_invalid_values(tmp_path, rating) -> None:
+    _source, candidate = source_material(tmp_path)
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    asset = repository.import_materials([candidate]).imported[0]
+
+    with pytest.raises(LibraryError, match="rating"):
+        repository.patch_asset_metadata(
+            asset.id, AssetMetadataPatch(rating=rating)
+        )
+
+    assert repository.list_assets()[0].rating == 0
+
+
+def test_metadata_patch_preserves_unmentioned_fields_and_merges_tags(tmp_path) -> None:
+    _source, candidate = source_material(tmp_path)
+    candidate.tags = ["Existing", "Sunny"]
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    asset = repository.import_materials([candidate]).imported[0]
+    asset = repository.update_asset_metadata(asset.id, AssetMetadataUpdate(
+        name=asset.name,
+        category=asset.category,
+        tags=asset.tags,
+        author="Material Team",
+        description="Keep this description.",
+        physical_size="2 × 2 m",
+    ))
+
+    updated = repository.patch_asset_metadata(
+        asset.id,
+        AssetMetadataPatch(
+            category="Concrete",
+            add_tags=("sunny", "urban", "Existing"),
+        ),
+    )
+
+    assert updated.category == "Concrete"
+    assert updated.tags == ("Existing", "Sunny", "urban")
+    assert updated.author == "Material Team"
+    assert updated.description == "Keep this description."
+    assert updated.physical_size == "2 × 2 m"
+    assert updated.asset_dir.parent.name == "concrete"
+
+
+def test_metadata_patch_batch_uses_one_lock_and_valid_manifest_hints(
+    tmp_path, monkeypatch,
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    imported = []
+    for index, name in enumerate(("batch-stone-a", "batch-stone-b")):
+        source, _candidate = source_material(tmp_path, name)
+        image(source / f"{name}_diff_1k.jpg", f"#{65 + index * 40:02x}6c62")
+        candidate = scan_texture_folder(source).materials[0]
+        candidate.category = "Stone"
+        imported.extend(repository.import_materials([candidate]).imported)
+
+    calls = {"initialize": 0, "enter": 0, "exit": 0, "categories": 0}
+    original_initialize = repository.initialize
+    original_enter = repository_module._ImportLock.__enter__
+    original_exit = repository_module._ImportLock.__exit__
+    original_category_load = repository_module.CategoryConfigStore.load
+
+    def initialize():
+        calls["initialize"] += 1
+        original_initialize()
+
+    def enter(lock):
+        calls["enter"] += 1
+        return original_enter(lock)
+
+    def exit_lock(lock, exc_type, exc, tb):
+        calls["exit"] += 1
+        return original_exit(lock, exc_type, exc, tb)
+
+    def load_categories(store, asset_type):
+        calls["categories"] += 1
+        return original_category_load(store, asset_type)
+
+    monkeypatch.setattr(repository, "initialize", initialize)
+    monkeypatch.setattr(repository_module._ImportLock, "__enter__", enter)
+    monkeypatch.setattr(repository_module._ImportLock, "__exit__", exit_lock)
+    monkeypatch.setattr(
+        repository_module.CategoryConfigStore, "load", load_categories
+    )
+    monkeypatch.setattr(
+        repository_module,
+        "_asset_manifest_paths",
+        lambda _root: pytest.fail("valid catalog hints must avoid a library scan"),
+    )
+    hints = {
+        asset.id: asset.asset_dir / "asset.json" for asset in imported
+    }
+
+    with repository.metadata_patch_batch(
+        (asset.id for asset in imported), hints
+    ) as batch:
+        outcomes = [
+            batch.patch(
+                asset.id, AssetMetadataPatch(category="Concrete")
+            )
+            for asset in imported
+        ]
+
+    assert calls == {
+        "initialize": 1,
+        "enter": 1,
+        "exit": 1,
+        "categories": 1,
+    }
+    assert {outcome.asset.category for outcome in outcomes} == {"Concrete"}
+    assert all(outcome.manifest_path.is_file() for outcome in outcomes)
+    assert all(
+        outcome.manifest_path == outcome.asset.asset_dir / "asset.json"
+        for outcome in outcomes
+    )
+
+
+def test_metadata_patch_batch_validates_hints_and_scans_at_most_once(
+    tmp_path, monkeypatch,
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    imported = []
+    for index, name in enumerate(("hint-stone-a", "hint-stone-b")):
+        source, _candidate = source_material(tmp_path, name)
+        image(source / f"{name}_diff_1k.jpg", f"#{75 + index * 40:02x}6c62")
+        candidate = scan_texture_folder(source).materials[0]
+        candidate.category = "Stone"
+        imported.extend(repository.import_materials([candidate]).imported)
+    first, second = imported
+    outside = tmp_path / "outside.json"
+    outside.write_text(
+        json.dumps({"id": first.id, "type": "texture_set"}),
+        encoding="utf-8",
+    )
+    scans = 0
+    original_scan = repository_module._asset_manifest_paths
+
+    def counted_scan(root):
+        nonlocal scans
+        scans += 1
+        return original_scan(root)
+
+    monkeypatch.setattr(
+        repository_module, "_asset_manifest_paths", counted_scan
+    )
+    hints = {
+        first.id: outside,
+        second.id: first.asset_dir / "asset.json",
+    }
+
+    with repository.metadata_patch_batch(
+        (first.id, second.id), hints
+    ) as batch:
+        first_outcome = batch.patch(
+            first.id, AssetMetadataPatch(category="Concrete")
+        )
+        second_outcome = batch.patch(
+            second.id, AssetMetadataPatch(category="Concrete")
+        )
+
+    assert scans == 1
+    assert first_outcome.asset.id == first.id
+    assert second_outcome.asset.id == second.id
+    assert json.loads(outside.read_text(encoding="utf-8"))["id"] == first.id
 
 
 def test_update_library_migrates_categories_to_tags_and_removes_surface(tmp_path) -> None:

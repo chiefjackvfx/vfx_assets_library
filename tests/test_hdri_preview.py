@@ -21,12 +21,30 @@ from universal_asset_library.previews.hdri_renderer import (
     select_hdri_variant,
 )
 from universal_asset_library.previews.hdri_renderer import driver_path
+from universal_asset_library.previews import (
+    BlenderPreviewSession,
+    TexturePreviewMap,
+    TexturePreviewRequest,
+    render_texture_preview,
+)
 
 
 def _image(path: Path, size: tuple[int, int], color: str) -> None:
     image = QImage(size[0], size[1], QImage.Format.Format_RGB32)
     image.fill(QColor(color))
     assert image.save(str(path), "PNG")
+
+
+def _hdr(path: Path, value: int) -> None:
+    width, height = 16, 8
+    header = (
+        b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n"
+        + f"-Y {height} +X {width}\n".encode()
+    )
+    scanline = bytearray((2, 2, 0, width))
+    for channel in (value, value, value, 129):
+        scanline.extend((128 + width, channel))
+    path.write_bytes(header + bytes(scanline) * height)
 
 
 def test_selects_highest_resolution_up_to_4k_and_preferred_exr() -> None:
@@ -71,40 +89,35 @@ def test_blender_invocation_is_shell_free_and_outputs_are_validated(tmp_path, mo
     executable.chmod(0o755)
     captured = {}
 
-    class FakeProcess:
-        returncode = 0
+    class FakeSession:
+        blender_version = "5.0.1"
+        log = "Blender mock complete"
 
-        def __init__(self, command, **kwargs):
-            captured["command"] = command
-            captured["kwargs"] = kwargs
-            args = command[command.index("--") + 1:]
-            values = dict(zip(args[::2], args[1::2]))
-            _image(Path(values["--scene-output"]), EXPECTED_SCENE_SIZE, "#222222")
-            _image(Path(values["--panorama-output"]), PANORAMA_SIZE, "#777777")
-            Path(values["--result"]).write_text(json.dumps({
+        def render(self, kind, selected_template, payload, **_kwargs):
+            captured["kind"] = kind
+            captured["template"] = selected_template
+            captured["payload"] = payload
+            _image(Path(payload["scene_output"]), EXPECTED_SCENE_SIZE, "#222222")
+            _image(Path(payload["panorama_output"]), PANORAMA_SIZE, "#777777")
+            return {
                 "blender_version": "5.0.1",
                 "render_device": "GPU",
                 "compute_device_type": "OPTIX",
                 "gpu_devices": ["Test GPU"],
-            }), encoding="utf-8")
+            }
 
-        def communicate(self, timeout=None):
-            return "Blender mock complete", None
+        def template_hash(self, _template):
+            return "template-hash"
 
-    monkeypatch.setattr("universal_asset_library.previews.hdri_renderer.validate_blender_executable", lambda _path: (True, "ok", "Blender 5.0.1"))
-    monkeypatch.setattr("universal_asset_library.previews.hdri_renderer.subprocess.Popen", FakeProcess)
     result = render_hdri_preview(HdriPreviewRequest(
         hdri, tmp_path / "output", "Courtyard", ("4K",), "maps/environment.exr",
         blender_path=str(executable), template_path=template,
-    ))
+    ), session=FakeSession())
     assert result.status == "ready"
     assert result.thumbnail_path == result.hero_path
     assert [path.name for path in result.hero_path.parent.glob("*_HDRI_*.jpg")] == ["Courtyard_HDRI_Preview.jpg"]
-    assert captured["command"][:7] == [
-        str(executable), "--background", "--factory-startup", "--disable-autoexec",
-        "--python-exit-code", "1", str(template),
-    ]
-    assert captured["kwargs"].get("shell") is None
+    assert captured["kind"] == "hdri"
+    assert captured["template"] == template
     assert result.metadata["scene_width"] == 1024
     assert result.metadata["panorama_height"] == 512
     assert result.metadata["height"] == 768
@@ -147,3 +160,75 @@ def test_real_template_can_render_when_blender_is_available(tmp_path) -> None:
     ))
     assert result.status == "ready", result.diagnostic or result.log
     assert QImage(str(result.hero_path)).size().width() == 1024
+
+
+@pytest.mark.skipif(
+    shutil.which("blender") is None, reason="Blender is not available on PATH"
+)
+def test_real_session_reuses_blender_for_two_hdri_renders(tmp_path) -> None:
+    app = QApplication.instance() or QApplication([])
+    executable = shutil.which("blender") or ""
+    session = BlenderPreviewSession(executable)
+    results = []
+    try:
+        for index, value in enumerate((96, 180), start=1):
+            source = tmp_path / f"environment-{index}.hdr"
+            _hdr(source, value)
+            results.append(render_hdri_preview(HdriPreviewRequest(
+                source,
+                tmp_path / f"render-{index}",
+                f"Environment {index}",
+                ("1K",),
+                source.name,
+                blender_path=executable,
+                timeout_seconds=600,
+            ), session=session))
+    finally:
+        session.close()
+
+    assert [result.status for result in results] == ["ready", "ready"], [
+        result.diagnostic or result.log for result in results
+    ]
+    assert session.start_count == 1
+
+
+@pytest.mark.skipif(
+    shutil.which("blender") is None, reason="Blender is not available on PATH"
+)
+def test_real_session_switches_templates_and_keeps_jobs_isolated(
+    tmp_path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    executable = shutil.which("blender") or ""
+    session = BlenderPreviewSession(executable)
+    statuses = []
+    try:
+        for index in (1, 2):
+            texture = tmp_path / f"texture-{index}.png"
+            _image(texture, (64, 64), "#884422" if index == 1 else "#226688")
+            statuses.append(render_texture_preview(TexturePreviewRequest(
+                tmp_path / f"texture-render-{index}",
+                f"Texture {index}",
+                "1K",
+                (TexturePreviewMap(
+                    "Base Color", texture, f"maps/texture-{index}.png"
+                ),),
+                blender_path=executable,
+                timeout_seconds=600,
+            ), session=session).status)
+            environment = tmp_path / f"environment-{index}.hdr"
+            _hdr(environment, 80 + index * 50)
+            statuses.append(render_hdri_preview(HdriPreviewRequest(
+                environment,
+                tmp_path / f"hdri-render-{index}",
+                f"Environment {index}",
+                ("1K",),
+                environment.name,
+                blender_path=executable,
+                timeout_seconds=600,
+            ), session=session).status)
+    finally:
+        session.close()
+
+    assert statuses == ["ready", "ready", "ready", "ready"]
+    assert session.start_count == 1

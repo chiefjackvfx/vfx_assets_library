@@ -1,0 +1,243 @@
+{
+  "generated_at": "2026-07-31T14:37:37.599862+00:00",
+  "nodes": {
+    "src_universal_asset_library_importer_models_texturemap": {
+      "code_fingerprint": "f3b06e7d0302ca784f48b6b81c3b2c6a64851338096e40bf84b9dc78591e5ff4",
+      "label": "TextureMap",
+      "last": "2026-07-31T13:56:41.925154+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-31T13:56:41.925154+00:00",
+          "outcome": "useful",
+          "q": "with textures ALPHAMASKED is like opacity so that needs to be set up properly in the scan atm its just getting put into extras."
+        }
+      ],
+      "score": 0.999343524,
+      "source_file": "src/universal_asset_library/importer/models.py",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_universal_asset_library_importer_scanner": {
+      "code_fingerprint": "50d8f2c12a8cd1fc468e41664606694a570756327e420a82fc5ceb42248edf19",
+      "label": "scanner.py",
+      "last": "2026-07-31T13:56:41.925154+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-31T13:56:41.925154+00:00",
+          "outcome": "useful",
+          "q": "with textures ALPHAMASKED is like opacity so that needs to be set up properly in the scan atm its just getting put into extras."
+        }
+      ],
+      "score": 0.999343524,
+      "source_file": "src/universal_asset_library/importer/scanner.py",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_universal_asset_library_importer_scanner_scan_texture_folder": {
+      "code_fingerprint": "50d8f2c12a8cd1fc468e41664606694a570756327e420a82fc5ceb42248edf19",
+      "label": "scan_texture_folder()",
+      "last": "2026-07-31T13:56:41.925154+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-31T13:56:41.925154+00:00",
+          "outcome": "useful",
+          "q": "with textures ALPHAMASKED is like opacity so that needs to be set up properly in the scan atm its just getting put into extras."
+        }
+      ],
+      "score": 0.999343524,
+      "source_file": "src/universal_asset_library/importer/scanner.py",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_universal_asset_library_library_catalog_catalogindex": {
+      "code_fingerprint": "1a4d4bd4abd044f76cee86f3c2e63c3da8d66a4b59c65c8c003bc2b694f63994",
+      "label": "CatalogIndex",
+      "last": "2026-07-31T10:31:12.314578+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-31T10:31:12.314578+00:00",
+          "outcome": "useful",
+          "q": "Implement the planned shared five-star asset rating system"
+        }
+      ],
+      "score": 0.996053956,
+      "source_file": "src/universal_asset_library/library/catalog.py",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_universal_asset_library_library_repository_assetmetadatapatch": {
+      "code_fingerprint": "e894d0225be2f9234c66aa0d32efa409ffd518bcdca67bfe5da54b2658a6f47a",
+      "label": "AssetMetadataPatch",
+      "last": "2026-07-31T11:17:55.888244+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-31T11:17:55.888244+00:00",
+          "outcome": "useful",
+          "q": "Allow rating multiple assets while background saves are still running"
+        },
+        {
+          "date": "2026-07-31T10:31:12.314578+00:00",
+          "outcome": "useful",
+          "q": "Implement the planned shared five-star asset rating system"
+        }
+      ],
+      "score": 1.99285496,
+      "source_file": "src/universal_asset_library/library/repository.py",
+      "status": "preferred",
+      "uses": 2
+    },
+    "src_universal_asset_library_library_repository_libraryrepository": {
+      "code_fingerprint": "e894d0225be2f9234c66aa0d32efa409ffd518bcdca67bfe5da54b2658a6f47a",
+      "label": "LibraryRepository",
+      "last": "2026-07-31T14:34:07.681082+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-31T14:34:07.681082+00:00",
+          "outcome": "useful",
+          "q": "PLEASE IMPLEMENT THIS PLAN: Faster Persistent Blender Preview Batching"
+        },
+        {
+          "date": "2026-07-31T10:31:12.314578+00:00",
+          "outcome": "useful",
+          "q": "Implement the planned shared five-star asset rating system"
+        }
+      ],
+      "score": 1.995997822,
+      "source_file": "src/universal_asset_library/library/repository.py",
+      "status": "preferred",
+      "uses": 2
+    },
+    "src_universal_asset_library_previews_hdri_renderer_render_hdri_preview": {
+      "code_fingerprint": "31083aa074fbb48f1b5560e0e4629dccfe5f4390e860578a5ebf3b3ef448284b",
+      "label": "render_hdri_preview()",
+      "last": "2026-07-31T14:34:07.681082+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-31T14:34:07.681082+00:00",
+          "outcome": "useful",
+          "q": "PLEASE IMPLEMENT THIS PLAN: Faster Persistent Blender Preview Batching"
+        }
+      ],
+      "score": 0.999943866,
+      "source_file": "src/universal_asset_library/previews/hdri_renderer.py",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_universal_asset_library_previews_texture_renderer_render_texture_preview": {
+      "code_fingerprint": "011f358b49f2fed9b971734608b09df38b687711befc3ddc1dd538b7e3b6508b",
+      "label": "render_texture_preview()",
+      "last": "2026-07-31T14:34:07.681082+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-31T14:34:07.681082+00:00",
+          "outcome": "useful",
+          "q": "PLEASE IMPLEMENT THIS PLAN: Faster Persistent Blender Preview Batching"
+        }
+      ],
+      "score": 0.999943866,
+      "source_file": "src/universal_asset_library/previews/texture_renderer.py",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_universal_asset_library_ui_assets_tab_assetstab": {
+      "code_fingerprint": "d262ecf2d0d00b27635fc7fb6c2f3cdf3d6c0a859385f9a5d657fe1403c30f16",
+      "label": "AssetsTab",
+      "last": "2026-07-31T14:34:07.681082+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-31T14:34:07.681082+00:00",
+          "outcome": "useful",
+          "q": "PLEASE IMPLEMENT THIS PLAN: Faster Persistent Blender Preview Batching"
+        },
+        {
+          "date": "2026-07-31T11:17:55.888244+00:00",
+          "outcome": "useful",
+          "q": "Allow rating multiple assets while background saves are still running"
+        },
+        {
+          "date": "2026-07-31T11:07:37.531921+00:00",
+          "outcome": "useful",
+          "q": "Make the five-star rating apply instantly and look cute"
+        },
+        {
+          "date": "2026-07-31T10:31:12.314578+00:00",
+          "outcome": "useful",
+          "q": "Implement the planned shared five-star asset rating system"
+        }
+      ],
+      "score": 3.989435012,
+      "source_file": "src/universal_asset_library/ui/assets_tab.py",
+      "status": "preferred",
+      "uses": 4
+    },
+    "src_universal_asset_library_ui_assets_tab_detailpanel": {
+      "code_fingerprint": "d262ecf2d0d00b27635fc7fb6c2f3cdf3d6c0a859385f9a5d657fe1403c30f16",
+      "label": "DetailPanel",
+      "last": "2026-07-31T11:07:37.531921+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-31T11:07:37.531921+00:00",
+          "outcome": "useful",
+          "q": "Make the five-star rating apply instantly and look cute"
+        },
+        {
+          "date": "2026-07-31T10:31:12.314578+00:00",
+          "outcome": "useful",
+          "q": "Implement the planned shared five-star asset rating system"
+        }
+      ],
+      "score": 1.992690143,
+      "source_file": "src/universal_asset_library/ui/assets_tab.py",
+      "status": "preferred",
+      "uses": 2
+    },
+    "src_universal_asset_library_ui_assets_tab_texturecarddelegate": {
+      "code_fingerprint": "d262ecf2d0d00b27635fc7fb6c2f3cdf3d6c0a859385f9a5d657fe1403c30f16",
+      "label": "TextureCardDelegate",
+      "last": "2026-07-31T11:24:06.789715+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-31T11:24:06.789715+00:00",
+          "outcome": "useful",
+          "q": "Make the rating control look really cute"
+        },
+        {
+          "date": "2026-07-31T11:07:37.531921+00:00",
+          "outcome": "useful",
+          "q": "Make the five-star rating apply instantly and look cute"
+        },
+        {
+          "date": "2026-07-31T10:31:12.314578+00:00",
+          "outcome": "useful",
+          "q": "Implement the planned shared five-star asset rating system"
+        }
+      ],
+      "score": 2.98959002,
+      "source_file": "src/universal_asset_library/ui/assets_tab.py",
+      "status": "preferred",
+      "uses": 3
+    },
+    "src_universal_asset_library_ui_theme": {
+      "code_fingerprint": "a497de7b304e02f597c41de4bd056a851826867b0265b8f9975cfaf461016ac2",
+      "label": "theme.py",
+      "last": "2026-07-31T11:24:06.789715+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-31T11:24:06.789715+00:00",
+          "outcome": "useful",
+          "q": "Make the rating control look really cute"
+        },
+        {
+          "date": "2026-07-31T11:07:37.531921+00:00",
+          "outcome": "useful",
+          "q": "Make the five-star rating apply instantly and look cute"
+        }
+      ],
+      "score": 1.993536064,
+      "source_file": "src/universal_asset_library/ui/theme.py",
+      "status": "preferred",
+      "uses": 2
+    }
+  },
+  "version": 1
+}

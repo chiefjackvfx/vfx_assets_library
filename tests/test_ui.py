@@ -1,14 +1,17 @@
 import os
 import json
+from threading import Event
 from dataclasses import replace
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtCore import QSettings, QThreadPool, Qt
-from PyQt6.QtGui import QColor, QImage, QPixmap
+from PyQt6.QtCore import QPoint, QItemSelectionModel, QSettings, QThreadPool, Qt
+from PyQt6.QtGui import QColor, QCloseEvent, QImage, QPixmap
 from PyQt6.QtMultimedia import QMediaPlayer
-from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMessageBox
 
 from universal_asset_library.app import create_application
 from universal_asset_library.settings import AppSettings, SettingsStore
@@ -17,13 +20,29 @@ from universal_asset_library.ui.assets_tab import (
     AssetsTab,
     DetailPanel,
     MaterialEditDialog,
+    MetadataUpdateWorker,
     ModelAssetRescanDialog,
     ModelConversionDialog,
     TagEditor,
+    StarRatingWidget,
+    TextureCardDelegate,
+    TextureFilterModel,
+    TextureListModel,
     _classification_preview,
     _merge_ai_tags,
 )
-from universal_asset_library.ai import CategoryGuess, OllamaStatus, TagGuess
+from universal_asset_library.ai import CategoryGuess, Classification, OllamaStatus, TagGuess
+from universal_asset_library.ui.ai_classification import (
+    AiBatchWorker,
+    AiOrganiseItem,
+    AiOrganiserDialog,
+    actionable_categories,
+    is_fallback_category,
+)
+from universal_asset_library.ui.batch_metadata import (
+    BatchMetadataRequest,
+    BatchMetadataWorker,
+)
 from universal_asset_library.ui.importer_tab import ImporterTab
 from universal_asset_library.ui.main_window import MainWindow
 from universal_asset_library.ui.settings_tab import SettingsTab
@@ -38,8 +57,13 @@ from universal_asset_library.importer import (
     scan_texture_folder,
 )
 from universal_asset_library.library import (
+    AssetMetadataPatch,
     AssetMetadataUpdate,
+    CatalogIndex,
+    LibraryRecoveryState,
     LibraryRepository,
+    MetadataPatchBatch,
+    MetadataPatchOutcome,
     ModelAssetRescan,
     ModelRescanItem,
     ModelUsdValidation,
@@ -119,13 +143,82 @@ def test_main_window_has_three_tabs_in_order(app, tmp_path) -> None:
     window.close()
 
 
+def test_main_window_construction_defers_library_maintenance(
+    app, tmp_path, monkeypatch,
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    store = SettingsStore(
+        QSettings(str(tmp_path / "deferred.ini"), QSettings.Format.IniFormat)
+    )
+    settings = store.save(AppSettings(str(library)))
+    monkeypatch.setattr(
+        LibraryRepository,
+        "legacy_asset_count",
+        lambda _self: pytest.fail("maintenance inspection ran synchronously"),
+    )
+
+    tab = SettingsTab(store, settings)
+
+    assert tab._inspection_worker is None
+    assert "not been checked" in tab.repair_status.text()
+    assert tab.refresh_maintenance_button.isEnabled()
+
+
+def test_close_is_blocked_while_asset_metadata_update_runs(
+    app, monkeypatch,
+) -> None:
+    window = MainWindow()
+    window.assets_tab._metadata_update_worker = object()
+    messages = []
+    monkeypatch.setattr(
+        "universal_asset_library.ui.main_window.QMessageBox.information",
+        lambda *_args: messages.append("shown"),
+    )
+    event = QCloseEvent()
+
+    window.closeEvent(event)
+
+    assert not event.isAccepted()
+    assert messages == ["shown"]
+    window.assets_tab._metadata_update_worker = None
+    window.close()
+
+
 def test_thumbnail_size_presets_update_delegate(app) -> None:
     tab = AssetsTab()
-    expected = {"small": (198, 210), "medium": (238, 245), "large": (286, 285)}
+    expected = {"small": (198, 228), "medium": (238, 263), "large": (286, 303)}
     for name, dimensions in expected.items():
         tab.set_thumbnail_size(name)
         size = tab.card_delegate.sizeHint(None, None)
         assert (size.width(), size.height()) == dimensions
+
+
+@pytest.mark.parametrize("dimensions", [(60, 180), (300, 60)])
+def test_model_card_thumbnail_contains_non_square_preview(
+    app, tmp_path, dimensions,
+) -> None:
+    source = tmp_path / "model"
+    source.mkdir()
+    (source / "chair.fbx").write_bytes(b"FBX")
+    preview = QImage(*dimensions, QImage.Format.Format_RGB32)
+    preview.fill(QColor("#795b42"))
+    assert preview.save(str(source / "chair_preview.png"))
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_models(
+        scan_model_folder(source).materials
+    ).imported[0]
+    delegate = TextureCardDelegate()
+
+    thumbnail = delegate._thumbnail(asset)
+
+    assert thumbnail is not None
+    assert thumbnail.width() <= delegate.card_size.width() - 10
+    assert thumbnail.height() <= delegate.preview_height
+    assert thumbnail.width() / thumbnail.height() == pytest.approx(
+        dimensions[0] / dimensions[1], rel=0.03
+    )
 
 
 def test_importer_and_catalog_share_asset_type_tabs(app) -> None:
@@ -264,7 +357,7 @@ def test_settings_initializes_and_validates_stock_taxonomy(app, tmp_path) -> Non
     tab._reload_stock_taxonomy()
     assert (library / ".ual" / "stock_categories.json").is_file()
     assert (library / ".ual" / "stock_tags.json").is_file()
-    assert "22 categories" in tab.stock_taxonomy_status.text()
+    assert "23 categories" in tab.stock_taxonomy_status.text()
     assert "canonical tags" in tab.stock_taxonomy_status.text()
 
 
@@ -512,13 +605,110 @@ def test_settings_save_reset_and_invalid_state(app, tmp_path) -> None:
     assert not tab.save_button.isEnabled()
     tab.library_path.setText(str(tmp_path))
     tab.thumbnail_size.setCurrentIndex(tab.thumbnail_size.findData("large"))
+    tab.render_texture_on_import.setChecked(False)
+    tab.save_texture_preview_blend.setChecked(True)
     assert tab.save_button.isEnabled()
     tab._save()
     assert captured[-1].thumbnail_size == "large"
+    assert captured[-1].render_texture_on_import is False
+    assert captured[-1].save_texture_preview_blend is True
     tab.default_category.setCurrentText("Wood")
     assert tab.reset_button.isEnabled()
     tab._reset()
     assert tab.default_category.currentText() == "Uncategorized"
+
+
+def test_texture_inspector_exposes_shader_preview_controls(app, tmp_path) -> None:
+    candidate = scan_texture_folder(texture_source(tmp_path, "Preview_Stone")).materials[0]
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(
+        library, render_texture_previews=False
+    ).import_materials([candidate]).imported[0]
+    tab = AssetsTab()
+
+    tab.detail.show_asset(asset)
+
+    assert not tab.detail.hdri_render_button.isHidden()
+    assert tab.detail.hdri_render_button.text() == "Render preview"
+    assert "disabled" in tab.detail.hdri_render_status.text().casefold()
+
+
+def test_missing_import_previews_are_rendered_one_at_a_time(
+    app, tmp_path, monkeypatch
+) -> None:
+    first_source = texture_source(tmp_path, "Queue_Stone_A")
+    second_source = texture_source(tmp_path, "Queue_Stone_B")
+    changed = QImage(1024, 1024, QImage.Format.Format_RGB32)
+    changed.fill(QColor("#334455"))
+    assert changed.save(
+        str(second_source / "Queue_Stone_B_diff_4k.jpg")
+    )
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(
+        library, render_texture_previews=False
+    )
+    assets = repository.import_materials([
+        scan_texture_folder(first_source).materials[0],
+        scan_texture_folder(second_source).materials[0],
+    ]).imported
+    tab = AssetsTab()
+    tab._library_path = str(library)
+    tab._all_assets = list(assets)
+    tab._reindex_all_assets()
+    tab.source_model.replace(list(assets))
+    started = []
+    monkeypatch.setattr(
+        QThreadPool,
+        "start",
+        lambda _pool, worker, *_args: started.append(worker),
+    )
+
+    selection = tab.view.selectionModel()
+    flags = (
+        QItemSelectionModel.SelectionFlag.Select
+        | QItemSelectionModel.SelectionFlag.Rows
+    )
+    selection.select(tab.proxy.index(0, 0), flags)
+    selection.select(tab.proxy.index(1, 0), flags)
+    app.processEvents()
+    assert not tab.bulk_preview_button.isHidden()
+    assert tab.bulk_preview_button.text() == "Queue Previews (2)"
+
+    tab.bulk_preview_button.click()
+
+    assert len(started) == 1
+    shared_session = started[0].preview_session
+    assert shared_session is not None
+    queued_ids = {
+        tab._active_preview_render_job.asset_id,
+        *(job.asset_id for job in tab._preview_render_jobs),
+    }
+    assert queued_ids == {asset.id for asset in assets}
+    assert tab.card_delegate.task_state(
+        tab._active_preview_render_job.asset_id
+    )[0] == "preview_rendering"
+    assert tab.card_delegate.task_state(
+        tab._preview_render_jobs[0].asset_id
+    )[0] == "preview_queued"
+    second_id = tab._preview_render_jobs[0].asset_id
+    assert "Preview queue: 2" in tab.preview_queue_status.text()
+    assert not tab.preview_queue_clear.isHidden()
+    tab._hdri_render_failed("first render failed")
+    app.processEvents()
+    assert len(started) == 2
+    assert tab._active_preview_render_job.asset_id == second_id
+    assert started[1].preview_session is shared_session
+    assert tab.card_delegate.task_state(second_id)[0] == (
+        "preview_rendering"
+    )
+    assert tab.preview_queue_clear.isHidden()
+    tab._hdri_render_failed("second render failed")
+    app.processEvents()
+    assert tab._preview_session is None
+    assert started[-1].__class__.__name__ == "PreviewSessionCloseWorker"
+    tab.shutdown_preview_queue()
 
 
 def test_assets_tab_uses_real_library_and_empty_states(app, tmp_path) -> None:
@@ -547,6 +737,70 @@ def test_assets_tab_uses_real_library_and_empty_states(app, tmp_path) -> None:
     assert tab.category.findText("Stone") >= 0
     assert "color:#e8a45f" in tab.detail.channels.text()
     assert "color:#9ca6b4" in tab.detail.channels.text()
+
+
+def test_cold_catalog_shows_loading_page_without_synchronous_scan(
+    app, tmp_path, monkeypatch,
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    LibraryRepository(library).initialize()
+    CatalogIndex.for_library(library).clear()
+    monkeypatch.setattr(
+        LibraryRepository,
+        "list_assets",
+        lambda *_args, **_kwargs: pytest.fail("load_library must not scan manifests"),
+    )
+    tab = AssetsTab()
+
+    tab.load_library(str(library))
+
+    assert tab.stack.currentIndex() == 2
+    assert "Loading texture catalog" in tab.loading_title.text()
+    assert tab.loading_progress.minimum() == 0
+    assert tab.loading_progress.maximum() == 0
+    tab.shutdown_catalog()
+
+
+def test_warm_catalog_type_switch_uses_memory_and_keeps_thumbnail_cache(
+    app, tmp_path, monkeypatch,
+) -> None:
+    texture_root = texture_source(tmp_path, "Warm_Stone")
+    preview = QImage(256, 256, QImage.Format.Format_RGB32)
+    preview.fill(QColor("#777777"))
+    assert preview.save(str(texture_root / "Warm_Stone_preview.jpg"))
+    texture_candidate = scan_texture_folder(texture_root).materials[0]
+    atlas_candidate = scan_atlas_folder(
+        texture_source(tmp_path, "Warm_Leaves")
+    ).materials[0]
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    texture = repository.import_materials([texture_candidate]).imported[0]
+    atlas = repository.import_atlases([atlas_candidate]).imported[0]
+    tab = AssetsTab()
+    tab.load_library(str(library))
+    assert tab.stack.currentIndex() == 0
+    assert tab.source_model.assets == [texture]
+    assert tab.card_delegate._thumbnail(texture) is not None
+    cached_keys = set(tab.card_delegate._pixmaps)
+    monkeypatch.setattr(
+        LibraryRepository,
+        "list_assets",
+        lambda *_args, **_kwargs: pytest.fail("type switch must not scan manifests"),
+    )
+    monkeypatch.setattr(
+        LibraryRepository,
+        "list_assets_for_type",
+        lambda *_args, **_kwargs: pytest.fail("type switch must not scan a section"),
+    )
+
+    tab.show_section("atlas")
+
+    assert tab.source_model.assets == [atlas]
+    assert cached_keys <= set(tab.card_delegate._pixmaps)
+    assert tab.refresh_catalog_button.text() == "Refresh Catalog"
+    tab.shutdown_catalog()
 
 
 def test_checked_import_state_requires_writable_library(app, tmp_path) -> None:
@@ -591,9 +845,62 @@ def test_settings_detects_abandoned_staging_for_confirmed_cleanup(app, tmp_path)
     store = SettingsStore(QSettings(str(tmp_path / "recovery.ini"), QSettings.Format.IniFormat))
     settings = store.save(AppSettings(str(library)))
     tab = SettingsTab(store, settings)
+    tab.refresh_maintenance_state()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
     assert "1 abandoned" in tab.recovery_status.text()
     assert tab.cleanup_staging_button.isEnabled()
     assert tab.update_library_button.isEnabled()
+
+
+def test_settings_maintenance_refresh_coalesces_and_ignores_stale_results(
+    app, tmp_path, monkeypatch,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    store = SettingsStore(
+        QSettings(str(tmp_path / "coalesced.ini"), QSettings.Format.IniFormat)
+    )
+    settings = store.save(AppSettings(str(first)))
+    started = Event()
+    release = Event()
+
+    def legacy_count(repository):
+        if repository.root == first:
+            started.set()
+            assert release.wait(5)
+            return 1
+        return 2
+
+    monkeypatch.setattr(LibraryRepository, "legacy_asset_count", legacy_count)
+    monkeypatch.setattr(
+        LibraryRepository,
+        "library_update_count",
+        lambda repository: 10 if repository.root == first else 20,
+    )
+    monkeypatch.setattr(
+        LibraryRepository,
+        "recovery_state",
+        lambda _repository: LibraryRecoveryState(()),
+    )
+    tab = SettingsTab(store, settings)
+    tab.refresh_maintenance_state()
+    assert started.wait(2)
+
+    tab._saved = replace(settings, library_path=str(second))
+    tab.refresh_maintenance_state()
+    release.set()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+
+    assert tab._legacy_count == 2
+    assert tab._library_update_count == 20
+    assert "2 legacy" in tab.repair_status.text()
+    assert "20 asset" in tab.update_status.text()
 
 
 def test_material_edit_dialog_and_assets_tab_save_refresh(app, tmp_path) -> None:
@@ -626,6 +933,16 @@ def test_material_edit_dialog_and_assets_tab_save_refresh(app, tmp_path) -> None
         author="Team",
         description="Updated from the Assets inspector.",
     ))
+    assert tab.metadata_update_active
+    assert not tab.task_strip.isHidden()
+    assert tab.card_delegate.task_animation_active
+    assert tab.card_delegate.task_state(asset.id)[0] == "moving"
+    assert tab.toolbar.isEnabled()
+    assert tab.stack.isEnabled()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    assert not tab.metadata_update_active
+    assert tab.card_delegate.task_state(asset.id) is None
     assert captured[0].name == "Edited Surface"
     assert tab.detail._asset.name == "Edited Surface"
     assert tab.category.findText("Concrete") >= 0
@@ -633,6 +950,345 @@ def test_material_edit_dialog_and_assets_tab_save_refresh(app, tmp_path) -> None
     tab.category.setCurrentText("Concrete")
     assert tab.proxy.rowCount() == 1
     assert LibraryRepository(library).list_assets()[0].tags == ("edited", "studio")
+
+
+def test_rating_filter_sort_and_star_toggle(app, tmp_path) -> None:
+    unrated = stock_asset(tmp_path, "unrated")
+    two = replace(stock_asset(tmp_path, "two"), name="Zulu", rating=2)
+    five_b = replace(stock_asset(tmp_path, "five-b"), name="Beta", rating=5)
+    five_a = replace(stock_asset(tmp_path, "five-a"), name="Alpha", rating=5)
+    source = TextureListModel([unrated, two, five_b, five_a])
+    proxy = TextureFilterModel()
+    proxy.setSourceModel(source)
+    proxy.setDynamicSortFilter(True)
+
+    proxy.set_filters("", "All", "All", "4+")
+    assert proxy.rowCount() == 2
+    proxy.set_filters("", "All", "All", "Unrated")
+    assert [proxy.index(row, 0).data(ASSET_ROLE).id for row in range(proxy.rowCount())] == [
+        "unrated"
+    ]
+    proxy.set_filters("", "All", "All", "All ratings")
+    proxy.set_sort_mode("Rating")
+    assert [proxy.index(row, 0).data(ASSET_ROLE).name for row in range(proxy.rowCount())] == [
+        "Alpha", "Beta", "Zulu", "Unrated",
+    ]
+
+    widget = StarRatingWidget()
+    changes = []
+    widget.rating_changed.connect(changes.append)
+    widget.set_rating(3)
+    assert [button.property("filled") for button in widget.buttons] == [
+        True, True, True, False, False,
+    ]
+    QTest.mouseClick(widget.buttons[2], Qt.MouseButton.LeftButton)
+    QTest.mouseClick(widget.buttons[4], Qt.MouseButton.LeftButton)
+    assert changes == [0, 5]
+
+
+def test_rating_is_optimistic_while_manifest_save_runs(
+    app, tmp_path, monkeypatch,
+) -> None:
+    source = texture_source(tmp_path, "Optimistic_Rating")
+    candidate = scan_texture_folder(source).materials[0]
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_materials([candidate]).imported[0]
+    started = Event()
+    release = Event()
+    original = LibraryRepository.patch_asset_metadata
+
+    def delayed_patch(repository, asset_id, patch):
+        started.set()
+        assert release.wait(5)
+        return original(repository, asset_id, patch)
+
+    monkeypatch.setattr(
+        LibraryRepository, "patch_asset_metadata", delayed_patch
+    )
+    tab = AssetsTab()
+    tab.load_library(str(library))
+
+    assert tab._rate_asset(asset, 5)
+    assert started.wait(2)
+    assert tab.detail._asset.rating == 5
+    assert tab.detail.star_rating.rating == 5
+    assert LibraryRepository(library).list_assets()[0].rating == 0
+
+    release.set()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    assert LibraryRepository(library).list_assets()[0].rating == 5
+    tab.close()
+
+
+def test_multiple_ratings_queue_without_blocking_clicks(
+    app, tmp_path, monkeypatch,
+) -> None:
+    first_source = texture_source(tmp_path, "Queue_First")
+    second_source = texture_source(tmp_path, "Queue_Second")
+    distinct = QImage(1024, 1024, QImage.Format.Format_RGB32)
+    distinct.fill(QColor("#557799"))
+    assert distinct.save(str(second_source / "Queue_Second_diff_4k.jpg"))
+    candidates = (
+        scan_texture_folder(first_source).materials[0],
+        scan_texture_folder(second_source).materials[0],
+    )
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    first, second = repository.import_materials(candidates).imported
+    started = Event()
+    release = Event()
+    calls = []
+    original = LibraryRepository.patch_asset_metadata
+
+    def delayed_first_patch(repository, asset_id, patch):
+        calls.append((asset_id, patch.rating))
+        if len(calls) == 1:
+            started.set()
+            assert release.wait(5)
+        return original(repository, asset_id, patch)
+
+    monkeypatch.setattr(
+        LibraryRepository, "patch_asset_metadata", delayed_first_patch
+    )
+    tab = AssetsTab()
+    tab.load_library(str(library))
+
+    assert tab._rate_asset(first, 2)
+    assert started.wait(2)
+    assert tab._rate_asset(second, 3)
+    assert tab._rate_asset(second, 5)
+    assert tab._asset_by_id(first.id).rating == 2
+    assert tab._asset_by_id(second.id).rating == 5
+    assert tab._rating_update_asset_id == first.id
+    assert tab._pending_rating_updates == {second.id: 5}
+
+    release.set()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    ratings = {
+        asset.id: asset.rating for asset in LibraryRepository(library).list_assets()
+    }
+    assert ratings == {first.id: 2, second.id: 5}
+    assert calls == [(first.id, 2), (second.id, 5)]
+    assert not tab.metadata_update_active
+    tab.close()
+
+
+def test_assets_tab_rating_persists_and_updates_detail(app, tmp_path) -> None:
+    source = texture_source(tmp_path, "Rating_Stone")
+    candidate = scan_texture_folder(source).materials[0]
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_materials([candidate]).imported[0]
+    tab = AssetsTab()
+    tab.load_library(str(library))
+    tab.resize(900, 700)
+    tab.show()
+    app.processEvents()
+
+    requested = []
+    tab.card_delegate.rating_requested.connect(
+        lambda requested_asset, rating: requested.append(
+            (requested_asset.id, rating)
+        )
+    )
+    index = tab.proxy.index(0, 0)
+    rect = tab.view.visualRect(index)
+    # Fourth star in the delegate's rating row.
+    QTest.mouseClick(
+        tab.view.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=QPoint(rect.left() + 69, rect.top() + 241),
+    )
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+
+    updated = LibraryRepository(library).list_assets()[0]
+    assert requested == [(asset.id, 4)]
+    assert updated.rating == 4
+    assert tab.detail._asset.rating == 4
+    assert tab.detail.star_rating.rating == 4
+    assert not tab.metadata_update_active
+    assert tab.card_delegate.task_state(asset.id) is None
+
+    assert tab._rate_asset(updated, 0)
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    assert LibraryRepository(library).list_assets()[0].rating == 0
+    tab.close()
+
+
+def test_rating_failure_retains_previous_value(app, tmp_path, monkeypatch) -> None:
+    source = texture_source(tmp_path, "Failed_Rating")
+    candidate = scan_texture_folder(source).materials[0]
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_materials([candidate]).imported[0]
+    monkeypatch.setattr(
+        LibraryRepository,
+        "patch_asset_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected rating failure")
+        ),
+    )
+    tab = AssetsTab()
+    tab.load_library(str(library))
+
+    assert tab._rate_asset(asset, 5)
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+
+    assert LibraryRepository(library).list_assets()[0].rating == 0
+    assert tab.detail._asset.rating == 0
+    assert tab.card_delegate.task_state(asset.id) is None
+    assert tab.task_retry_button.isHidden()
+    assert "injected rating failure" in tab.detail.star_rating.toolTip()
+    tab.close()
+
+
+def test_metadata_move_card_animates_without_blocking_browser(
+    app, tmp_path, monkeypatch,
+) -> None:
+    source = texture_source(tmp_path, "Overlay_Stone")
+    candidate = scan_texture_folder(source).materials[0]
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_materials([candidate]).imported[0]
+    started = Event()
+    release = Event()
+    original = LibraryRepository.update_asset_metadata
+
+    def delayed_update(repository, asset_id, update):
+        started.set()
+        assert release.wait(5)
+        return original(repository, asset_id, update)
+
+    monkeypatch.setattr(
+        LibraryRepository, "update_asset_metadata", delayed_update
+    )
+    tab = AssetsTab()
+    tab.load_library(str(library))
+    tab.resize(900, 700)
+    tab.show()
+    app.processEvents()
+    try:
+        assert tab._save_material_edit(
+            asset,
+            AssetMetadataUpdate(asset.name, "Concrete", asset.tags),
+        )
+        assert started.wait(2)
+        assert tab.task_strip.isVisible()
+        assert tab.toolbar.isEnabled()
+        assert tab.stack.isEnabled()
+        assert tab.search.isEnabled()
+        assert not tab.detail.path_button.isEnabled()
+        start_angle = tab.card_delegate._task_angle
+        QTest.qWait(120)
+        assert tab.card_delegate._task_angle != start_angle
+        assert not tab._save_material_edit(
+            asset,
+            AssetMetadataUpdate(asset.name, "Wood", asset.tags),
+        )
+    finally:
+        release.set()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+
+    assert not tab.metadata_update_active
+    assert tab.card_delegate.task_state(asset.id) is None
+    assert tab.toolbar.isEnabled()
+    assert LibraryRepository(library).list_assets()[0].category == "Concrete"
+    tab.close()
+
+
+def test_metadata_move_failure_uses_non_modal_card_error(
+    app, tmp_path, monkeypatch,
+) -> None:
+    source = texture_source(tmp_path, "Failed_Move")
+    candidate = scan_texture_folder(source).materials[0]
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_materials([candidate]).imported[0]
+    original_update = LibraryRepository.update_asset_metadata
+    monkeypatch.setattr(
+        LibraryRepository,
+        "update_asset_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected move failure")
+        ),
+    )
+    tab = AssetsTab()
+    tab.load_library(str(library))
+
+    assert tab._save_material_edit(
+        asset, AssetMetadataUpdate(asset.name, "Concrete", asset.tags)
+    )
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+
+    assert not tab.metadata_update_active
+    assert tab.metadata_overlay.isHidden()
+    assert tab.toolbar.isEnabled()
+    assert not tab.task_strip.isHidden()
+    assert not tab.task_retry_button.isHidden()
+    assert tab.card_delegate.task_state(asset.id) == (
+        "failed", "injected move failure",
+    )
+    assert asset.asset_dir.is_dir()
+    monkeypatch.setattr(
+        LibraryRepository, "update_asset_metadata", original_update
+    )
+    tab._retry_failed_asset(asset.id)
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    assert LibraryRepository(library).list_assets()[0].category == "Concrete"
+    assert tab.card_delegate.task_state(asset.id) is None
+
+
+def test_metadata_worker_indexes_flat_stock_manifest(
+    app, tmp_path, monkeypatch,
+) -> None:
+    original = stock_asset(tmp_path / "fixture", "flat-stock")
+    flat_dir = tmp_path / "library" / "stock" / "atmospheres"
+    flat_dir.mkdir(parents=True)
+    source = flat_dir / "Hero_Smoke.mov"
+    preview = flat_dir / "Hero_Smoke_Preview.mp4"
+    thumbnail = flat_dir / "Hero_Smoke_Thumbnail.jpg"
+    source.write_bytes(b"source")
+    preview.write_bytes(b"preview")
+    thumbnail.write_bytes(b"thumbnail")
+    (flat_dir / "Hero_Smoke.json").write_text("{}", encoding="utf-8")
+    updated = replace(
+        original,
+        name="Hero Smoke",
+        category="Atmospheres",
+        asset_dir=flat_dir,
+        source_path=source,
+        preview_path=preview,
+        thumbnail_path=thumbnail,
+        hero_path=thumbnail,
+    )
+    monkeypatch.setattr(
+        LibraryRepository,
+        "update_asset_metadata",
+        lambda *_args, **_kwargs: updated,
+    )
+    index = CatalogIndex(tmp_path / "catalog.sqlite3", "test-library")
+    worker = MetadataUpdateWorker(
+        str(tmp_path / "library"),
+        original.id,
+        AssetMetadataUpdate("Hero Smoke", "Atmospheres"),
+        index,
+    )
+
+    worker.run()
+
+    assert index.query_section("stock") == [updated]
 
 
 def test_category_selector_is_json_backed_and_not_editable(app, tmp_path) -> None:
@@ -765,6 +1421,8 @@ def test_ai_category_and_tags_confirm_through_repository(
     tab._ai_guess_finished(
         "category", CategoryGuess("Concrete", 0.9, "Concrete surface.")
     )
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
     categorized = LibraryRepository(library).list_assets()[0]
     assert categorized.category == "Concrete"
     assert categorized.tags == asset.tags
@@ -779,11 +1437,370 @@ def test_ai_category_and_tags_confirm_through_repository(
             "Visible surface properties.",
         ),
     )
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
     tagged = LibraryRepository(library).list_assets()[0]
     assert tagged.category == "Concrete"
     assert tagged.tags[-5:] == (
         "rough", "outdoor", "weathered", "stone", "matte",
     )
+
+
+def test_ai_organiser_targets_fallback_categories_and_excludes_them(
+    app, tmp_path,
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    assets = []
+    for index, (name, category) in enumerate((
+        ("Needs_Category", "Uncategorized"),
+        ("Other_Surface", "Other"),
+        ("Good_Surface", "Stone"),
+    )):
+        source = texture_source(tmp_path, name)
+        unique = QImage(1024, 1024, QImage.Format.Format_RGB32)
+        unique.fill(QColor(80 + index * 40, 90, 100))
+        assert unique.save(str(source / f"{name}_diff_4k.jpg"))
+        candidate = scan_texture_folder(source).materials[0]
+        candidate.category = category
+        assets.extend(repository.import_materials([candidate]).imported)
+    tab = AssetsTab()
+    tab.load_library(str(library))
+    vocabularies = {
+        asset_type: ("rough", "outdoor", "weathered", "stone", "matte")
+        for asset_type in tab._category_catalogs
+    }
+
+    dialog = AiOrganiserDialog(
+        tuple(repository.list_assets()),
+        tab._category_catalogs,
+        vocabularies,
+        _classification_preview,
+        current_asset_type="texture_set",
+    )
+
+    assert {item.asset.category for item in dialog.items} == {
+        "Uncategorized", "Other",
+    }
+    assert all(
+        not is_fallback_category(category)
+        for item in dialog.items
+        for category in item.categories
+    )
+    assert actionable_categories(
+        ("Stone", "Other", "Miscellaneous", "Uncategorized")
+    ) == ("Stone",)
+
+
+def test_ai_batch_worker_continues_after_failure(app, tmp_path, monkeypatch) -> None:
+    preview = tmp_path / "preview.jpg"
+    image = QImage(32, 32, QImage.Format.Format_RGB32)
+    image.fill(QColor("#777777"))
+    assert image.save(str(preview))
+    assets = [
+        type("Asset", (), {
+            "id": value,
+            "name": value,
+            "asset_type": "texture_set",
+            "category": "Uncategorized",
+            "tags": (),
+        })()
+        for value in ("good", "bad")
+    ]
+    items = tuple(
+        (
+            row,
+            AiOrganiseItem(
+                asset,
+                preview,
+                ("Stone", "Concrete"),
+                ("rough", "outdoor", "weathered", "stone", "matte"),
+            ),
+        )
+        for row, asset in enumerate(assets)
+    )
+
+    def classify(_client, _preview, **kwargs):
+        if kwargs["asset_name"] == "bad":
+            raise RuntimeError("model failed")
+        return Classification(
+            "Stone",
+            ("rough", "outdoor", "weathered", "stone", "matte"),
+            0.9,
+            "Visible stone.",
+        )
+
+    monkeypatch.setattr(assets_tab_module.OllamaClient, "classify", classify)
+    worker = AiBatchWorker(items)
+    completed = []
+    worker.signals.item_finished.connect(
+        lambda row, result, error: completed.append((row, result, error))
+    )
+    worker.run()
+
+    assert completed[0][1].category == "Stone"
+    assert completed[1][1] is None
+    assert completed[1][2] == "model failed"
+
+
+def test_bulk_selection_category_update_preserves_tags(
+    app, tmp_path, monkeypatch,
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    imported = []
+    for index, name in enumerate(("Bulk_Stone_A", "Bulk_Stone_B", "Bulk_Stone_C")):
+        source = texture_source(tmp_path, name)
+        unique = QImage(1024, 1024, QImage.Format.Format_RGB32)
+        unique.fill(QColor(70 + index * 50, 80, 90))
+        assert unique.save(str(source / f"{name}_diff_4k.jpg"))
+        candidate = scan_texture_folder(source).materials[0]
+        candidate.category = "Stone"
+        candidate.tags = ["existing"]
+        imported.extend(repository.import_materials([candidate]).imported)
+    tab = AssetsTab()
+    tab.load_library(str(library))
+    tab.show()
+    QTest.qWait(350)
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    selection = tab.view.selectionModel()
+    selection.clearSelection()
+    flags = (
+        QItemSelectionModel.SelectionFlag.Select
+        | QItemSelectionModel.SelectionFlag.Rows
+    )
+    selection.select(tab.proxy.index(0, 0), flags)
+    selection.select(tab.proxy.index(1, 0), flags)
+    app.processEvents()
+
+    assert len(tab._selected_assets()) == 2
+    assert not tab.bulk_bar.isHidden()
+    tab.bulk_category.setCurrentText("Concrete")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    tab._change_selected_category()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+
+    selected_ids = {asset.id for asset in imported[:2]}
+    updated = {
+        asset.id: asset for asset in repository.list_assets()
+        if asset.id in selected_ids
+    }
+    assert {asset.category for asset in updated.values()} == {"Concrete"}
+    assert {asset.tags for asset in updated.values()} == {("existing",)}
+    assert {asset.id for asset in tab._selected_assets()} == selected_ids
+
+
+def test_batch_move_updates_each_card_while_browser_stays_usable(
+    app, tmp_path, monkeypatch,
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    imported = []
+    for index, name in enumerate(("Background_A", "Background_B", "Background_C")):
+        source = texture_source(tmp_path, name)
+        unique = QImage(1024, 1024, QImage.Format.Format_RGB32)
+        unique.fill(QColor(65 + index * 55, 85, 105))
+        assert unique.save(str(source / f"{name}_diff_4k.jpg"))
+        candidate = scan_texture_folder(source).materials[0]
+        candidate.category = "Stone"
+        imported.extend(repository.import_materials([candidate]).imported)
+    first, second, unaffected = imported
+    second_started = Event()
+    release_second = Event()
+    original_patch = MetadataPatchBatch.patch
+
+    def delayed_patch(batch, asset_id, patch):
+        if asset_id == second.id:
+            second_started.set()
+            assert release_second.wait(5)
+        return original_patch(batch, asset_id, patch)
+
+    monkeypatch.setattr(
+        MetadataPatchBatch, "patch", delayed_patch
+    )
+    tab = AssetsTab()
+    tab.load_library(str(library))
+    tab.show()
+    QTest.qWait(350)
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    requests = tuple(
+        BatchMetadataRequest(
+            asset.id,
+            asset.name,
+            AssetMetadataPatch(category="Concrete"),
+        )
+        for asset in (first, second)
+    )
+
+    assert tab._start_batch_metadata(
+        requests, origin="manual-category", title="Moving assets"
+    )
+    assert second_started.wait(3)
+    QTest.qWait(100)
+
+    assert tab._asset_by_id(first.id).category == "Concrete"
+    assert tab.card_delegate.task_state(first.id) is None
+    assert tab.card_delegate.task_state(second.id)[0] == "moving"
+    assert tab.toolbar.isEnabled()
+    assert tab.stack.isEnabled()
+    assert tab.search.isEnabled()
+    unaffected_index = tab._proxy_index_for_id(unaffected.id)
+    tab.view.setCurrentIndex(unaffected_index)
+    tab._selected(unaffected_index)
+    assert tab.detail.path_button.isEnabled()
+
+    release_second.set()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    assert not tab.metadata_update_active
+    assert tab._asset_by_id(second.id).category == "Concrete"
+
+
+def test_cancel_background_move_clears_unprocessed_card_states(
+    app, tmp_path, monkeypatch,
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    imported = []
+    for index, name in enumerate(("Cancel_Background_A", "Cancel_Background_B")):
+        source = texture_source(tmp_path, name)
+        unique = QImage(1024, 1024, QImage.Format.Format_RGB32)
+        unique.fill(QColor(75 + index * 65, 95, 115))
+        assert unique.save(str(source / f"{name}_diff_4k.jpg"))
+        candidate = scan_texture_folder(source).materials[0]
+        candidate.category = "Stone"
+        imported.extend(repository.import_materials([candidate]).imported)
+    first, second = imported
+    first_started = Event()
+    release_first = Event()
+    original_patch = MetadataPatchBatch.patch
+
+    def delayed_patch(batch, asset_id, patch):
+        if asset_id == first.id:
+            first_started.set()
+            assert release_first.wait(5)
+        return original_patch(batch, asset_id, patch)
+
+    monkeypatch.setattr(
+        MetadataPatchBatch, "patch", delayed_patch
+    )
+    tab = AssetsTab()
+    tab.load_library(str(library))
+    tab.show()
+    QTest.qWait(350)
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    requests = tuple(
+        BatchMetadataRequest(
+            asset.id,
+            asset.name,
+            AssetMetadataPatch(category="Concrete"),
+        )
+        for asset in imported
+    )
+    assert tab._start_batch_metadata(
+        requests, origin="manual-category", title="Moving assets"
+    )
+    assert first_started.wait(3)
+    tab._cancel_batch_metadata()
+    release_first.set()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+
+    current = {asset.id: asset for asset in repository.list_assets()}
+    assert current[first.id].category == "Concrete"
+    assert current[second.id].category == "Stone"
+    assert tab.card_delegate.task_state(first.id) is None
+    assert tab.card_delegate.task_state(second.id) is None
+    assert not tab.metadata_update_active
+    assert "canceled" in tab.task_status.text().casefold()
+
+
+def test_incremental_move_respects_active_category_filter(app, tmp_path) -> None:
+    source = texture_source(tmp_path, "Filtered_Background")
+    candidate = scan_texture_folder(source).materials[0]
+    candidate.category = "Stone"
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    asset = repository.import_materials([candidate]).imported[0]
+    tab = AssetsTab()
+    tab.load_library(str(library))
+    tab.show()
+    QTest.qWait(350)
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    tab.category.setCurrentText("Stone")
+    assert tab.proxy.rowCount() == 1
+
+    updated = repository.patch_asset_metadata(
+        asset.id, AssetMetadataPatch(category="Concrete")
+    )
+    tab.apply_asset_update_incremental(updated)
+
+    assert tab.category.currentText() == "Stone"
+    assert tab.proxy.rowCount() == 0
+    assert tab.category_rail._counts.get("Stone", 0) == 0
+
+
+def test_batch_metadata_worker_reports_partial_failures(
+    app, tmp_path, monkeypatch,
+) -> None:
+    requests = (
+        BatchMetadataRequest(
+            "good", "Good", AssetMetadataPatch(category="Stone")
+        ),
+        BatchMetadataRequest(
+            "bad", "Bad", AssetMetadataPatch(category="Stone")
+        ),
+    )
+
+    def patch(_batch, asset_id, _patch):
+        if asset_id == "bad":
+            raise RuntimeError("cannot move")
+        updated = type("Updated", (), {
+            "id": asset_id,
+            "asset_type": "texture_set",
+            "asset_dir": Path("/does/not/exist"),
+        })()
+        return MetadataPatchOutcome(
+            updated, Path("/does/not/exist/asset.json")
+        )
+
+    class BrokenCatalog:
+        def records_for_ids(self, _asset_ids):
+            raise RuntimeError("catalog unavailable")
+
+        def writer(self):
+            raise RuntimeError("catalog unavailable")
+
+    monkeypatch.setattr(MetadataPatchBatch, "patch", patch)
+    worker = BatchMetadataWorker(str(tmp_path), requests, BrokenCatalog())
+    results = []
+    item_results = []
+    worker.signals.item_finished.connect(item_results.append)
+    worker.signals.finished.connect(results.append)
+    worker.run()
+
+    assert [asset.id for asset in results[0].updated] == ["good"]
+    assert results[0].failures == {"bad": "cannot move"}
+    assert (results[0].completed, results[0].total) == (2, 2)
+    assert not results[0].canceled
+    assert item_results[0].request.asset_id == "good"
+    assert item_results[0].updated.id == "good"
+    assert item_results[1].request.asset_id == "bad"
+    assert item_results[1].error == "cannot move"
 
 
 def test_ollama_setup_flow_rechecks_readiness(app, monkeypatch) -> None:
@@ -827,7 +1844,7 @@ def test_assets_bridge_layout_has_compact_toolbar_and_pinned_footer(app, tmp_pat
     assert toolbar.itemAt(0).widget() is tab.section
     assert toolbar.itemAt(1).widget() is tab.search
     assert toolbar.itemAt(toolbar.count() - 1).widget() is tab.count
-    assert tab.view.selectionMode().name == "SingleSelection"
+    assert tab.view.selectionMode().name == "ExtendedSelection"
     assert tab.detail.details_scroll.parent() is tab.detail
     assert tab.detail.export_footer.parent() is tab.detail
     assert not tab.detail.details_scroll.isAncestorOf(tab.detail.export_footer)
@@ -835,6 +1852,24 @@ def test_assets_bridge_layout_has_compact_toolbar_and_pinned_footer(app, tmp_pat
     assert tab.detail.files_section.body.isHidden()
     assert tab.detail.technical_section.body.isHidden()
     tab.close()
+
+
+def test_main_window_disables_write_tabs_during_background_asset_updates(
+    app,
+) -> None:
+    window = MainWindow()
+    importer_index = window.tabs.indexOf(window.importer_tab)
+    settings_index = window.tabs.indexOf(window.settings_tab)
+
+    window._library_mutation_busy_changed(True)
+    assert not window.tabs.isTabEnabled(importer_index)
+    assert not window.tabs.isTabEnabled(settings_index)
+    assert window.tabs.isTabEnabled(window.tabs.indexOf(window.assets_tab))
+
+    window._library_mutation_busy_changed(False)
+    assert window.tabs.isTabEnabled(importer_index)
+    assert window.tabs.isTabEnabled(settings_index)
+    window.close()
 
 
 def test_stock_inspector_has_player_controls_and_no_dcc_footer(app, tmp_path) -> None:
@@ -1013,6 +2048,9 @@ def test_settings_repairs_legacy_names_in_background(app, tmp_path) -> None:
     tab = SettingsTab(store, settings)
     captured = []
     tab.library_repaired.connect(captured.append)
+    tab.refresh_maintenance_state()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
     assert tab._legacy_count == 1
     assert tab.repair_button.isEnabled()
     tab._start_repair()

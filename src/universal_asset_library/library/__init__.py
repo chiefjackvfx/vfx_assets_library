@@ -1,10 +1,14 @@
 from .repository import (
+    AssetMetadataPatch,
     AssetMetadataUpdate,
     CancelToken,
     ImportProgress,
     ImportSummary,
     HdriPreviewUpdate,
+    TexturePreviewUpdate,
     ModelConversionUpdate,
+    MetadataPatchBatch,
+    MetadataPatchOutcome,
     LibraryError,
     LibraryLockedError,
     LibraryUpdateSummary,
@@ -14,6 +18,21 @@ from .repository import (
     RepairSummary,
     StaleSourceError,
     StockClassificationSummary,
+)
+from .catalog import (
+    CATALOG_SCHEMA_VERSION,
+    CatalogError,
+    CatalogIndex,
+    CatalogRecord,
+    CatalogWriter,
+    decode_asset,
+    encode_asset,
+)
+from .catalog_refresh import (
+    ASSET_TYPES,
+    CatalogRefreshWorker,
+    CatalogSectionResult,
+    refresh_catalog_section,
 )
 from .polyhaven import (
     PolyHavenClient,
@@ -39,12 +58,16 @@ from universal_asset_library.integrations.model_rescan import (
 )
 
 __all__ = [
+    "AssetMetadataPatch",
     "AssetMetadataUpdate",
     "CancelToken",
     "ImportProgress",
     "ImportSummary",
     "HdriPreviewUpdate",
+    "TexturePreviewUpdate",
     "ModelConversionUpdate",
+    "MetadataPatchBatch",
+    "MetadataPatchOutcome",
     "LibraryError",
     "LibraryLockedError",
     "LibraryUpdateSummary",
@@ -54,6 +77,17 @@ __all__ = [
     "RepairSummary",
     "StaleSourceError",
     "StockClassificationSummary",
+    "CATALOG_SCHEMA_VERSION",
+    "CatalogError",
+    "CatalogIndex",
+    "CatalogRecord",
+    "CatalogWriter",
+    "decode_asset",
+    "encode_asset",
+    "ASSET_TYPES",
+    "CatalogRefreshWorker",
+    "CatalogSectionResult",
+    "refresh_catalog_section",
     "PolyHavenClient",
     "PolyHavenDownloadPlan",
     "PolyHavenDownloadResult",

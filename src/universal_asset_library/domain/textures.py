@@ -111,6 +111,7 @@ STOCK_CATEGORIES = (
     "Electricity",
     "Explosions",
     "Fire",
+    "Film FX",
     "Glass",
     "Impacts",
     "Lasers",

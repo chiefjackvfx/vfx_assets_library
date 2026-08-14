@@ -339,17 +339,17 @@ def _build_principled_graph(tree, material, shader, output, sources):
         displacement.name = "ShotBox Displacement"
         _link(tree, displacement_source[0], _socket(displacement.inputs, "Height"))
         _link(tree, _socket(displacement.outputs, "Displacement"), _socket(output.inputs, "Displacement"))
-        _enable_bump_and_displacement(material)
+        _enable_displacement_only(material)
 
 
-def _enable_bump_and_displacement(material):
+def _enable_displacement_only(material):
     try:
-        material.displacement_method = "BOTH"
+        material.displacement_method = "DISPLACEMENT"
         return
     except Exception:
         pass
     try:
-        material.cycles.displacement_method = "BOTH"
+        material.cycles.displacement_method = "DISPLACEMENT"
     except Exception:
         pass
 
@@ -631,6 +631,6 @@ def session_data(bpy):
     return {
         "blender_version": version,
         "blend_file": blend_file,
-        "bridge_version": "0.4.1",
+        "bridge_version": "0.4.2",
         "capabilities": ["hdri", "texture_material", "usd_model"],
     }

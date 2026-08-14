@@ -42,11 +42,14 @@ MAP_CONTAINER_NAMES = {"textures", "texture", "maps", "images"}
 GENERIC_CATEGORIES = {"surface", "outdoor", "indoor", "floor", "wall", "manmade", "man made"}
 FORMAT_PRIORITY = {"exr": 6, "tif": 5, "tiff": 5, "png": 4, "webp": 3, "tga": 2, "jpg": 1, "jpeg": 1}
 ARCHIVE_EXTENSIONS = {".rar", ".zip"}
-ARCHIVE_PREVIEW_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+ARCHIVE_PREVIEW_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 ARCHIVE_MAP_EXTENSIONS = IMAGE_EXTENSIONS - {".hdr"}
 ARCHIVE_MEMBER_LIMIT = 4096
 ARCHIVE_EXPANDED_LIMIT = 64 * 1024 * 1024 * 1024
 ARCHIVE_RATIO_LIMIT = 500
+MEGASCANS_ASSET_CODE_SUFFIX = re.compile(
+    r"(?i)(?:[_\-\s]+)[a-z]{6}\d[a-z]$"
+)
 
 
 TOKEN_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -62,7 +65,7 @@ TOKEN_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Cavity", ("cavity",)),
     ("Metalness", ("metalness", "metallic", "metal")),
     ("Specular", ("specular", "spec", "reflection", "reflect", "refl")),
-    ("Opacity", ("opacity", "alpha")),
+    ("Opacity", ("opacity", "alphamasked", "alpha_masked", "alpha")),
     ("Emission", ("emission", "emissive", "emit")),
     ("Translucency", ("translucency", "translucent", "subsurface", "sss")),
 )
@@ -227,7 +230,16 @@ def _scan_archive_material_pairs(
                         "No recognizable PBR maps were found after extraction."
                     )
                 candidate = scanned.materials[0]
-                candidate.name = _display_name(archive.stem)
+                candidate.name = (
+                    _clean_material_name(
+                        candidate.name,
+                        candidate.provider,
+                        candidate.provider_id,
+                    )
+                    if candidate.provider.casefold() == "megascans"
+                    and candidate.name
+                    else _display_name(archive.stem)
+                )
                 candidate.category = category
                 candidate.archive_source = ArchiveSource(
                     archive.resolve(),
@@ -320,28 +332,49 @@ def _archive_preview_pairs(
         ),
         key=lambda path: str(path).casefold(),
     )
+    previews_by_parent: dict[Path, list[Path]] = {}
+    for parent in {archive.parent for archive in archives}:
+        previews_by_parent[parent] = sorted(
+            (
+                path for path in parent.iterdir()
+                if path.is_file() and not path.is_symlink()
+                and path.suffix.casefold() in ARCHIVE_PREVIEW_EXTENSIONS
+            ),
+            key=lambda path: path.name.casefold(),
+        )
+    used_previews: set[Path] = set()
     for archive in archives:
-        matches = [
-            path for path in archive.parent.iterdir()
-            if path.is_file() and not path.is_symlink()
-            and path.suffix.casefold() in ARCHIVE_PREVIEW_EXTENSIONS
-            and path.stem.casefold() == archive.stem.casefold()
+        available = [
+            path for path in previews_by_parent[archive.parent]
+            if path not in used_previews
         ]
+        scored = sorted(
+            ((_archive_preview_score(archive, path), path) for path in available),
+            key=lambda item: (item[0], item[1].name.casefold()),
+            reverse=True,
+        )
+        matches: list[Path] = []
+        if scored:
+            best_score = scored[0][0]
+            matches = [path for score, path in scored if score == best_score]
+            if best_score[0] == 0 and len(available) != 1:
+                matches = []
         if len(matches) == 1:
             pairs.append((archive, matches[0]))
+            used_previews.add(matches[0])
         elif not matches:
             if archive.suffix.casefold() == ".zip":
                 pairs.append((archive, None))
                 diagnostics.append(Diagnostic(
                     "info", "zip_preview_external_missing",
-                    f"{archive.name} has no same-name external preview; "
+                    f"{archive.name} has no matching sibling preview; "
                     "the ZIP will still be extracted and scanned.",
                     archive.relative_to(root).as_posix(), archive.stem,
                 ))
             else:
                 diagnostics.append(Diagnostic(
                     "warning", "archive_preview_missing",
-                    f"{archive.name} has no same-name JPEG or image preview.",
+                    f"{archive.name} has no matching sibling JPEG or PNG preview.",
                     archive.relative_to(root).as_posix(), archive.stem,
                 ))
         else:
@@ -350,12 +383,37 @@ def _archive_preview_pairs(
             diagnostics.append(Diagnostic(
                 "warning" if archive.suffix.casefold() == ".zip" else "error",
                 "archive_preview_ambiguous",
-                f"{archive.name} has multiple same-name previews; no preview was guessed."
+                f"{archive.name} has multiple equally likely sibling previews; no preview was guessed."
                 + (" The ZIP will still be extracted and scanned."
                    if archive.suffix.casefold() == ".zip" else ""),
                 archive.relative_to(root).as_posix(), archive.stem,
             ))
     return pairs, diagnostics
+
+
+def _archive_preview_score(archive: Path, preview: Path) -> tuple[int, int, int]:
+    archive_stem = archive.stem.casefold()
+    preview_stem = preview.stem.casefold()
+    if archive_stem == preview_stem:
+        return 3, len(archive_stem), len(archive_stem)
+    archive_tokens = _archive_name_tokens(archive_stem)
+    preview_tokens = _archive_name_tokens(preview_stem)
+    if archive_tokens and archive_tokens == preview_tokens:
+        return 2, len(archive_tokens), sum(map(len, archive_tokens))
+    shared = archive_tokens & preview_tokens
+    prefix = len(os.path.commonprefix((archive_stem, preview_stem)))
+    return 1 if shared else 0, len(shared), prefix
+
+
+def _archive_name_tokens(stem: str) -> frozenset[str]:
+    ignored = {
+        "archive", "download", "hero", "image", "map", "maps", "preview",
+        "render", "source", "texture", "textures", "thumb", "thumbnail",
+    }
+    return frozenset(
+        token for token in re.findall(r"[a-z0-9]+", stem.casefold())
+        if token not in ignored and not re.fullmatch(r"[1-9]\d*k", token)
+    )
 
 
 def _extract_rar_images(
@@ -820,7 +878,14 @@ def _scan_material(
             metadata_role = facts.preview_roles_by_path.get(relative.casefold(), "") if facts else ""
             if not metadata_role and facts and basename_counts[path.name.casefold()] == 1:
                 metadata_role = facts.preview_roles_by_basename.get(path.name.casefold(), "")
-            preview_files.append((path, dimensions, metadata_role))
+            # TIFFs are texture payloads or companions, never display previews.
+            # Filename-inferred previews use lightweight display formats; a
+            # provider-declared preview may additionally use WebP.
+            if path.suffix.casefold() not in {".tif", ".tiff"} and (
+                metadata_role
+                or path.suffix.casefold() in {".jpg", ".jpeg", ".png", ".webp"}
+            ):
+                preview_files.append((path, dimensions, metadata_role))
             continue
         label = _map_resolution(path, root, dimensions, declaration)
         variant = resolutions.setdefault(label, ResolutionVariant(label=label))
@@ -845,7 +910,15 @@ def _scan_material(
             preferred = max(alternatives, key=_map_preference)
             preferred.preferred = True
 
-    name = facts.name if facts and facts.name else _display_name(root.name)
+    name = (
+        _clean_material_name(
+            facts.name,
+            facts.provider,
+            facts.provider_id,
+        )
+        if facts and facts.name
+        else _display_name(root.name)
+    )
     category = _select_category(
         facts.categories if facts else [],
         root.name,
@@ -895,7 +968,11 @@ def _scan_material(
         for texture_map in alternatives
     }
     assigned_paths.update(candidate.metadata_paths)
-    assigned_paths.update(path for path in (candidate.selected_thumbnail, candidate.selected_hero) if path)
+    assigned_paths.update(
+        preview.relative_path for preview in candidate.previews
+        if preview.metadata_role
+        or preview.inferred_role in {"thumbnail", "hero"}
+    )
     candidate.extra_paths = sorted(
         (
             relative for relative, snapshot in candidate.source_snapshots.items()
@@ -1222,7 +1299,25 @@ def _single_category_tags(existing, provider_categories, category: str) -> list[
 
 def _display_name(folder_name: str) -> str:
     cleaned = re.sub(r"(?i)^[1-9]\d*k[_\- ]+", "", folder_name)
+    cleaned = MEGASCANS_ASSET_CODE_SUFFIX.sub("", cleaned)
     return re.sub(r"[_\-]+", " ", cleaned).strip().title()
+
+
+def _clean_material_name(
+    value: str,
+    provider: str = "",
+    provider_id: str = "",
+) -> str:
+    cleaned = str(value or "").strip()
+    identifier = str(provider_id or "").strip()
+    if provider.casefold() == "megascans" and identifier:
+        cleaned = re.sub(
+            rf"(?i)(?:[_\-\s]+)[\[(]?\s*{re.escape(identifier)}"
+            rf"\s*[\])]?$",
+            "",
+            cleaned,
+        ).strip(" _-")
+    return cleaned
 
 
 def _resolution_sort_key(label: str) -> tuple[int, str]:

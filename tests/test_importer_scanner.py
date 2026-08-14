@@ -33,6 +33,58 @@ def test_filename_only_material_detects_resolution_channels_and_preview(tmp_path
     assert candidate.selected_thumbnail == "Bricks06.png"
 
 
+@pytest.mark.parametrize("suffix", ("ALPHAMASKED", "ALPHA_MASKED"))
+def test_alpha_masked_filename_is_scanned_as_opacity(
+    tmp_path,
+    suffix,
+) -> None:
+    material = tmp_path / f"2K_Fabric_{suffix}"
+    material.mkdir()
+    image(material / "Fabric_2K_BASECOLOR.jpg", 2048, 2048)
+    opacity_path = f"Fabric_2K_{suffix}.png"
+    image(material / opacity_path, 2048, 2048)
+
+    candidate = scan_texture_folder(material).materials[0]
+
+    opacity = candidate.resolutions["2K"].maps["Opacity"]
+    assert [texture_map.relative_path for texture_map in opacity] == [
+        opacity_path,
+    ]
+    assert opacity_path not in candidate.extra_paths
+
+
+def test_tiffs_are_maps_or_extras_and_display_images_are_all_previews(
+    tmp_path,
+) -> None:
+    material = tmp_path / "Stone Package"
+    material.mkdir()
+
+    def png_payload(path: Path, width: int, height: int) -> None:
+        value = QImage(width, height, QImage.Format.Format_RGB32)
+        value.fill(QColor("#777777"))
+        assert value.save(str(path), "PNG")
+
+    png_payload(material / "stone_basecolor_2k.tif", 2048, 2048)
+    png_payload(material / "stone_roughness_2k.tiff", 2048, 2048)
+    png_payload(material / "unlabelled_payload.tif", 512, 512)
+    image(material / "stone_card.jpg", 320, 320)
+    image(material / "stone_wide.png", 960, 540)
+
+    candidate = scan_texture_folder(material).materials[0]
+
+    assert set(candidate.resolutions["2K"].maps) == {
+        "Base Color", "Roughness",
+    }
+    assert {preview.relative_path for preview in candidate.previews} == {
+        "stone_card.jpg", "stone_wide.png",
+    }
+    assert candidate.selected_thumbnail == "stone_card.jpg"
+    assert candidate.selected_hero == "stone_wide.png"
+    assert "unlabelled_payload.tif" in candidate.extra_paths
+    assert "stone_card.jpg" not in candidate.extra_paths
+    assert "stone_wide.png" not in candidate.extra_paths
+
+
 def test_unknown_json_warns_and_uses_base_color_preview_fallback(tmp_path) -> None:
     material = tmp_path / "D_Wood_Pine_04"
     material.mkdir()
@@ -89,7 +141,10 @@ def test_megascans_adapter_keeps_format_alternatives_and_prefers_exr(tmp_path) -
         "name": "Source Name",
         "categories": ["surface", "concrete"],
         "tags": ["worn"],
-        "semanticTags": {"name": "Concrete Truth", "environment": ["urban"]},
+        "semanticTags": {
+            "name": "Concrete Truth abc123",
+            "environment": ["urban"],
+        },
         "maps": [
             {"uri": "abc_4K_Albedo.jpg", "type": "albedo", "resolution": "4096x4096", "bitDepth": 8, "colorSpace": "sRGB"},
             {"uri": "abc_4K_Displacement.jpg", "type": "displacement", "resolution": "4096x4096", "bitDepth": 8, "colorSpace": "Linear"},
@@ -106,6 +161,19 @@ def test_megascans_adapter_keeps_format_alternatives_and_prefers_exr(tmp_path) -
     assert candidate.name == "Concrete Truth"
     assert len(alternatives) == 2
     assert next(item for item in alternatives if item.preferred).file_format == "EXR"
+
+
+def test_filename_only_megascans_suffix_is_removed_from_material_name(
+    tmp_path,
+) -> None:
+    material = tmp_path / "Mossy_Rocky_Ground_tjlpcb3r"
+    material.mkdir()
+    image(material / "tjlpcb3r_Albedo_2K.jpg", 2048, 2048)
+    image(material / "tjlpcb3r_Roughness_2K.jpg", 2048, 2048)
+
+    candidate = scan_texture_folder(material).materials[0]
+
+    assert candidate.name == "Mossy Rocky Ground"
 
 
 def test_malformed_json_does_not_abort_filename_inference(tmp_path) -> None:

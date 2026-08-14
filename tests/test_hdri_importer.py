@@ -154,7 +154,7 @@ def test_hdri_import_publishes_composite_render_metadata_when_blender_succeeds(t
     library = tmp_path / "library"
     library.mkdir()
 
-    def fake_render(request, progress=None, cancel_token=None):
+    def fake_render(request, progress=None, cancel_token=None, session=None):
         request.output_dir.mkdir(parents=True, exist_ok=True)
         hero = request.output_dir / "Sunny_Courtyard_HDRI_Preview.jpg"
         thumbnail = request.output_dir / "Sunny_Courtyard_HDRI_Thumbnail.jpg"
@@ -207,7 +207,7 @@ def test_manual_hdri_regeneration_keeps_previous_preview_when_source_changes(tmp
     asset = repository.import_hdris([scan_hdri_folder(source).materials[0]]).imported[0]
     previous = asset.hero_path.read_bytes()
 
-    def fake_render(request, progress=None, cancel_token=None):
+    def fake_render(request, progress=None, cancel_token=None, session=None):
         request.output_dir.mkdir(parents=True, exist_ok=True)
         hero = request.output_dir / "Sunny_Courtyard_HDRI_Preview.jpg"
         thumbnail = request.output_dir / "Sunny_Courtyard_HDRI_Thumbnail.jpg"

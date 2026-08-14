@@ -33,9 +33,16 @@ def test_blender_and_hdri_render_preferences_round_trip(tmp_path) -> None:
     store = make_store(tmp_path)
     executable = tmp_path / "Blender"
     executable.write_bytes(b"fixture")
-    saved = store.save(AppSettings(blender_path=str(executable), render_hdri_on_import=False))
+    saved = store.save(AppSettings(
+        blender_path=str(executable),
+        render_hdri_on_import=False,
+        render_texture_on_import=False,
+        save_texture_preview_blend=True,
+    ))
     assert saved.blender_path == str(executable)
     assert saved.render_hdri_on_import is False
+    assert saved.render_texture_on_import is False
+    assert saved.save_texture_preview_blend is True
     assert store.load() == saved
 
 

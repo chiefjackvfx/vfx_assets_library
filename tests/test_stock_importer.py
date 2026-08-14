@@ -16,7 +16,11 @@ from universal_asset_library.importer import (
     infer_stock_display_name,
     scan_stock_folder,
 )
-from universal_asset_library.library import AssetMetadataUpdate, LibraryRepository
+from universal_asset_library.library import (
+    AssetMetadataPatch,
+    AssetMetadataUpdate,
+    LibraryRepository,
+)
 
 
 FFMPEG = shutil.which("ffmpeg")
@@ -346,6 +350,15 @@ def test_flat_stock_metadata_edit_renames_and_moves_only_its_files(
     assert {asset.id for asset in repository.list_stock_assets()} == {
         first.id, second.id
     }
+    manifest = updated.asset_dir / "Hero_Smoke.json"
+    with repository.metadata_patch_batch(
+        (updated.id,), {updated.id: manifest}
+    ) as batch:
+        outcome = batch.patch(
+            updated.id, AssetMetadataPatch(add_tags=("approved",))
+        )
+    assert outcome.manifest_path == manifest
+    assert outcome.asset.tags == ("hero", "smoke", "approved")
 
 
 def test_flat_stock_same_name_collision_uses_shared_numeric_token(

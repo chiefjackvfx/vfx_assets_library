@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from io import BytesIO
 import json
 import shutil
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -10,6 +12,7 @@ from PyQt6.QtGui import QImage
 
 from universal_asset_library.importer import scan_texture_folder, unzip_all_zip_files
 from universal_asset_library.library import LibraryRepository
+import universal_asset_library.importer.archive_packages as archive_module
 import universal_asset_library.importer.scanner as scanner_module
 
 
@@ -116,6 +119,65 @@ def test_changed_rar_is_stale_before_import(monkeypatch, tmp_path: Path) -> None
             shutil.rmtree(value, ignore_errors=True)
 
 
+def test_megascans_code_is_removed_from_archive_material_name(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "incoming"
+    build = tmp_path / "archive-maps"
+    source.mkdir()
+    build.mkdir()
+    archive = source / "Mossy_Rocky_Ground_tjlpcb3r.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as package:
+        for channel in ("Albedo", "Roughness"):
+            path = build / f"tjlpcb3r_{channel}_2K.jpg"
+            _image(path, 2048)
+            package.write(path, path.name)
+
+    result = scan_texture_folder(source)
+    try:
+        assert len(result.materials) == 1
+        assert result.materials[0].name == "Mossy Rocky Ground"
+    finally:
+        for value in result.temporary_roots:
+            shutil.rmtree(value, ignore_errors=True)
+
+
+def test_zip_pairs_with_sibling_preview_after_package_suffixes(tmp_path) -> None:
+    source = _source(tmp_path, ".zip", True)
+    (source / "Marble_001.zip").rename(source / "Marble_001_4K.zip")
+    (source / "Marble_001.jpg").rename(source / "Marble_001_preview.jpg")
+
+    result = scan_texture_folder(source)
+    try:
+        assert len(result.materials) == 1
+        material = result.materials[0]
+        assert material.selected_thumbnail == "Marble_001_preview.jpg"
+        assert material.selected_hero == "Marble_001_preview.jpg"
+        assert "Marble_001_preview.jpg" not in material.extra_paths
+        assert any(
+            item.code == "archive_preview_pair"
+            for item in material.diagnostics
+        )
+    finally:
+        for value in result.temporary_roots:
+            shutil.rmtree(value, ignore_errors=True)
+
+
+def test_single_jpeg_beside_zip_is_preview_but_tiff_is_not(tmp_path) -> None:
+    source = tmp_path / "incoming"
+    source.mkdir()
+    archive = source / "texture_payload.zip"
+    archive.write_bytes(b"pairing only")
+    preview = source / "cover.jpg"
+    _image(preview, 512)
+    (source / "texture_payload.tif").write_bytes(b"texture data")
+
+    pairs, diagnostics = scanner_module._archive_preview_pairs(source)
+
+    assert pairs == [(archive, preview)]
+    assert not diagnostics
+
+
 def test_unzip_all_creates_same_name_folders_with_json(tmp_path: Path) -> None:
     source = tmp_path / "incoming"
     source.mkdir()
@@ -134,3 +196,100 @@ def test_unzip_all_creates_same_name_folders_with_json(tmp_path: Path) -> None:
     second = unzip_all_zip_files(source)
     assert not second.extracted
     assert str(archive) in second.skipped
+
+
+def test_unzip_all_extracts_rar_and_zip_archives(
+    monkeypatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "incoming"
+    source.mkdir()
+    rar_archive = source / "A_Marble.RAR"
+    rar_archive.write_bytes(b"rar source")
+    zip_archive = source / "B_Stone.zip"
+    with zipfile.ZipFile(zip_archive, "w") as package:
+        package.writestr("metadata.json", '{"name":"Stone"}')
+
+    def fake_rar_extract(archive, target, extractor, token):
+        token.check()
+        assert archive == rar_archive
+        assert extractor == "/fake/bsdtar"
+        target.mkdir()
+        (target / "metadata.json").write_text('{"name":"Marble"}')
+
+    monkeypatch.setattr(archive_module.shutil, "which", lambda name: "/fake/bsdtar")
+    monkeypatch.setattr(archive_module, "_extract_rar_atomically", fake_rar_extract)
+    progress = []
+
+    summary = unzip_all_zip_files(source, progress=progress.append)
+
+    assert summary.extracted == [source / "A_Marble", source / "B_Stone"]
+    assert not summary.failed
+    assert (source / "A_Marble/metadata.json").is_file()
+    assert (source / "B_Stone/metadata.json").is_file()
+    assert [item.archive for item in progress] == ["A_Marble.RAR", "B_Stone.zip"]
+    assert progress[-1].total_archives == 2
+
+
+def test_unzip_all_reports_missing_rar_extractor(
+    monkeypatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "incoming"
+    source.mkdir()
+    archive = source / "Marble.rar"
+    archive.write_bytes(b"rar source")
+    monkeypatch.setattr(archive_module.shutil, "which", lambda name: None)
+
+    summary = unzip_all_zip_files(source)
+
+    assert not summary.extracted
+    assert "bsdtar is unavailable" in summary.failed[str(archive)]
+    assert not (source / "Marble").exists()
+    assert not list(source.glob(".*.shotbox-unzip-*"))
+
+
+@pytest.mark.parametrize("member", ["../escape.json", "/escape.json", "C:/escape.json"])
+def test_rar_member_paths_cannot_escape_target(member: str) -> None:
+    with pytest.raises(ValueError, match="Unsafe RAR member path"):
+        archive_module._safe_archive_member_path(member, "RAR")
+
+
+def test_rar_directory_without_trailing_slash_is_not_extracted_as_a_file(
+    monkeypatch, tmp_path: Path
+) -> None:
+    archive = tmp_path / "Cobblestone 037.rar"
+    archive.write_bytes(b"rar source")
+    target = tmp_path / "Cobblestone 037"
+
+    def fake_run(command, **_kwargs):
+        if "-tvf" in command:
+            stdout = (
+                "-rw-r--r--  0 0  0  7 May 31 2016 "
+                "Cobblestone 037/map.jpg\n"
+                "drwxr-xr-x  0 0  0  0 Dec 28 2017 Cobblestone 037\n"
+            )
+        else:
+            stdout = "Cobblestone 037/map.jpg\nCobblestone 037\n"
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = BytesIO(b"texture")
+            self.stderr = BytesIO()
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return b"", b""
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(archive_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        archive_module.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess()
+    )
+
+    archive_module._extract_rar_atomically(
+        archive, target, "/usr/bin/bsdtar", archive_module.ScanCancellationToken()
+    )
+
+    assert (target / "Cobblestone 037/map.jpg").read_bytes() == b"texture"

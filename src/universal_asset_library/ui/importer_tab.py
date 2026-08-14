@@ -163,7 +163,10 @@ class ImportWorker(QRunnable):
         conflict_decisions: dict[str, str],
         blender_path: str = "",
         render_hdri_previews: bool = True,
+        render_texture_previews: bool = True,
         ffmpeg_path: str = "",
+        save_texture_preview_blend: bool = False,
+        defer_preview_renders: bool = False,
     ) -> None:
         super().__init__()
         self.library_path = library_path
@@ -173,7 +176,12 @@ class ImportWorker(QRunnable):
         self.conflict_decisions = conflict_decisions
         self.blender_path = blender_path
         self.render_hdri_previews = render_hdri_previews
+        self.render_texture_previews = render_texture_previews
         self.ffmpeg_path = ffmpeg_path
+        self.save_texture_preview_blend = bool(
+            save_texture_preview_blend
+        )
+        self.defer_preview_renders = bool(defer_preview_renders)
         self.signals = ImportSignals()
 
     def run(self) -> None:
@@ -181,7 +189,17 @@ class ImportWorker(QRunnable):
             summary = LibraryRepository(
                 self.library_path,
                 blender_path=self.blender_path,
-                render_hdri_previews=self.render_hdri_previews,
+                render_hdri_previews=(
+                    self.render_hdri_previews
+                    and not self.defer_preview_renders
+                ),
+                render_texture_previews=(
+                    self.render_texture_previews
+                    and not self.defer_preview_renders
+                ),
+                save_texture_preview_blend=(
+                    self.save_texture_preview_blend
+                ),
                 ffmpeg_path=self.ffmpeg_path,
             ).import_materials(
                 self.materials,
@@ -258,6 +276,8 @@ class ImporterTab(QWidget):
         self._default_model_category = "Uncategorized"
         self._blender_path = ""
         self._render_hdri_previews = True
+        self._render_texture_previews = True
+        self._save_texture_preview_blend = False
         self._ffmpeg_path = ""
         self._stock_taxonomy: StockTaxonomy = default_stock_taxonomy()
         self._category_catalogs = {
@@ -309,8 +329,8 @@ class ImporterTab(QWidget):
         notice_layout = QHBoxLayout(notice)
         notice_layout.setContentsMargins(14, 9, 14, 9)
         notice_label = QLabel(
-            "Scanning is read-only. Unzip all ZIPs is a separate source-folder action "
-            "that creates one new folder beside each ZIP."
+            "Scanning is read-only. Extract archives is a separate source-folder action "
+            "that creates one new folder beside each ZIP or RAR."
         )
         notice_label.setStyleSheet("color:#FF8357;")
         notice_layout.addWidget(notice_label)
@@ -327,9 +347,9 @@ class ImporterTab(QWidget):
         self.scan_button = QPushButton("Scan folder")
         self.scan_button.setObjectName("primaryButton")
         self.scan_button.clicked.connect(self._start_scan)
-        self.unzip_button = QPushButton("Unzip all ZIPs")
+        self.unzip_button = QPushButton("Extract archives")
         self.unzip_button.setToolTip(
-            "Extract every ZIP under this import folder into a same-name sibling folder."
+            "Extract every ZIP and RAR under this import folder into a same-name sibling folder."
         )
         self.unzip_button.clicked.connect(self._start_unzip)
         self.scan_cancel_button = QPushButton("Cancel scan")
@@ -661,10 +681,10 @@ class ImporterTab(QWidget):
         self.unzip_button.setEnabled(False)
         self.browse_button.setEnabled(False)
         self.source_path.setEnabled(False)
-        self.scan_cancel_button.setText("Cancel unzip")
+        self.scan_cancel_button.setText("Cancel extraction")
         self.scan_cancel_button.setEnabled(True)
         self.scan_cancel_button.show()
-        self.status.setText(f"Finding ZIP files under {source}…")
+        self.status.setText(f"Finding ZIP and RAR files under {source}…")
         self.status.setStyleSheet("color:#FF8357;")
         worker = UnzipWorker(source, self._scan_cancel_token)
         worker.signals.progress.connect(self._unzip_progressed)
@@ -675,7 +695,7 @@ class ImporterTab(QWidget):
 
     def _unzip_progressed(self, progress: ZipExtractionProgress) -> None:
         self.status.setText(
-            f"Unzipping {progress.archive} · "
+            f"Extracting {progress.archive} · "
             f"{progress.completed_archives}/{progress.total_archives}"
         )
 
@@ -688,7 +708,7 @@ class ImporterTab(QWidget):
         self._clear_review()
         self._invalidate_preflight()
         message = (
-            f"Unzipped {len(summary.extracted)} · skipped {len(summary.skipped)} "
+            f"Extracted {len(summary.extracted)} · skipped {len(summary.skipped)} "
             f"· failed {len(summary.failed)}"
         )
         if summary.canceled:
@@ -706,10 +726,10 @@ class ImporterTab(QWidget):
 
     def _unzip_failed(self, details: str) -> None:
         self._finish_unzip_ui()
-        self.status.setText("ZIP extraction failed. No completed folder was overwritten.")
+        self.status.setText("Archive extraction failed. No completed folder was overwritten.")
         self.status.setStyleSheet("color:#ef7d7d;")
         self.scan_summary.setText(
-            details.splitlines()[-1] if details else "Unknown ZIP extraction error"
+            details.splitlines()[-1] if details else "Unknown archive extraction error"
         )
         self._update_import_state()
 
@@ -737,7 +757,7 @@ class ImporterTab(QWidget):
             self._scan_cancel_token.cancel()
             self.scan_cancel_button.setEnabled(False)
             self.status.setText(
-                "Canceling unzip…" if self._unzip_worker else "Canceling scan…"
+                "Canceling extraction…" if self._unzip_worker else "Canceling scan…"
             )
 
     def _scan_finished(self, token: int, result: ScanResult) -> None:
@@ -1397,7 +1417,10 @@ class ImporterTab(QWidget):
             self._conflict_decisions,
             self._blender_path,
             self._render_hdri_previews,
+            self._render_texture_previews,
             self._ffmpeg_path,
+            self._save_texture_preview_blend,
+            True,
         )
         worker.signals.progress.connect(self._import_progressed)
         worker.signals.finished.connect(self._import_finished)
@@ -1534,7 +1557,24 @@ class ImporterTab(QWidget):
         if not self._current and self._mode() == "model":
             self.category.setCurrentText(self._default_model_category)
 
-    def set_hdri_preview_settings(self, blender_path: str, render_on_import: bool) -> None:
+    def set_preview_settings(
+        self,
+        blender_path: str,
+        render_hdri_on_import: bool,
+        render_texture_on_import: bool,
+        save_texture_preview_blend: bool = False,
+    ) -> None:
+        self._blender_path = blender_path
+        self._render_hdri_previews = bool(render_hdri_on_import)
+        self._render_texture_previews = bool(render_texture_on_import)
+        self._save_texture_preview_blend = bool(
+            save_texture_preview_blend
+        )
+
+    def set_hdri_preview_settings(
+        self, blender_path: str, render_on_import: bool
+    ) -> None:
+        """Compatibility wrapper for callers that only configure HDRI previews."""
         self._blender_path = blender_path
         self._render_hdri_previews = bool(render_on_import)
 

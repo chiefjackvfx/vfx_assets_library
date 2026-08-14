@@ -48,8 +48,12 @@ def configure_cycles_gpu(scene) -> tuple[str, list[str]]:
     )
 
 
-def main() -> None:
-    args = arguments()
+def render_job(
+    payload: dict,
+    gpu_metadata: dict,
+    *,
+    progress=None,
+) -> dict:
     scene = bpy.context.scene
     if scene.camera is None:
         raise RuntimeError("The HDRI preview template has no active camera.")
@@ -72,8 +76,10 @@ def main() -> None:
     environment = world.node_tree.nodes.get("Environment Texture")
     if environment is None or environment.bl_idname != "ShaderNodeTexEnvironment":
         raise RuntimeError("World.001 must contain an Environment Texture image node named 'Environment Texture'.")
-    environment.image = bpy.data.images.load(str(Path(args.hdri).resolve()), check_existing=False)
-    gpu_backend, gpu_devices = configure_cycles_gpu(scene)
+    environment.image = bpy.data.images.load(
+        str(Path(str(payload["hdri"])).resolve()),
+        check_existing=False,
+    )
 
     original = {
         "camera": scene.camera,
@@ -90,14 +96,21 @@ def main() -> None:
     scene.render.resolution_x = 1024
     scene.render.resolution_y = 256
     scene.render.resolution_percentage = 100
-    scene.render.filepath = str(Path(args.scene_output).resolve())
+    scene.render.filepath = str(Path(str(payload["scene_output"])).resolve())
+    if progress:
+        progress("Rendering HDRI scene")
     bpy.ops.render.render(write_still=True)
 
     # The upper preview is the source equirectangular image itself. Do not project it
     # through a camera or onto geometry. Scaling this newly loaded image datablock is
     # safe because the template is never saved.
     environment.image.scale(1024, 512)
-    environment.image.save_render(str(Path(args.panorama_output).resolve()), scene=scene)
+    if progress:
+        progress("Preparing HDRI panorama")
+    environment.image.save_render(
+        str(Path(str(payload["panorama_output"])).resolve()),
+        scene=scene,
+    )
 
     scene.camera = original["camera"]
     scene.render.filepath = original["filepath"]
@@ -107,12 +120,29 @@ def main() -> None:
     scene.render.resolution_y = original["resolution_y"]
     scene.render.resolution_percentage = original["percentage"]
     scene.render.film_transparent = original["film_transparent"]
-    Path(args.result).write_text(json.dumps({
-        "blender_version": bpy.app.version_string,
-        "compute_device_type": gpu_backend,
-        "render_device": "GPU",
-        "gpu_devices": gpu_devices,
-    }), encoding="utf-8")
+    return dict(gpu_metadata)
+
+
+def main() -> None:
+    args = arguments()
+    scene = bpy.context.scene
+    gpu_backend, gpu_devices = configure_cycles_gpu(scene)
+    metadata = render_job(
+        {
+            "hdri": args.hdri,
+            "scene_output": args.scene_output,
+            "panorama_output": args.panorama_output,
+        },
+        {
+            "compute_device_type": gpu_backend,
+            "render_device": "GPU",
+            "gpu_devices": gpu_devices,
+        },
+    )
+    Path(args.result).write_text(
+        json.dumps({"blender_version": bpy.app.version_string, **metadata}),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":
