@@ -346,6 +346,24 @@ def test_preflight_blocks_source_changed_after_scan(tmp_path) -> None:
     assert repository.list_assets() == []
 
 
+def test_preflight_reports_validation_hash_duplicate_and_disk_phases(tmp_path) -> None:
+    _source, candidate = source_material(tmp_path)
+    library = tmp_path / "library"
+    library.mkdir()
+    progress = []
+
+    LibraryRepository(library).preflight_materials([candidate], progress=progress.append)
+
+    phases = {item.phase for item in progress}
+    assert {"Validating", "Hashing", "Checking duplicates", "Checking disk space"} <= phases
+    hashing = next(item for item in progress if item.phase == "Hashing")
+    assert hashing.material == "Stone"
+    assert hashing.file
+    assert hashing.completed_items == 1
+    assert hashing.total_items >= hashing.completed_items
+    assert progress[-1].phase == "Checking disk space"
+
+
 def test_provider_id_changed_content_requires_explicit_separate_choice(tmp_path) -> None:
     source = tmp_path / "provider-conflict"
     source.mkdir()

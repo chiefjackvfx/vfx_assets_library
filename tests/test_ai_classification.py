@@ -110,7 +110,7 @@ def test_separate_guess_validators_reject_unknown_values() -> None:
 
 
 def test_packaged_vocabularies_and_stock_override(tmp_path) -> None:
-    for asset_type in ("texture_set", "atlas", "hdri", "model", "stock"):
+    for asset_type in ("texture_set", "atlas", "hdri", "model", "vdb", "stock"):
         assert len(load_tag_vocabulary(asset_type)) >= 5
     control = tmp_path / ".ual"
     control.mkdir()

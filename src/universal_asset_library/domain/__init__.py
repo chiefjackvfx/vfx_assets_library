@@ -5,6 +5,7 @@ from .textures import (
     PBR_CHANNELS,
     STOCK_CATEGORIES,
     TEXTURE_CATEGORIES,
+    VDB_CATEGORIES,
     TextureAsset,
     sample_textures,
 )
@@ -25,6 +26,9 @@ from .library_assets import (
     LibraryStockAsset,
     LibraryStockMediaInfo,
     LibraryTextureAsset,
+    LibraryVdbAsset,
+    LibraryVdbFile,
+    LibraryVdbVariant,
 )
 
 __all__ = [
@@ -44,12 +48,16 @@ __all__ = [
     "LibraryStockAsset",
     "LibraryStockMediaInfo",
     "LibraryTextureAsset",
+    "LibraryVdbAsset",
+    "LibraryVdbFile",
+    "LibraryVdbVariant",
     "PBR_CHANNELS",
     "ATLAS_CATEGORIES",
     "HDRI_CATEGORIES",
     "MODEL_CATEGORIES",
     "STOCK_CATEGORIES",
     "TEXTURE_CATEGORIES",
+    "VDB_CATEGORIES",
     "TextureAsset",
     "sample_textures",
 ]

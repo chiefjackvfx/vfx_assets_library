@@ -13,6 +13,7 @@ from universal_asset_library.domain import (
     MODEL_CATEGORIES,
     STOCK_CATEGORIES,
     TEXTURE_CATEGORIES,
+    VDB_CATEGORIES,
 )
 
 
@@ -26,6 +27,7 @@ CATEGORY_FILENAMES = {
     "hdri": "hdri_categories.json",
     "model": "model_categories.json",
     "stock": "stock_categories.json",
+    "vdb": "vdb_categories.json",
 }
 
 DEFAULT_CATEGORY_NAMES = {
@@ -34,16 +36,17 @@ DEFAULT_CATEGORY_NAMES = {
     "hdri": HDRI_CATEGORIES,
     "model": MODEL_CATEGORIES,
     "stock": STOCK_CATEGORIES,
+    "vdb": VDB_CATEGORIES,
 }
 
 CATEGORY_ICON_IDS = {
     "all",
     GENERIC_ICON_ID,
     "architecture", "asphalt", "atmospheres", "ballistics", "bark", "blood", "branches",
-    "brick", "characters", "clean", "coal", "concrete", "construction", "creatures",
+    "brick", "characters", "clean", "clouds", "coal", "concrete", "construction", "creatures",
     "debris", "decals", "decorative", "dirty",
     "destruction", "dust", "electricity", "explosions", "film-fx", "fire", "flowers", "food",
-    "floors", "furniture", "fabric", "glass", "grass", "gravel", "ground",
+    "floors", "fog", "furniture", "fabric", "glass", "grass", "gravel", "ground",
     "ground-cover", "grout", "impacts", "imperfections", "indoor", "industrial",
     "lasers", "leaves", "lens", "magic", "marble", "metal", "meteors",
     "miscellaneous", "moss", "motion-graphics", "nature", "night", "organic", "other",
@@ -59,11 +62,11 @@ ICON_SHAPES = {
     "architecture": "structure", "asphalt": "terrain", "atmospheres": "cloud",
     "ballistics": "target", "bark": "nature", "blood": "water", "branches": "nature",
     "brick": "material", "characters": "life", "clean": "light", "coal": "terrain",
-    "concrete": "material", "construction": "structure", "creatures": "life",
+    "clouds": "cloud", "concrete": "material", "construction": "structure", "creatures": "life",
     "debris": "terrain", "decals": "tag", "decorative": "object", "dirty": "material",
     "destruction": "energy", "dust": "cloud",
     "electricity": "energy", "explosions": "energy", "film-fx": "motion",
-    "fire": "energy", "flowers": "nature",
+    "fire": "energy", "flowers": "nature", "fog": "cloud",
     "food": "object", "floors": "material", "furniture": "object", "fabric": "material",
     "glass": "material", "grass": "nature", "gravel": "terrain", "ground": "terrain",
     "ground-cover": "nature", "grout": "material", "impacts": "target",
@@ -197,7 +200,7 @@ class CategoryConfigStore:
         self.last_warnings = []
         try:
             self.control_root.mkdir(parents=True, exist_ok=True)
-            for asset_type in ("texture_set", "atlas", "hdri", "model"):
+            for asset_type in ("texture_set", "atlas", "hdri", "model", "vdb"):
                 path = self.path_for(asset_type)
                 if not path.exists():
                     _atomic_json(path, _catalog_document(default_category_catalog(asset_type)))

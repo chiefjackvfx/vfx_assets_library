@@ -244,6 +244,60 @@ class ModelCandidate(MaterialCandidate):
         return len(self.model_files)
 
 
+@dataclass(slots=True)
+class VdbFile:
+    relative_path: str
+    frame: int | None = None
+    padding: int = 0
+
+
+@dataclass(slots=True)
+class VdbVariant:
+    label: str
+    files: list[VdbFile] = field(default_factory=list)
+
+    @property
+    def is_sequence(self) -> bool:
+        return len(self.files) > 1 and all(item.frame is not None for item in self.files)
+
+    @property
+    def frame_start(self) -> int | None:
+        frames = [item.frame for item in self.files if item.frame is not None]
+        return min(frames) if frames else None
+
+    @property
+    def frame_end(self) -> int | None:
+        frames = [item.frame for item in self.files if item.frame is not None]
+        return max(frames) if frames else None
+
+    @property
+    def padding(self) -> int:
+        return max((item.padding for item in self.files), default=0)
+
+    @property
+    def missing_frames(self) -> tuple[int, ...]:
+        if not self.is_sequence or self.frame_start is None or self.frame_end is None:
+            return ()
+        present = {item.frame for item in self.files}
+        return tuple(frame for frame in range(self.frame_start, self.frame_end + 1) if frame not in present)
+
+
+@dataclass(slots=True)
+class VdbCandidate(MaterialCandidate):
+    variants: dict[str, VdbVariant] = field(default_factory=dict)
+    selected_preview_video: str = ""
+    asset_type: str = "vdb"
+
+    @property
+    def resolution_labels(self) -> list[str]:
+        order = {"low": 0, "mid": 1, "high": 2}
+        return sorted(self.variants, key=lambda label: (order.get(label.casefold(), 99), label.casefold()))
+
+    @property
+    def map_count(self) -> int:
+        return sum(len(variant.files) for variant in self.variants.values())
+
+
 @dataclass(frozen=True, slots=True)
 class StockMediaInfo:
     container: str

@@ -24,6 +24,9 @@ from .models import (
     StockPreviewCandidate,
     StockPreviewProfile,
     TextureMap,
+    VdbCandidate,
+    VdbFile,
+    VdbVariant,
 )
 from .scanner import scan_atlas_folder, scan_texture_folder
 from .hdri_scanner import scan_hdri_folder
@@ -31,6 +34,7 @@ from .model_scanner import scan_model_folder
 from .detection import detect_asset_type
 from .mixed_scanner import scan_mixed_folder
 from .stock_scanner import infer_stock_display_name, scan_stock_folder
+from .vdb_scanner import scan_vdb_folder
 from .stock_taxonomy import (
     StockCategoryRule,
     StockClassification,
@@ -72,6 +76,9 @@ __all__ = [
     "StockPreviewCandidate",
     "StockPreviewProfile",
     "TextureMap",
+    "VdbCandidate",
+    "VdbFile",
+    "VdbVariant",
     "scan_texture_folder",
     "scan_atlas_folder",
     "scan_hdri_folder",
@@ -79,6 +86,7 @@ __all__ = [
     "detect_asset_type",
     "scan_mixed_folder",
     "scan_stock_folder",
+    "scan_vdb_folder",
     "infer_stock_display_name",
     "StockCategoryRule",
     "StockClassification",

@@ -9,6 +9,7 @@ from .detection import detect_asset_type
 from .hdri_scanner import hdri_resolution_label, loose_hdri_key, scan_hdri_folder
 from .model_scanner import scan_model_folder
 from .stock_scanner import scan_stock_folder
+from .vdb_scanner import scan_vdb_folder
 from .stock_taxonomy import StockTaxonomy
 from .models import (
     Diagnostic,
@@ -63,6 +64,7 @@ def scan_mixed_folder(
             or path.suffix.casefold() == ".zip"
             or path.suffix.casefold() in {".usd", ".usda", ".usdc", ".usdz", ".fbx", ".obj", ".abc", ".gltf", ".glb", ".blend", ".ma", ".mb"}
             or path.suffix.casefold() in {".mov", ".mp4"}
+            or path.suffix.casefold() == ".vdb"
             or (_filename_channel(path.name)[0] and not has_child_directories)
             for path in direct_files
         )
@@ -71,6 +73,7 @@ def scan_mixed_folder(
             scanner = {
                 "model": scan_model_folder, "hdri": scan_hdri_folder, "atlas": scan_atlas_folder,
                 "stock": scan_stock_folder,
+                "vdb": scan_vdb_folder,
             }.get(mode, scan_texture_folder)
             category = default_model_category if mode == "model" else default_category
             scanner_kwargs = {"progress": progress, "cancel_token": token}
@@ -120,6 +123,7 @@ def scan_mixed_folder(
             scanner = {
                 "model": scan_model_folder, "hdri": scan_hdri_folder, "atlas": scan_atlas_folder,
                 "stock": scan_stock_folder,
+                "vdb": scan_vdb_folder,
             }.get(mode, scan_texture_folder)
             category = default_model_category if mode == "model" else default_category
 
@@ -185,6 +189,7 @@ def scan_mixed_folder(
             ("atlas", counts.get("atlas", 0)),
             ("hdri", counts.get("hdri", 0)),
             ("model", counts.get("model", 0)),
+            ("vdb", counts.get("vdb", 0)),
             ("stock", counts.get("stock", 0)),
         )
         if count
@@ -305,6 +310,7 @@ def _type_label(asset_type: str, plural: bool = False) -> str:
     labels = {
         "texture_set": "texture material", "atlas": "atlas", "hdri": "HDRI",
         "model": "model", "stock": "Stock clip",
+        "vdb": "VDB volume",
     }
     label = labels.get(asset_type, asset_type)
     if not plural:

@@ -1,11 +1,11 @@
 # ShotBox Assets
 
-A lightweight PyQt6 desktop library for PBR textures, cutout atlases, HDRIs, USD-first 3D models, and video Stock footage, styled to match ShotBox.
+A lightweight PyQt6 desktop library for PBR textures, cutout atlases, HDRIs, USD-first 3D models, OpenVDB volumes, and video Stock footage, styled to match ShotBox.
 
 The current milestone contains three surfaces:
 
-- **Assets** — searchable Textures, Atlases, HDRIs, Models, and Stock sections loaded from portable manifests.
-- **Importer** — Texture/Atlas/HDRI/Model/Stock modes with provider-aware scanning, checked batch import, progress, cancellation, and duplicate protection.
+- **Assets** — searchable Textures, Atlases, HDRIs, Models, VDBs, and Stock sections loaded from portable manifests.
+- **Importer** — Texture/Atlas/HDRI/Model/VDB/Stock modes with provider-aware scanning, checked batch import, progress, cancellation, and duplicate protection.
 - **Settings** — persistent library path, thumbnail size, importer defaults, Blender and FFmpeg executables, and independent automatic texture/HDRI preview preferences.
 
 ## Run locally
@@ -61,7 +61,7 @@ If no session appears, use **Refresh Connection** in Settings and check that Hou
 
 ## Blender and Houdini asset bridges
 
-ShotBox Assets can send imported HDRIs, PBR texture materials, and managed USD models into running Blender 5.1/5.2 and Houdini 21/22 sessions:
+ShotBox Assets can send imported HDRIs, PBR texture materials, managed USD models, and VDB volumes into running Blender 5.1/5.2 and Houdini 21/22 sessions. VDB sending is Houdini-only in this release:
 
 1. Open **Settings → Blender Bridge**, select the detected Blender versions, and choose **Install / Update Plugin**.
 2. Restart the DCC. The installed bridge reports its connection and last received asset.
@@ -72,6 +72,8 @@ ShotBox Assets can send imported HDRIs, PBR texture materials, and managed USD m
 For a texture set, choose a resolution and **Send material**. Blender creates or updates a ShotBox-owned Principled BSDF material and replaces the active material slot on each selected mesh, appending only when an object has no material slots. Its image textures share one **Texture Coordinate (UV) → Mapping** chain, and the complete graph is spaced into readable columns so Scale, Rotation, or Location can be adjusted once for every map. Materials with a managed Displacement or Height map automatically use Blender's **Displacement Only** surface mode. Houdini starts from its native **USD MaterialX Builder** scaffold, wires the PBR maps into the provided Standard Surface and Displacement nodes, and assigns it to selected scene-graph primitives. Every MaterialX image shares one `uv_coordinates → uv_control` chain, so changing Scale, Rotate, or Offset on `uv_control` transforms the complete texture set together. With no suitable selection, the material is created unassigned. Preferred managed maps are referenced directly, packed maps are split by their declared channels, and repeat sends update the material carrying the same asset ID.
 
 For a USD-ready model, choose the preferred or another managed USD variant and **Import model**. Blender imports editable geometry and authored materials beneath a new ShotBox root at the 3D cursor; each send creates a separate placement and excludes USD cameras and lights. Houdini can create a live Reference LOP in Solaris or a packed USD File Import SOP in the selected geometry network, falling back to `/stage` or a new `/obj` Geometry container as needed. SOP imports also build managed MaterialX shaders under `/mat` and append a Material SOP assignment; Normal takes priority over Bump and Displacement remains separate. DCC scenes are never saved automatically and managed library files are never copied or modified by the bridge.
+
+For a VDB, choose Low, Mid, High, or another discovered quality variant and select **Create File SOP in Houdini**. Each send creates a new File SOP in the selected SOP network or Geometry object, falling back to a new Geometry object under `/obj`. Static volumes reference their managed file directly. Sequences use a padded `$F` expression, retain their source frame range, and use Houdini's **No Geometry** missing-frame policy. The bridge does not create shaders or pyro networks and never saves the HIP file.
 
 Static models with a managed BLEND, FBX, OBJ, GLTF, GLB, or Alembic source expose **Convert to USD**. ShotBox runs the configured Blender 5.1+ executable headlessly, resets Blender to an empty factory scene, imports only the selected model, matches managed texture sets to material slots, copies the used maps into a portable derivative, and publishes the preferred USDC directly under `usd/`. LOD0 is selected by default whenever it is available, including for rebuilds. Normal maps take precedence over Bump maps; Bump is used only when no Normal map exists, while Displacement remains separate. A single exported material uses the asset name; multi-material assets use `<AssetName>_<TextureSetName>`. The default USD Interchange preset exports −Z forward and Y up; Z-up is also available. Rigs, animation, blend shapes, missing materials, ambiguous matches, stale assets, and invalid exports fail without changing the prior asset or USD.
 
@@ -93,7 +95,7 @@ The app displays file count, channels or dependency count, and total size before
 
 ## Importer behavior
 
-Choose **Textures**, **Atlases**, **HDRIs**, **Models**, or **Stock**, then select a single asset folder or a parent containing several assets. The scanner:
+Choose **Textures**, **Atlases**, **HDRIs**, **Models**, **VDBs**, or **Stock**, then select a single asset folder or a parent containing several assets. The scanner:
 
 - reads supported local images and JSON without modifying them;
 - recognizes Megascans and Poly Haven metadata;
@@ -114,6 +116,8 @@ HDRI mode recognizes local HDR and EXR panoramas, including Poly Haven `info.jso
 HDRI files are stored directly in the asset's `maps/` directory rather than inside one-file resolution folders. Resolution grouping remains available through `asset.json` and the UI.
 
 Model mode recognizes USD/USD variants, FBX, OBJ, Alembic, glTF/GLB, Blender, and Maya scenes. One selected source folder becomes one model asset with a uniform managed layout: model files are flattened into `models/`, texture maps into `maps/<resolution>/`, previews into `previews/`, provider JSON into `metadata/`, and ordinary companions into `extras/`. Source subfolders are not recreated. USD is always preferred when locally available and is marked **USD Ready**. Assets without USD still import using the best available Blender, Maya, FBX, OBJ, Alembic, or glTF representation and are marked **No USD**.
+
+VDB mode scans `.vdb` files without loading OpenVDB grids. Quality tokens such as Low, Mid, and High become selectable variants on one asset. A numeric run after a quality token is treated as a sequence frame only when multiple matching frames exist; static numbered collections such as `cloud_formation_001_Low_Res.vdb` remain separate assets. Sequence padding, source frame range, and gaps are preserved in `asset.json`. Managed files live under `vdbs/<category>/<asset>/volumes/<variant>/`. Supplied JPG, PNG, WebP, MOV, and MP4 previews are paired by normalized names; FFmpeg extracts a midpoint thumbnail when available, otherwise the retained video uses a volume placeholder. Portable VDB categories are stored in `.ual/vdb_categories.json`.
 
 Stock mode treats every MOV or MP4 source as its own catalog asset. FFprobe records codec, dimensions, frame rate, duration, audio, and alpha state, while provider previews in `Previews`, `Video_Thumbnails`, `Thumbnails`, or `Proxies` are paired by normalized filename and media agreement. A preview tree beside the selected source folder is discovered automatically. Videos below a recognized preview/proxy/thumbnail folder at any depth are never offered as source assets, even when that folder is selected directly. When provider filenames differ, structured effect-folder and clip-number matching is allowed only when duration and frame counts agree; ambiguous matches stay unassigned. Compatible H.264 4:2:0 previews are preserved unchanged. Missing or incompatible previews become full-duration, no-upscale 480p H.264 MP4 files with AAC audio when present; transparent sources are composited over a neutral checkerboard. Every import receives a JPEG thumbnail extracted at exactly the preview midpoint. Managed Stock files are stored loose in `stock/<category>/` as `<Asset>.<ext>`, `<Asset>_Preview.<ext>`, `<Asset>_Thumbnail.jpg`, and `<Asset>.json`; new Stock imports intentionally omit sidecars and extras. Stock cards play their managed preview silently as soon as they are hovered using one shared decoder; this can be disabled in Settings, and manually started inspector playback takes priority. The Assets inspector provides non-autoplay playback, seeking, looping, mute, volume, and an external-player fallback. FFmpeg is mandatory for Stock import because midpoint thumbnails are always generated.
 
@@ -152,7 +156,7 @@ Preview images remain on the local computer.
 
 The Assets catalog uses an expandable category rail beside the asset grid. It starts as an icon strip, can expand to show category names and live result counts, and combines its single-category selection with the current search and technical facet. Only primary categories used by the selected asset type are shown. Switching asset types resets the rail to **All**.
 
-Portable category order, suggestions, aliases, and bundled icon IDs live in `.ual/texture_categories.json`, `.ual/atlas_categories.json`, `.ual/hdri_categories.json`, `.ual/model_categories.json`, and `.ual/stock_categories.json`. Missing files are created from defaults without replacing existing edits. Unknown icon IDs use the generic icon, and invalid configuration falls back to built-in categories with a library warning. Stock aliases continue to drive filename and folder classification.
+Portable category order, suggestions, aliases, and bundled icon IDs live in `.ual/texture_categories.json`, `.ual/atlas_categories.json`, `.ual/hdri_categories.json`, `.ual/model_categories.json`, `.ual/vdb_categories.json`, and `.ual/stock_categories.json`. Missing files are created from defaults without replacing existing edits. Unknown icon IDs use the generic icon, and invalid configuration falls back to built-in categories with a library warning. Stock aliases continue to drive filename and folder classification.
 
 **Settings → Update / Fix Library** migrates older `categories` arrays by preserving the manifest's primary `category`, moving useful secondary values into lowercase tags, removing `surface`, and atomically publishing the validated manifest. Unknown primary categories are reported for taxonomy attention rather than guessed.
 

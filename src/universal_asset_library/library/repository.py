@@ -14,7 +14,7 @@ from typing import Callable, Iterable, Mapping
 from uuid import uuid4
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QImage, QImageReader
+from PyQt6.QtGui import QColor, QImage, QImageReader, QPainter, QPen
 
 from universal_asset_library.domain import (
     LibraryExtraFile,
@@ -32,6 +32,9 @@ from universal_asset_library.domain import (
     LibraryStockAsset,
     LibraryStockMediaInfo,
     LibraryTextureAsset,
+    LibraryVdbAsset,
+    LibraryVdbFile,
+    LibraryVdbVariant,
 )
 from universal_asset_library.importer.models import (
     Diagnostic,
@@ -41,17 +44,25 @@ from universal_asset_library.importer.models import (
     ModelCandidate,
     MaterialPreflight,
     PreflightResult,
+    ScanCancelled,
     SourceFileSnapshot,
     StockCandidate,
     TextureMap,
+    VdbCandidate,
 )
 from universal_asset_library.importer.adapters import normalize_channel
 from universal_asset_library.importer.stock_taxonomy import StockTaxonomyStore, classify_stock_path
+from universal_asset_library.importer.stock_scanner import (
+    StockProbeError,
+    probe_video,
+    resolve_ffprobe,
+)
 from universal_asset_library.categories import CategoryCatalog, CategoryConfigStore
 from universal_asset_library.previews import (
     BlenderPreviewSession,
     HdriPreviewRequest,
     HdriPreviewResult,
+    StockPreviewError,
     TexturePreviewMap,
     TexturePreviewRequest,
     TexturePreviewResult,
@@ -100,7 +111,7 @@ MODEL_LAYOUT_VERSION = 6
 STOCK_LAYOUT_VERSION = 2
 SPACE_CUSHION = 64 * 1024 * 1024
 AssetRecord = (
-    LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset
+    LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset | LibraryVdbAsset
 )
 
 
@@ -126,11 +137,14 @@ class ImportProgress:
     file: str
     completed_bytes: int
     total_bytes: int
+    phase: str = ""
+    completed_items: int = 0
+    total_items: int = 0
 
 
 @dataclass(slots=True)
 class ImportSummary:
-    imported: list[LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset] = field(default_factory=list)
+    imported: list[AssetRecord] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
     canceled: bool = False
@@ -171,7 +185,7 @@ class RepairSummary:
 
 @dataclass(slots=True)
 class LibraryUpdateSummary:
-    updated: list[LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset] = field(default_factory=list)
+    updated: list[LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset | LibraryVdbAsset] = field(default_factory=list)
     valid: int = 0
     failed: dict[str, str] = field(default_factory=dict)
     canceled: bool = False
@@ -273,6 +287,7 @@ class LibraryRepository:
         (self.root / "atlases").mkdir(parents=True, exist_ok=True)
         (self.root / "hdris").mkdir(parents=True, exist_ok=True)
         (self.root / "models").mkdir(parents=True, exist_ok=True)
+        (self.root / "vdbs").mkdir(parents=True, exist_ok=True)
         (self.root / "stock").mkdir(parents=True, exist_ok=True)
         config = control / "library.json"
         if not config.exists():
@@ -321,7 +336,7 @@ class LibraryRepository:
 
     def load_asset_manifest(
         self, manifest_path: str | Path, *, expected_type: str | None = None
-    ) -> LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset:
+    ) -> AssetRecord:
         path = Path(manifest_path).absolute()
         document = json.loads(path.read_text(encoding="utf-8"))
         asset = _asset_from_manifest(document, path.parent)
@@ -351,6 +366,9 @@ class LibraryRepository:
 
     def list_stock_assets(self) -> list[LibraryStockAsset]:
         return [asset for asset in self.list_assets_for_type("stock") if isinstance(asset, LibraryStockAsset)]
+
+    def list_vdb_assets(self) -> list[LibraryVdbAsset]:
+        return [asset for asset in self.list_assets_for_type("vdb") if isinstance(asset, LibraryVdbAsset)]
 
     def classify_uncategorized_stock(
         self,
@@ -1595,12 +1613,24 @@ class LibraryRepository:
                 pass
         result.total_bytes = total_bytes
         completed_bytes = 0
+        completed_files = 0
+        total_files = len(source_files)
 
         for material in selected:
             item = MaterialPreflight(material=material)
             result.materials.append(item)
             try:
                 token.check()
+                if progress:
+                    progress(ImportProgress(
+                        material.name,
+                        "Paths, metadata, and source snapshots",
+                        completed_bytes,
+                        total_bytes,
+                        "Validating",
+                        completed_files,
+                        total_files,
+                    ))
                 if material.archive_source:
                     _validate_archive_source(material)
                     archive = material.archive_source.archive_path
@@ -1634,9 +1664,24 @@ class LibraryRepository:
                     snapshot = material.source_snapshots.get(relative)
                     cache_key = (str(source), source.stat().st_size, source.stat().st_mtime_ns)
                     digest = cache.get(cache_key)
+                    current_file = completed_files + 1
                     if not digest:
                         digest, used = _hash_source(
-                            source, snapshot, material.name, progress, token,
+                            source,
+                            snapshot,
+                            material.name,
+                            (
+                                lambda value, position=current_file: progress(ImportProgress(
+                                    value.material,
+                                    value.file,
+                                    value.completed_bytes,
+                                    value.total_bytes,
+                                    "Hashing",
+                                    position,
+                                    total_files,
+                                ))
+                            ) if progress else None,
+                            token,
                             completed_bytes, total_bytes,
                         )
                         completed_bytes += used
@@ -1644,7 +1689,16 @@ class LibraryRepository:
                     else:
                         completed_bytes += source.stat().st_size
                         if progress:
-                            progress(ImportProgress(material.name, source.name, completed_bytes, total_bytes))
+                            progress(ImportProgress(
+                                material.name,
+                                source.name,
+                                completed_bytes,
+                                total_bytes,
+                                "Using cached hash",
+                                current_file,
+                                total_files,
+                            ))
+                    completed_files += 1
                     item.hashes[relative] = digest
                     if relative in primary:
                         label, channel = primary[relative]
@@ -1655,6 +1709,16 @@ class LibraryRepository:
                     item.fingerprint = hashlib.sha256(
                         "\n".join(sorted(fingerprint_records)).encode("utf-8")
                     ).hexdigest()
+                if progress:
+                    progress(ImportProgress(
+                        material.name,
+                        "Content fingerprints and provider IDs",
+                        completed_bytes,
+                        total_bytes,
+                        "Checking duplicates",
+                        completed_files,
+                        total_files,
+                    ))
                 duplicate = existing_fingerprints.get((material.asset_type, item.fingerprint))
                 if duplicate:
                     item.status = "Duplicate"
@@ -1689,6 +1753,16 @@ class LibraryRepository:
                 item.diagnostics.append(Diagnostic("error", "preflight_failed", str(error), material=str(material.source_root)))
             result.diagnostics.extend(item.diagnostics)
 
+        if progress:
+            progress(ImportProgress(
+                "",
+                "Required capacity plus the 64 MB safety cushion",
+                completed_bytes,
+                total_bytes,
+                "Checking disk space",
+                completed_files,
+                total_files,
+            ))
         required = sum(
             _material_source_bytes(item.material)
             for item in result.materials
@@ -2638,6 +2712,9 @@ class LibraryRepository:
     def import_stock(self, assets: Iterable[StockCandidate], **kwargs) -> ImportSummary:
         return self.import_materials(assets, **kwargs)
 
+    def import_vdbs(self, assets: Iterable[VdbCandidate], **kwargs) -> ImportSummary:
+        return self.import_materials(assets, **kwargs)
+
     def _import_one(
         self,
         material: MaterialCandidate,
@@ -2648,9 +2725,14 @@ class LibraryRepository:
         existing_fingerprints: set[str],
         preflight: MaterialPreflight,
         preview_session: BlenderPreviewSession | None = None,
-    ) -> tuple[LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | None, int]:
+    ) -> tuple[AssetRecord | None, int]:
         if isinstance(material, StockCandidate):
             return self._import_one_stock(
+                material, completed_before, total_bytes, progress, token,
+                existing_fingerprints, preflight,
+            )
+        if isinstance(material, VdbCandidate):
+            return self._import_one_vdb(
                 material, completed_before, total_bytes, progress, token,
                 existing_fingerprints, preflight,
             )
@@ -3502,6 +3584,188 @@ class LibraryRepository:
                 shutil.rmtree(stage)
             raise
 
+    def _import_one_vdb(
+        self,
+        material: VdbCandidate,
+        completed_before: int,
+        total_bytes: int,
+        progress: Callable[[ImportProgress], None] | None,
+        token: CancelToken,
+        existing_fingerprints: set[str],
+        preflight: MaterialPreflight,
+    ) -> tuple[LibraryVdbAsset | None, int]:
+        asset_id = str(uuid4())
+        stage = self.root / ".ual" / "staging" / asset_id
+        stage.mkdir(parents=True, exist_ok=False)
+        copied_bytes = 0
+        fingerprint_records: list[str] = []
+        manifest_variants: dict[str, dict] = {}
+        try:
+            for label in material.resolution_labels:
+                variant = material.variants[label]
+                records: list[dict] = []
+                used: set[str] = set()
+                for source_file in variant.files:
+                    source = _safe_source(material.source_root, source_file.relative_path)
+                    filename = _safe_filename(source.name)
+                    stem, suffix = Path(filename).stem, Path(filename).suffix
+                    counter = 2
+                    while filename.casefold() in used:
+                        filename = f"{stem}_{counter}{suffix}"
+                        counter += 1
+                    used.add(filename.casefold())
+                    destination = stage / "volumes" / _safe_component(label) / filename
+                    size, digest = _copy_hash(
+                        source, destination, material.name, progress, token,
+                        completed_before + copied_bytes, total_bytes,
+                        material.source_snapshots.get(source_file.relative_path),
+                        preflight.hashes.get(source_file.relative_path, ""),
+                    )
+                    copied_bytes += size
+                    records.append({
+                        "path": destination.relative_to(stage).as_posix(),
+                        "original_path": source_file.relative_path,
+                        "format": "VDB",
+                        "size": size,
+                        "sha256": digest,
+                        "frame": source_file.frame,
+                        "padding": source_file.padding,
+                    })
+                    identity = source_file.frame if source_file.frame is not None else "static"
+                    fingerprint_records.append(f"{label}|{identity}|{digest}")
+                manifest_variants[label] = {
+                    "label": label,
+                    "mode": "sequence" if variant.is_sequence else "static",
+                    "is_sequence": variant.is_sequence,
+                    "frame_start": variant.frame_start,
+                    "frame_end": variant.frame_end,
+                    "padding": variant.padding,
+                    "missing_frames": list(variant.missing_frames),
+                    "files": records,
+                }
+
+            fingerprint = hashlib.sha256(
+                "\n".join(sorted(fingerprint_records)).encode("utf-8")
+            ).hexdigest()
+            if preflight.fingerprint and fingerprint != preflight.fingerprint:
+                raise StaleSourceError(
+                    f"{material.name} changed after preflight; rescan before importing."
+                )
+            if fingerprint in existing_fingerprints:
+                shutil.rmtree(stage)
+                return None, copied_bytes
+
+            preview_manifest = {"thumbnail": "", "hero": "", "video": ""}
+            preview_original_paths: dict[str, str | None] = {
+                "thumbnail": None, "hero": None, "video": None,
+            }
+            if material.selected_thumbnail:
+                source = _safe_source(material.source_root, material.selected_thumbnail)
+                destination = stage / "previews" / (
+                    f"{_filename_token(material.name)}_Thumbnail{_safe_suffix(source.suffix)}"
+                )
+                size, _digest = _copy_hash(
+                    source, destination, material.name, progress, token,
+                    completed_before + copied_bytes, total_bytes,
+                    material.source_snapshots.get(material.selected_thumbnail),
+                    preflight.hashes.get(material.selected_thumbnail, ""),
+                )
+                copied_bytes += size
+                stored = destination.relative_to(stage).as_posix()
+                preview_manifest["thumbnail"] = stored
+                preview_manifest["hero"] = stored
+                preview_original_paths["thumbnail"] = material.selected_thumbnail
+                preview_original_paths["hero"] = material.selected_thumbnail
+            if material.selected_preview_video:
+                source = _safe_source(material.source_root, material.selected_preview_video)
+                destination = stage / "previews" / (
+                    f"{_filename_token(material.name)}_Preview{_safe_suffix(source.suffix)}"
+                )
+                size, _digest = _copy_hash(
+                    source, destination, material.name, progress, token,
+                    completed_before + copied_bytes, total_bytes,
+                    material.source_snapshots.get(material.selected_preview_video),
+                    preflight.hashes.get(material.selected_preview_video, ""),
+                )
+                copied_bytes += size
+                preview_manifest["video"] = destination.relative_to(stage).as_posix()
+                preview_original_paths["video"] = material.selected_preview_video
+            if (
+                not preview_manifest["thumbnail"]
+                and preview_manifest["video"]
+            ):
+                ffmpeg = resolve_ffmpeg(self.ffmpeg_path)
+                ffprobe = resolve_ffprobe(self.ffmpeg_path)
+                if ffmpeg and ffprobe:
+                    video = stage / preview_manifest["video"]
+                    thumbnail = stage / "previews" / (
+                        f"{_filename_token(material.name)}_Thumbnail.jpg"
+                    )
+                    try:
+                        media_info = probe_video(video, ffprobe, token)
+                        generate_midpoint_thumbnail(
+                            video,
+                            thumbnail,
+                            media_info.duration,
+                            ffmpeg,
+                            token,
+                        )
+                    except ScanCancelled as error:
+                        raise ImportCancelled("Import canceled by user.") from error
+                    except (StockProbeError, StockPreviewError):
+                        pass
+                    else:
+                        relative = thumbnail.relative_to(stage).as_posix()
+                        preview_manifest["thumbnail"] = relative
+                        preview_manifest["hero"] = relative
+            if not preview_manifest["thumbnail"]:
+                placeholder = stage / "previews" / (
+                    f"{_filename_token(material.name)}_Placeholder.jpg"
+                )
+                _write_vdb_placeholder(material.name, placeholder, token)
+                relative = placeholder.relative_to(stage).as_posix()
+                preview_manifest["thumbnail"] = relative
+                preview_manifest["hero"] = relative
+
+            now = _utc_now()
+            manifest = {
+                "schema_version": SCHEMA_VERSION,
+                "rating": 0,
+                "naming_version": NAMING_VERSION,
+                "layout_version": LAYOUT_VERSION,
+                "id": asset_id,
+                "type": "vdb",
+                "name": material.name,
+                "slug": _slugify(material.name),
+                "category": material.category,
+                "tags": list(_clean_tags(material.tags)),
+                "description": material.description,
+                "author": material.author,
+                "physical_size": material.physical_size,
+                "provider": {"name": material.provider, "id": material.provider_id},
+                "created_at": now,
+                "updated_at": now,
+                "source": {"original_path": str(material.source_root)},
+                "variants": manifest_variants,
+                "previews": preview_manifest,
+                "preview_original_paths": preview_original_paths,
+                "source_metadata": [],
+                "extra_files": [],
+                "fingerprint": fingerprint,
+            }
+            _atomic_json(stage / "asset.json", manifest)
+            _asset_from_manifest(manifest, stage)
+            final_parent = self.root / "vdbs" / _slugify(material.category)
+            final_parent.mkdir(parents=True, exist_ok=True)
+            final = _unique_asset_destination(final_parent, _slugify(material.name))
+            os.replace(stage, final)
+            _sync_directory(final_parent)
+            return _asset_from_manifest(manifest, final), copied_bytes
+        except Exception:
+            if stage.exists():
+                shutil.rmtree(stage)
+            raise
+
     def _import_one_model(
         self,
         material: ModelCandidate,
@@ -3884,7 +4148,7 @@ def _pid_exists(pid: int) -> bool:
 
 def _asset_from_manifest(
     document: dict, asset_dir: Path
-) -> LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset:
+) -> AssetRecord:
     if document.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("Unsupported asset manifest")
     if document.get("type") == "hdri":
@@ -3893,6 +4157,8 @@ def _asset_from_manifest(
         return _model_asset_from_manifest(document, asset_dir)
     if document.get("type") == "stock":
         return _stock_asset_from_manifest(document, asset_dir)
+    if document.get("type") == "vdb":
+        return _vdb_asset_from_manifest(document, asset_dir)
     if document.get("type") not in {"texture_set", "atlas"}:
         raise ValueError("Unsupported asset manifest")
     resolutions: dict[str, LibraryResolution] = {}
@@ -3981,6 +4247,112 @@ def _asset_from_manifest(
             if isinstance(previews.get("render", {}), dict)
             else {}
         ),
+        rating=_manifest_rating(document),
+    )
+
+
+def _vdb_asset_from_manifest(document: dict, asset_dir: Path) -> LibraryVdbAsset:
+    variants: dict[str, LibraryVdbVariant] = {}
+    total_size = 0
+    for label, value in document.get("variants", {}).items():
+        if not isinstance(value, dict):
+            raise ValueError("Invalid VDB variant record")
+        canonical_label = str(value.get("label", label)).strip()
+        if not canonical_label or canonical_label != str(label):
+            raise ValueError("VDB variant label does not match its manifest key")
+        is_sequence = bool(value.get("is_sequence", False))
+        mode = str(value.get("mode", "sequence" if is_sequence else "static")).casefold()
+        if mode not in {"static", "sequence"} or (mode == "sequence") != is_sequence:
+            raise ValueError(f"VDB variant {label} has inconsistent sequence metadata")
+        files: list[LibraryVdbFile] = []
+        for record in value.get("files", []):
+            if not isinstance(record, dict):
+                raise ValueError("Invalid VDB file record")
+            relative = _safe_manifest_path(str(record.get("path", "")))
+            path = asset_dir / relative
+            if path.suffix.casefold() != ".vdb" or not path.is_file():
+                raise ValueError(f"Missing VDB file: {relative}")
+            size = int(record.get("size", path.stat().st_size))
+            total_size += size
+            frame = record.get("frame")
+            files.append(LibraryVdbFile(
+                relative,
+                str(record.get("original_path", "")),
+                size,
+                str(record.get("sha256", "")),
+                int(frame) if frame is not None else None,
+                int(record.get("padding", 0)),
+            ))
+        if not files:
+            raise ValueError(f"VDB variant {label} contains no local files")
+        frames = [item.frame for item in files if item.frame is not None]
+        frame_start = int(value["frame_start"]) if value.get("frame_start") is not None else None
+        frame_end = int(value["frame_end"]) if value.get("frame_end") is not None else None
+        padding = int(value.get("padding", 0))
+        missing_frames = tuple(int(frame) for frame in value.get("missing_frames", []))
+        if is_sequence:
+            if len(frames) != len(files) or len(set(frames)) != len(frames):
+                raise ValueError(f"VDB variant {label} has invalid sequence frame records")
+            if not frames or frame_start != min(frames) or frame_end != max(frames) or padding <= 0:
+                raise ValueError(f"VDB variant {label} has an invalid frame range or padding")
+            expected_missing = tuple(frame for frame in range(frame_start, frame_end + 1) if frame not in frames)
+            if missing_frames != expected_missing:
+                raise ValueError(f"VDB variant {label} has inconsistent missing-frame metadata")
+        elif frames or frame_start is not None or frame_end is not None or padding or missing_frames:
+            raise ValueError(f"Static VDB variant {label} contains sequence metadata")
+        variants[str(label)] = LibraryVdbVariant(
+            str(label),
+            tuple(files),
+            is_sequence,
+            frame_start,
+            frame_end,
+            padding,
+            missing_frames,
+        )
+    if not variants:
+        raise ValueError("VDB manifest contains no variants")
+    previews = document.get("previews", {})
+    thumbnail = _optional_asset_path(asset_dir, previews.get("thumbnail"))
+    hero = _optional_asset_path(asset_dir, previews.get("hero"))
+    video = _optional_asset_path(asset_dir, previews.get("video"))
+    for path in {item for item in (thumbnail, hero, video) if item}:
+        total_size += path.stat().st_size
+    extras: list[LibraryExtraFile] = []
+    for record in document.get("extra_files", []):
+        relative = _safe_manifest_path(str(record["path"]))
+        path = asset_dir / relative
+        if not path.is_file():
+            raise ValueError(f"Missing VDB companion: {relative}")
+        size = int(record.get("size", path.stat().st_size))
+        total_size += size
+        extras.append(LibraryExtraFile(
+            relative, str(record.get("original_path", "")), size,
+            str(record.get("sha256", "")),
+            str(record.get("format", path.suffix.lstrip("."))).upper(),
+        ))
+    source_metadata = _validated_support_paths(asset_dir, document.get("source_metadata", []))
+    total_size += sum((asset_dir / path).stat().st_size for path in source_metadata)
+    provider = document.get("provider", {})
+    return LibraryVdbAsset(
+        id=str(document["id"]),
+        name=str(document["name"]),
+        category=_manifest_primary_category(document),
+        tags=tuple(str(tag) for tag in document.get("tags", [])),
+        description=str(document.get("description", "")),
+        author=str(document.get("author", "")),
+        provider=_provider_name(provider.get("name")),
+        provider_id=str(provider.get("id", "")),
+        asset_dir=asset_dir,
+        variants=variants,
+        thumbnail_path=thumbnail,
+        hero_path=hero,
+        preview_path=video,
+        fingerprint=str(document.get("fingerprint", "")),
+        created_at=str(document.get("created_at", "")),
+        total_size=total_size,
+        extra_files=tuple(extras),
+        source_metadata=source_metadata,
+        physical_size=str(document.get("physical_size", "")),
         rating=_manifest_rating(document),
     )
 
@@ -4785,6 +5157,11 @@ def _validate_candidate(material: MaterialCandidate, library_root: Path) -> None
                 raise LibraryError(
                     f"{material.name}'s selected preview is not H.264 4:2:0; choose Generate 480p preview."
                 )
+    elif isinstance(material, VdbCandidate):
+        if not material.name.strip() or not material.category.strip() or not material.variants:
+            raise LibraryError(f"{material.name or 'VDB'} is missing required review metadata or VDB variants.")
+        if not any(variant.files for variant in material.variants.values()):
+            raise LibraryError(f"{material.name} has no local VDB files.")
     elif isinstance(material, ModelCandidate):
         if not material.name.strip() or not material.category.strip() or not material.model_files:
             raise LibraryError(f"{material.name or 'Model'} is missing required review metadata or model files.")
@@ -4797,7 +5174,7 @@ def _validate_candidate(material: MaterialCandidate, library_root: Path) -> None
     for relative in _candidate_source_paths(material):
         _safe_source(material.source_root, relative)
     if (
-        not isinstance(material, (ModelCandidate, StockCandidate))
+        not isinstance(material, (ModelCandidate, StockCandidate, VdbCandidate))
         and not any(variant.maps for variant in material.resolutions.values())
     ):
         raise LibraryError(f"{material.name} has no local texture maps.")
@@ -4876,6 +5253,7 @@ def _portable_candidate_diagnostics(material: MaterialCandidate, library_root: P
             diagnostics.append(Diagnostic("error", "filename_too_long", f"{component!r} is too long for a portable library path."))
     container = (
         "models" if isinstance(material, ModelCandidate)
+        else "vdbs" if isinstance(material, VdbCandidate)
         else "hdris" if isinstance(material, HdriCandidate)
         else "stock" if isinstance(material, StockCandidate)
         else "atlases" if material.asset_type == "atlas"
@@ -4883,6 +5261,7 @@ def _portable_candidate_diagnostics(material: MaterialCandidate, library_root: P
     )
     tail = (
         ("source", "textures", "16K") if isinstance(material, ModelCandidate)
+        else ("volumes", "high", "volume_1001.vdb") if isinstance(material, VdbCandidate)
         else (f"{_filename_token(material.name)}{Path(material.source_video).suffix}",) if isinstance(material, StockCandidate)
         else ("maps", "16K")
     )
@@ -5005,6 +5384,12 @@ def _primary_file_records(material: MaterialCandidate):
                     for texture_file in variant.maps[channel]:
                         yield f"TEXTURE:{set_name}:{label}", f"{channel}:{texture_file.lod}", texture_file
         return
+    if isinstance(material, VdbCandidate):
+        for label in material.resolution_labels:
+            for vdb_file in material.variants[label].files:
+                identity = str(vdb_file.frame) if vdb_file.frame is not None else "static"
+                yield label, identity, vdb_file
+        return
     for label in material.resolution_labels:
         variant = material.resolutions[label]
         for channel in sorted(variant.maps, key=str.casefold):
@@ -5090,6 +5475,8 @@ def _candidate_source_paths(material: MaterialCandidate) -> list[str]:
         if material.preview_policy == "use_existing" and material.selected_preview:
             paths.add(material.selected_preview)
         return sorted(paths, key=str.casefold)
+    if isinstance(material, VdbCandidate) and material.selected_preview_video:
+        paths.add(material.selected_preview_video)
     paths.update(path for path in (material.selected_thumbnail, material.selected_hero) if path)
     paths.update(material.metadata_paths)
     paths.update(_material_extra_paths(material))
@@ -5105,6 +5492,18 @@ def _material_extra_paths(material: MaterialCandidate) -> list[str]:
         )
     if isinstance(material, ModelCandidate):
         return sorted(set(material.extra_paths), key=str.casefold)
+    if isinstance(material, VdbCandidate):
+        assigned = {
+            item.relative_path
+            for variant in material.variants.values()
+            for item in variant.files
+        }
+        assigned.update(path for path in (
+            material.selected_thumbnail, material.selected_hero,
+            material.selected_preview_video,
+        ) if path)
+        assigned.update(material.metadata_paths)
+        return sorted((path for path in material.extra_paths if path not in assigned), key=str.casefold)
     assigned = {
         texture_map.relative_path
         for variant in material.resolutions.values()
@@ -5238,6 +5637,28 @@ def _write_model_placeholder(name: str, destination: Path, token: CancelToken) -
         raise LibraryError(f"Could not create a placeholder preview for {name}.")
     with destination.open("rb") as handle:
         os.fsync(handle.fileno())
+
+
+def _write_vdb_placeholder(name: str, destination: Path, token: CancelToken) -> None:
+    token.check()
+    image = QImage(640, 360, QImage.Format.Format_RGB32)
+    image.fill(QColor("#263340"))
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(QColor("#9eb1c1"), 3))
+    painter.setBrush(QColor("#70869b"))
+    for x, y, width, height in (
+        (120, 170, 210, 105), (230, 105, 230, 160),
+        (355, 155, 165, 120), (185, 205, 300, 80),
+    ):
+        painter.drawEllipse(x, y, width, height)
+    painter.end()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not image.save(str(destination), "JPG", 90):
+        raise LibraryError(f"Could not create a VDB placeholder preview for {name}.")
+    with destination.open("rb") as handle:
+        os.fsync(handle.fileno())
+    token.check()
 
 
 def _hash_source(
@@ -5571,7 +5992,7 @@ def _stock_manifest_paths(library_root: Path) -> list[Path]:
 
 def _asset_manifest_paths(library_root: Path) -> list[Path]:
     paths: set[Path] = set(_stock_manifest_paths(library_root))
-    for name in ("textures", "atlases", "hdris", "models"):
+    for name in ("textures", "atlases", "hdris", "models", "vdbs"):
         container = library_root / name
         if container.is_dir():
             paths.update(container.glob("**/asset.json"))
@@ -5595,6 +6016,7 @@ def _asset_container(asset_type: str) -> str:
         "hdri": "hdris",
         "model": "models",
         "stock": "stock",
+        "vdb": "vdbs",
     }
     try:
         return containers[asset_type.casefold()]

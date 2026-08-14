@@ -89,7 +89,7 @@ class MainWindow(QMainWindow):
             settings.render_texture_on_import,
         )
         library = settings.library_path or "not configured"
-        self.statusBar().showMessage(f"Texture, Atlas, HDRI, model, and Stock library · Library: {library}")
+        self.statusBar().showMessage(f"Texture, Atlas, HDRI, model, VDB, and Stock library · Library: {library}")
 
     def _imports_completed(self, summary) -> None:
         if summary.imported:

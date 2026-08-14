@@ -10,7 +10,7 @@ from .catalog import AssetRecord, CatalogIndex, CatalogRecord
 from .repository import CancelToken, ImportCancelled, LibraryRepository
 
 
-ASSET_TYPES = ("texture_set", "atlas", "hdri", "model", "stock")
+ASSET_TYPES = ("texture_set", "atlas", "hdri", "model", "vdb", "stock")
 
 
 @dataclass(frozen=True, slots=True)

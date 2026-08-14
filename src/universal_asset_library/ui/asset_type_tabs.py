@@ -22,8 +22,10 @@ class AssetTypeTabs(QTabBar):
         self.setTabData(2, "hdri")
         self.addTab("Models")
         self.setTabData(3, "model")
+        self.addTab("VDBs")
+        self.setTabData(4, "vdb")
         self.addTab("Stock")
-        self.setTabData(4, "stock")
+        self.setTabData(5, "stock")
         self.currentChanged.connect(self.currentIndexChanged.emit)
 
     def currentData(self):

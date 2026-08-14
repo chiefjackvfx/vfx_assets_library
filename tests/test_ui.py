@@ -55,11 +55,13 @@ from universal_asset_library.importer import (
     scan_hdri_folder,
     scan_model_folder,
     scan_texture_folder,
+    scan_vdb_folder,
 )
 from universal_asset_library.library import (
     AssetMetadataPatch,
     AssetMetadataUpdate,
     CatalogIndex,
+    ImportProgress,
     LibraryRecoveryState,
     LibraryRepository,
     MetadataPatchBatch,
@@ -226,8 +228,9 @@ def test_importer_and_catalog_share_asset_type_tabs(app) -> None:
     assets = AssetsTab()
     assert isinstance(importer.import_mode, AssetTypeTabs)
     assert isinstance(assets.section, AssetTypeTabs)
-    assert [importer.import_mode.tabText(index) for index in range(5)] == ["Textures", "Atlases", "HDRIs", "Models", "Stock"]
-    assert [assets.section.tabText(index) for index in range(5)] == ["Textures", "Atlases", "HDRIs", "Models", "Stock"]
+    expected = ["Textures", "Atlases", "HDRIs", "Models", "VDBs", "Stock"]
+    assert [importer.import_mode.tabText(index) for index in range(6)] == expected
+    assert [assets.section.tabText(index) for index in range(6)] == expected
     importer.import_mode.setCurrentIndex(1)
     assets.section.setCurrentIndex(1)
     assert importer.title.text() == "Import Atlases"
@@ -240,9 +243,40 @@ def test_importer_and_catalog_share_asset_type_tabs(app) -> None:
     assert assets.channel.toolTip() == "Filter by HDRI resolution or format"
     importer.import_mode.setCurrentIndex(4)
     assets.section.setCurrentIndex(4)
+    assert importer.title.text() == "Import VDB Volumes"
+    assert assets.title.text() == "VDB Volumes"
+    assert assets.channel.toolTip() == "Filter by VDB variant or sequence mode"
+    importer.import_mode.setCurrentIndex(5)
+    assets.section.setCurrentIndex(5)
     assert importer.title.text() == "Import Stock Footage"
     assert assets.title.text() == "Stock Footage"
     assert assets.channel.toolTip() == "Filter by dimensions, codec, alpha, or audio"
+
+
+def test_vdb_importer_review_and_catalog_detail_defaults_to_mid(app, tmp_path) -> None:
+    source = tmp_path / "clouds"
+    source.mkdir()
+    for label in ("Low", "Mid", "High"):
+        (source / f"cloud_formation_001_{label}_Res.vdb").write_bytes(label.encode())
+    result = scan_vdb_folder(source)
+
+    importer = ImporterTab()
+    importer.import_mode.setCurrentIndex(importer.import_mode.findData("vdb"))
+    importer._scan_finished(0, result)
+    assert importer.title.text() == "Import VDB Volumes"
+    assert importer.files_heading.text() == "VDB files by variant"
+    assert importer.resolution.itemText(1) == "Mid"
+
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_vdbs(result.materials).imported[0]
+    panel = DetailPanel()
+    panel.show_asset(asset)
+    assert panel.eyebrow.text() == "VDB · STATIC"
+    assert panel.houdini_resolution.currentText() == "Mid"
+    assert panel.houdini_send_button.text() == "Create File SOP in Houdini"
+    assert panel.dcc_app.isHidden()
+    assert panel.dcc_stack.currentWidget() is panel.houdini_dcc_page
 
 
 def test_assets_category_rail_filters_primary_categories_and_live_counts(app, tmp_path) -> None:
@@ -834,6 +868,28 @@ def test_background_preflight_enables_import_and_sets_ready_state(app, tmp_path)
     assert tab._preflight_result.materials[0].status in {"Ready", "Warning"}
     assert tab.import_button.isEnabled()
     assert tab.material_list.item(0).data(Qt.ItemDataRole.UserRole + 1) in {"Ready", "Warning"}
+
+
+def test_preflight_status_describes_current_phase_file_and_progress(app) -> None:
+    tab = ImporterTab()
+
+    tab._preflight_progressed(ImportProgress(
+        "Cloud Formation 014",
+        "cloud_formation_014_High_Res.vdb",
+        5 * 1024**3,
+        18 * 1024**3,
+        "Hashing",
+        37,
+        225,
+    ))
+
+    text = tab.status.text()
+    assert "Preflight · Hashing" in text
+    assert "Cloud Formation 014" in text
+    assert "cloud_formation_014_High_Res.vdb" in text
+    assert "file 37/225" in text
+    assert "5.0 GB / 18.0 GB" in text
+    assert tab.import_progress.value() == int(5 / 18 * 1000)
 
 
 def test_settings_detects_abandoned_staging_for_confirmed_cleanup(app, tmp_path) -> None:

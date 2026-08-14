@@ -316,7 +316,7 @@ def test_worker_refreshes_selected_section_first(tmp_path) -> None:
 
     worker.run()
 
-    assert repository.discovered == ["model", "texture_set", "atlas", "hdri", "stock"]
+    assert repository.discovered == ["model", "texture_set", "atlas", "hdri", "vdb", "stock"]
     assert ready == repository.discovered
     assert list(completed[0]) == repository.discovered
 

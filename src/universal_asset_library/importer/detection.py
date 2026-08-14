@@ -16,6 +16,7 @@ def detect_asset_type(source: str | Path) -> tuple[str, str]:
     exr_files = 0
     pbr_maps = 0
     stock_files = 0
+    vdb_files = 0
     archive_packages: set[tuple[str, str]] = set()
     zip_packages: set[tuple[str, str]] = set()
     image_previews: set[tuple[str, str]] = set()
@@ -40,6 +41,8 @@ def detect_asset_type(source: str | Path) -> tuple[str, str]:
                 image_previews.add(package_key)
             if suffix in MODEL_FORMATS:
                 model_files += 1
+            elif suffix == ".vdb":
+                vdb_files += 1
             elif suffix in {".mov", ".mp4"}:
                 stock_files += 1
             elif suffix == ".hdr":
@@ -111,6 +114,8 @@ def detect_asset_type(source: str | Path) -> tuple[str, str]:
         return "texture_set", f"found {len(zip_packages)} ZIP package(s) to inspect"
     if model_files:
         return "model", f"found {model_files} supported 3D model file(s)"
+    if vdb_files:
+        return "vdb", f"found {vdb_files} OpenVDB file(s)"
     if stock_files:
         return "stock", f"found {stock_files} MOV/MP4 video file(s)"
     if hdr_files:

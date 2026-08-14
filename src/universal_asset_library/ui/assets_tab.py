@@ -55,10 +55,12 @@ from universal_asset_library.domain import (
     LibraryModelAsset,
     LibraryStockAsset,
     LibraryTextureAsset,
+    LibraryVdbAsset,
     MODEL_CATEGORIES,
     PBR_CHANNELS,
     STOCK_CATEGORIES,
     TEXTURE_CATEGORIES,
+    VDB_CATEGORIES,
 )
 from universal_asset_library.library import (
     AssetMetadataPatch,
@@ -365,7 +367,7 @@ class TagEditor(QFrame):
         self.chip_scroll.setFixedHeight(min(118, desired + 2))
 
 
-AssetRecord = LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset
+AssetRecord = LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset | LibraryVdbAsset
 
 
 def _classification_preview(asset: AssetRecord | None) -> Path | None:
@@ -420,6 +422,7 @@ class MaterialEditDialog(QDialog):
         self.category.setEditable(False)
         self.category.addItems(category_suggestions or (
                 MODEL_CATEGORIES if isinstance(asset, LibraryModelAsset)
+                else VDB_CATEGORIES if isinstance(asset, LibraryVdbAsset)
                 else STOCK_CATEGORIES if isinstance(asset, LibraryStockAsset)
                 else HDRI_CATEGORIES if isinstance(asset, LibraryHdriAsset)
                 else ATLAS_CATEGORIES if asset.asset_type == "atlas"
@@ -1031,7 +1034,12 @@ class TextureCardDelegate(QStyledItemDelegate):
             painter.fillRect(preview, gradient)
         painter.restore()
 
-        badge_text = ("USD" if asset.usd_ready else (asset.preferred_model.file_format if asset.preferred_model else "MODEL")) if isinstance(asset, LibraryModelAsset) else asset.resolution or "—"
+        badge_text = (
+            ("USD" if asset.usd_ready else (asset.preferred_model.file_format if asset.preferred_model else "MODEL"))
+            if isinstance(asset, LibraryModelAsset) else
+            f"{len(asset.variants)} VAR" if isinstance(asset, LibraryVdbAsset) else
+            asset.resolution or "—"
+        )
         badge_width = max(34, min(74, 12 + len(badge_text) * 6))
         badge = QRectF(preview.right() - badge_width - 8, preview.top() + 8, badge_width, 20)
         painter.setPen(Qt.PenStyle.NoPen)
@@ -1059,6 +1067,8 @@ class TextureCardDelegate(QStyledItemDelegate):
         meta = (
             f"{asset.category}  ·  {'USD Ready' if asset.usd_ready else asset.file_format}"
             if isinstance(asset, LibraryModelAsset) else
+            f"{asset.category}  ·  {'Sequence' if asset.is_sequence else 'Static'} · {asset.resolution}"
+            if isinstance(asset, LibraryVdbAsset) else
             f"{asset.category}  ·  {asset.duration_label} · {'Alpha' if asset.media_info.alpha == 'yes' else asset.resolution}"
             if isinstance(asset, LibraryStockAsset) else
             f"{asset.category}  ·  {asset.resolution or asset.file_format}"
@@ -1302,8 +1312,9 @@ class StockHoverPreviewController(QObject):
         if (
             not self.enabled
             or self.suspended
-            or not isinstance(asset, LibraryStockAsset)
+            or not isinstance(asset, (LibraryStockAsset, LibraryVdbAsset))
             or asset.id in self._failed_asset_ids
+            or asset.preview_path is None
             or not asset.preview_path.is_file()
         ):
             self.stop()
@@ -1343,8 +1354,9 @@ class StockHoverPreviewController(QObject):
             return
         asset = self._pending_index.data(ASSET_ROLE)
         if (
-            not isinstance(asset, LibraryStockAsset)
+            not isinstance(asset, (LibraryStockAsset, LibraryVdbAsset))
             or asset.id in self._failed_asset_ids
+            or asset.preview_path is None
             or not asset.preview_path.is_file()
         ):
             self.stop()
@@ -1961,12 +1973,22 @@ class DetailPanel(QFrame):
         self.maps_title.show()
         self.channels.show()
         is_stock = isinstance(asset, LibraryStockAsset)
-        self.stock_player_frame.setVisible(is_stock)
-        self.hero.setVisible(not is_stock)
-        if is_stock:
+        has_video_preview = (
+            is_stock
+            or isinstance(asset, LibraryVdbAsset)
+            and asset.preview_path is not None
+            and asset.preview_path.is_file()
+        )
+        self.stock_player_frame.setVisible(has_video_preview)
+        self.hero.setVisible(not has_video_preview)
+        if has_video_preview:
             self.stock_player.setSource(QUrl.fromLocalFile(str(asset.preview_path)))
+        if is_stock:
             self.stock_seek.setRange(0, max(0, int(asset.media_info.duration * 1000)))
             self.stock_time.setText(f"0:00 / {_media_time(int(asset.media_info.duration * 1000))}")
+        elif has_video_preview:
+            self.stock_seek.setRange(0, 0)
+            self.stock_time.setText("0:00 / 0:00")
         preview = asset.hero_path or asset.thumbnail_path
         pixmap = QPixmap(str(preview)) if preview else QPixmap()
         if pixmap.isNull():
@@ -2140,6 +2162,36 @@ class DetailPanel(QFrame):
             self.dcc_stack.show()
             self._dcc_app_changed(self.dcc_app.currentIndex())
             self.export_footer.show()
+        elif isinstance(asset, LibraryVdbAsset):
+            self.eyebrow.setText("VDB · SEQUENCE" if asset.is_sequence else "VDB · STATIC")
+            self.maps_title.setText("Volume variants")
+            lines = []
+            total_files = 0
+            for label, variant in asset.variants.items():
+                total_files += len(variant.files)
+                if variant.is_sequence:
+                    detail = (
+                        f"frames {variant.frame_start}–{variant.frame_end} · "
+                        f"{len(variant.files)} files"
+                    )
+                    if variant.missing_frames:
+                        detail += f" · {len(variant.missing_frames)} missing"
+                else:
+                    detail = "static volume"
+                lines.append(
+                    f"<span style='color:#8ac4f4'>●</span>&nbsp;&nbsp;"
+                    f"{html.escape(label)} · {html.escape(detail)}"
+                )
+            self.files_section.set_title(f"VDB Files · {total_files}")
+            self.channels.setText("<br>".join(lines))
+            self.edit_button.setText("Edit VDB…")
+            self.technical_details.setText(
+                f"<span style='color:#8792a1'>Asset ID</span><br>{html.escape(asset.id)}<br><br>"
+                f"<span style='color:#8792a1'>Managed path</span><br>{html.escape(str(asset.asset_dir))}<br><br>"
+                f"<span style='color:#8792a1'>Playback</span><br>"
+                f"{'Source frame numbers are preserved' if asset.is_sequence else 'Static volume variants'}"
+            )
+            self._configure_vdb_dcc(asset)
         elif isinstance(asset, LibraryStockAsset):
             info = asset.media_info
             self.eyebrow.setText("STOCK · ALPHA" if info.alpha == "yes" else "STOCK")
@@ -2470,7 +2522,7 @@ class DetailPanel(QFrame):
         self.houdini_status.setStyleSheet(f"color: {'#78c995' if success else '#ef7d7d'};")
 
     def _update_houdini_controls(self) -> None:
-        supported = isinstance(self._asset, (LibraryHdriAsset, LibraryTextureAsset, LibraryModelAsset))
+        supported = isinstance(self._asset, (LibraryHdriAsset, LibraryTextureAsset, LibraryModelAsset, LibraryVdbAsset))
         multiple = supported and len(self._houdini_sessions) > 1
         self.houdini_session_label.setVisible(multiple)
         self.houdini_session.setVisible(multiple)
@@ -2483,6 +2535,9 @@ class DetailPanel(QFrame):
         if isinstance(self._asset, LibraryModelAsset) and isinstance(session, HoudiniSession) and "usd_model" not in session.capabilities:
             self.houdini_status.setText("Update the Houdini plug-in in Settings and restart Houdini.")
             self.houdini_status.setStyleSheet("color: #e6b566;")
+        if isinstance(self._asset, LibraryVdbAsset) and isinstance(session, HoudiniSession) and "vdb_file" not in session.capabilities:
+            self.houdini_status.setText("Update the Houdini plug-in in Settings and restart Houdini.")
+            self.houdini_status.setStyleSheet("color: #e6b566;")
         elif isinstance(self._asset, LibraryModelAsset) and not self._asset.usd_ready:
             self.houdini_status.setText("This model has no managed USD file. Download or import USD first.")
             self.houdini_status.setStyleSheet("color: #e6b566;")
@@ -2493,7 +2548,7 @@ class DetailPanel(QFrame):
 
     def _send_to_houdini(self) -> None:
         session = self.houdini_session.currentData()
-        if isinstance(self._asset, (LibraryHdriAsset, LibraryTextureAsset, LibraryModelAsset)) and isinstance(session, HoudiniSession):
+        if isinstance(self._asset, (LibraryHdriAsset, LibraryTextureAsset, LibraryModelAsset, LibraryVdbAsset)) and isinstance(session, HoudiniSession):
             self.houdini_send_requested.emit(
                 self._asset,
                 str(self.houdini_resolution.currentData() or self.houdini_resolution.currentText()),
@@ -2503,12 +2558,13 @@ class DetailPanel(QFrame):
 
     def _houdini_can_send(self) -> bool:
         session = self.houdini_session.currentData()
-        if not isinstance(self._asset, (LibraryHdriAsset, LibraryTextureAsset, LibraryModelAsset)) or not isinstance(session, HoudiniSession):
+        if not isinstance(self._asset, (LibraryHdriAsset, LibraryTextureAsset, LibraryModelAsset, LibraryVdbAsset)) or not isinstance(session, HoudiniSession):
             return False
         return self.houdini_resolution.count() > 0 and (
             isinstance(self._asset, LibraryHdriAsset)
             or isinstance(self._asset, LibraryTextureAsset) and "texture_material" in session.capabilities
             or isinstance(self._asset, LibraryModelAsset) and "usd_model" in session.capabilities
+            or isinstance(self._asset, LibraryVdbAsset) and "vdb_file" in session.capabilities
         )
 
     def set_blender_sessions(self, sessions: list[BlenderSession], preferred_id: str = "") -> None:
@@ -2624,6 +2680,25 @@ class DetailPanel(QFrame):
         self._dcc_app_changed(self.dcc_app.currentIndex())
         self.export_footer.show()
 
+    def _configure_vdb_dcc(self, asset: LibraryVdbAsset) -> None:
+        labels = list(asset.variants)
+        order = {"low": 0, "mid": 1, "high": 2}
+        labels.sort(key=lambda label: (order.get(label.casefold(), 99), label.casefold()))
+        self.houdini_resolution.clear()
+        self.houdini_resolution.addItems(labels)
+        default = next((label for label in labels if label.casefold() == "mid"), "")
+        if not default:
+            default = next((label for label in labels if label.casefold() == "low"), labels[0] if labels else "")
+        self.houdini_resolution.setCurrentText(default)
+        self.houdini_target.hide()
+        self.houdini_send_button.setText("Create File SOP in Houdini")
+        self._update_houdini_controls()
+        self.dcc_title.show()
+        self.dcc_app.hide()
+        self.dcc_stack.setCurrentWidget(self.houdini_dcc_page)
+        self.dcc_stack.show()
+        self.export_footer.show()
+
     def set_hdri_rendering(self, active: bool, message: str = "") -> None:
         if not (
             isinstance(self._asset, LibraryHdriAsset)
@@ -2682,7 +2757,7 @@ class DetailPanel(QFrame):
             self.edit_requested.emit(self._asset)
 
     def _toggle_stock_playback(self) -> None:
-        if not isinstance(self._asset, LibraryStockAsset):
+        if not isinstance(self._asset, (LibraryStockAsset, LibraryVdbAsset)):
             return
         if self.stock_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.stock_player.pause()
@@ -2714,7 +2789,7 @@ class DetailPanel(QFrame):
             self.stock_audio.setVolume(max(0.0, min(1.0, value / 100.0)))
 
     def _open_stock_preview(self) -> None:
-        if isinstance(self._asset, LibraryStockAsset):
+        if isinstance(self._asset, (LibraryStockAsset, LibraryVdbAsset)) and self._asset.preview_path:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._asset.preview_path)))
 
     def _copy_path(self) -> None:
@@ -2967,7 +3042,7 @@ class HoudiniWorker(QRunnable):
         operation: str,
         *,
         session: HoudiniSession | None = None,
-        asset: LibraryHdriAsset | LibraryTextureAsset | LibraryModelAsset | None = None,
+        asset: LibraryHdriAsset | LibraryTextureAsset | LibraryModelAsset | LibraryVdbAsset | None = None,
         resolution: str = "",
         target: str = "lop",
         library_path: str = "",
@@ -2995,6 +3070,11 @@ class HoudiniWorker(QRunnable):
                 elif isinstance(self.asset, LibraryModelAsset):
                     payload = prepare_model_export(self.asset, self.resolution, self.library_path)
                     result = client.import_usd_model(self.session, payload, target=self.target)
+                elif isinstance(self.asset, LibraryVdbAsset):
+                    result = client.import_vdb(
+                        self.session, self.asset, self.resolution,
+                        library_root=Path(self.library_path),
+                    )
                 else:
                     label, hdri_file = choose_hdri_file(self.asset, self.resolution)
                     managed_path = self.asset.asset_dir / hdri_file.path
@@ -3321,7 +3401,7 @@ class AssetsTab(QWidget):
         )
         self._category_catalogs = {
             asset_type: default_category_catalog(asset_type)
-            for asset_type in ("texture_set", "atlas", "hdri", "model", "stock")
+            for asset_type in ("texture_set", "atlas", "hdri", "model", "vdb", "stock")
         }
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 14, 16, 14)
@@ -3669,7 +3749,7 @@ class AssetsTab(QWidget):
                 self._catalog_index = CatalogIndex.for_library(path)
                 sections = self._catalog_index.sections()
                 self._all_assets = [
-                    asset for asset_type in ("texture_set", "atlas", "hdri", "model", "stock")
+                    asset for asset_type in ("texture_set", "atlas", "hdri", "model", "vdb", "stock")
                     for asset in sections.get(asset_type, ())
                 ]
                 self._reindex_all_assets()
@@ -4727,6 +4807,18 @@ class AssetsTab(QWidget):
             }
             self.channel.addItems(["All", *sorted(values, key=str.casefold)])
             self.channel.setToolTip("Filter by HDRI resolution or format")
+        elif self._section_type() == "vdb":
+            values = {
+                value
+                for asset in self.source_model.assets
+                if isinstance(asset, LibraryVdbAsset)
+                for value in (
+                    *asset.variants.keys(),
+                    *("Sequence" if item.is_sequence else "Static" for item in asset.variants.values()),
+                )
+            }
+            self.channel.addItems(["All", *sorted(values, key=str.casefold)])
+            self.channel.setToolTip("Filter by VDB variant or sequence mode")
         elif self._section_type() == "stock":
             values = {
                 value
@@ -4914,6 +5006,7 @@ class AssetsTab(QWidget):
                 "models" if self._section_type() == "model"
                 else "HDRIs" if self._section_type() == "hdri"
                 else "atlases" if self._section_type() == "atlas"
+                else "VDB volumes" if self._section_type() == "vdb"
                 else "Stock clips" if self._section_type() == "stock"
                 else "texture sets"
             )
@@ -4957,7 +5050,7 @@ class AssetsTab(QWidget):
             return
         worker = HoudiniWorker("discover")
         self._houdini_worker = worker
-        if isinstance(self.detail._asset, (LibraryHdriAsset, LibraryTextureAsset, LibraryModelAsset)):
+        if isinstance(self.detail._asset, (LibraryHdriAsset, LibraryTextureAsset, LibraryModelAsset, LibraryVdbAsset)):
             self.detail.set_houdini_busy(True, "Looking for running Houdini sessions…")
         worker.signals.finished.connect(self._houdini_finished)
         worker.signals.failed.connect(self._houdini_failed)
@@ -4965,7 +5058,7 @@ class AssetsTab(QWidget):
 
     def _send_hdri_to_houdini(
         self,
-        asset: LibraryHdriAsset | LibraryTextureAsset | LibraryModelAsset,
+        asset: LibraryHdriAsset | LibraryTextureAsset | LibraryModelAsset | LibraryVdbAsset,
         resolution: str,
         target: str,
         session: HoudiniSession,
@@ -4982,8 +5075,12 @@ class AssetsTab(QWidget):
             library_path=self._library_path,
         )
         self._houdini_worker = worker
-        noun = "material" if isinstance(asset, LibraryTextureAsset) else "model" if isinstance(asset, LibraryModelAsset) else "HDRI"
-        verb = "Importing" if isinstance(asset, LibraryModelAsset) else "Sending"
+        noun = (
+            "material" if isinstance(asset, LibraryTextureAsset) else
+            "model" if isinstance(asset, LibraryModelAsset) else
+            "VDB" if isinstance(asset, LibraryVdbAsset) else "HDRI"
+        )
+        verb = "Importing" if isinstance(asset, (LibraryModelAsset, LibraryVdbAsset)) else "Sending"
         self.detail.set_houdini_busy(True, f"{verb} {asset.name} {noun} in Houdini…")
         worker.signals.finished.connect(self._houdini_finished)
         worker.signals.failed.connect(self._houdini_failed)
@@ -5591,23 +5688,26 @@ class AssetsTab(QWidget):
         self._rebuild_bulk_categories()
         is_hdri = mode == "hdri"
         is_model = mode == "model"
+        is_vdb = mode == "vdb"
         is_atlas = mode == "atlas"
         is_stock = mode == "stock"
         self.title.setText(
             "3D Models" if is_model else "HDRIs" if is_hdri else
-            "Atlases" if is_atlas else "Stock Footage" if is_stock else "PBR Textures"
+            "Atlases" if is_atlas else "VDB Volumes" if is_vdb else
+            "Stock Footage" if is_stock else "PBR Textures"
         )
         self.search.setPlaceholderText(
             "Search models, formats, LODs, providers, or USD status…" if is_model else
             "Search HDRIs, tags, providers, or formats…" if is_hdri else
             "Search atlases, tags, providers, or maps…" if is_atlas else
+            "Search VDB volumes, variants, categories, or tags…" if is_vdb else
             "Search Stock clips, categories, codecs, or tags…" if is_stock else
             "Search textures, tags, providers, or maps…"
         )
         self.category.setCurrentText("All")
         self.category_rail.set_current("All", emit=False)
         self._display_section()
-        if is_hdri:
+        if is_hdri or is_vdb:
             self.refresh_houdini_sessions()
 
     def show_section(self, asset_type: str) -> None:
@@ -5619,6 +5719,8 @@ class AssetsTab(QWidget):
 def _largest_resolution(asset: AssetRecord) -> int:
     if isinstance(asset, LibraryStockAsset):
         return asset.media_info.width * asset.media_info.height
+    if isinstance(asset, LibraryVdbAsset):
+        return sum(len(variant.files) for variant in asset.variants.values())
     values = []
     for label in asset.resolutions:
         digits = "".join(char for char in label if char.isdigit())

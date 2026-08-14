@@ -453,3 +453,90 @@ def _lod_key(label: str) -> tuple[int, str]:
 def _resolution_key(label: str) -> tuple[int, str]:
     digits = "".join(value for value in label if value.isdigit())
     return int(digits) if digits else 999, label
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryVdbFile:
+    path: str
+    original_path: str
+    size: int
+    sha256: str
+    frame: int | None = None
+    padding: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryVdbVariant:
+    label: str
+    files: tuple[LibraryVdbFile, ...]
+    is_sequence: bool = False
+    frame_start: int | None = None
+    frame_end: int | None = None
+    padding: int = 0
+    missing_frames: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryVdbAsset:
+    id: str
+    name: str
+    category: str
+    tags: tuple[str, ...]
+    description: str
+    author: str
+    provider: str
+    provider_id: str
+    asset_dir: Path
+    variants: dict[str, LibraryVdbVariant]
+    thumbnail_path: Path | None
+    hero_path: Path | None
+    preview_path: Path | None
+    fingerprint: str
+    created_at: str
+    total_size: int
+    extra_files: tuple[LibraryExtraFile, ...] = ()
+    source_metadata: tuple[str, ...] = ()
+    palette: tuple[str, str] = ("#70869b", "#263340")
+    asset_type: str = "vdb"
+    physical_size: str = ""
+    rating: int = 0
+
+    @property
+    def extras(self) -> tuple[LibraryExtraFile, ...]:
+        return self.extra_files
+
+    @property
+    def resolution(self) -> str:
+        order = {"low": 0, "mid": 1, "high": 2}
+        return ", ".join(sorted(self.variants, key=lambda label: (order.get(label.casefold(), 99), label.casefold())))
+
+    @property
+    def channels(self) -> tuple[str, ...]:
+        return ()
+
+    @property
+    def file_format(self) -> str:
+        return "VDB"
+
+    @property
+    def is_sequence(self) -> bool:
+        return any(variant.is_sequence for variant in self.variants.values())
+
+    @property
+    def size_label(self) -> str:
+        value = float(self.total_size)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if value < 1024 or unit == "TB":
+                return f"{value:.0f} {unit}" if unit in {"B", "KB"} else f"{value:.1f} {unit}"
+            value /= 1024
+        return ""
+
+    def matches(self, query: str = "", category: str = "All", facet: str = "All") -> bool:
+        modes = {"Sequence" if item.is_sequence else "Static" for item in self.variants.values()}
+        values = {*self.variants, *modes, "VDB"}
+        haystack = " ".join((self.name, self.category, self.provider, *self.tags, *values)).casefold()
+        return (
+            (not query.strip() or query.strip().casefold() in haystack)
+            and (category == "All" or category == self.category)
+            and (facet == "All" or facet in values)
+        )

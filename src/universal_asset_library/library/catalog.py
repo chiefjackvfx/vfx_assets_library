@@ -25,11 +25,14 @@ from universal_asset_library.domain import (
     LibraryStockMediaInfo,
     LibraryTextureAsset,
     LibraryUsdDerivative,
+    LibraryVdbAsset,
+    LibraryVdbFile,
+    LibraryVdbVariant,
 )
 
 
 CATALOG_SCHEMA_VERSION = 3
-AssetRecord = LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset
+AssetRecord = LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset | LibraryVdbAsset
 
 _DATACLASSES = {
     value.__name__: value
@@ -49,6 +52,9 @@ _DATACLASSES = {
         LibraryStockMediaInfo,
         LibraryTextureAsset,
         LibraryUsdDerivative,
+        LibraryVdbAsset,
+        LibraryVdbFile,
+        LibraryVdbVariant,
     )
 }
 
@@ -83,7 +89,7 @@ def decode_asset(payload: str) -> AssetRecord:
         value = _decode_value(json.loads(payload))
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
         raise CatalogError(f"Invalid catalog asset payload: {error}") from error
-    if not isinstance(value, (LibraryTextureAsset, LibraryHdriAsset, LibraryModelAsset, LibraryStockAsset)):
+    if not isinstance(value, (LibraryTextureAsset, LibraryHdriAsset, LibraryModelAsset, LibraryStockAsset, LibraryVdbAsset)):
         raise CatalogError("Catalog payload does not contain an asset")
     return value
 
@@ -177,7 +183,7 @@ class CatalogIndex:
         return cls(parent / "catalogs" / f"{digest}.sqlite3", key)
 
     def sections(self) -> dict[str, list[AssetRecord]]:
-        result = {name: [] for name in ("texture_set", "atlas", "hdri", "model", "stock")}
+        result = {name: [] for name in ("texture_set", "atlas", "hdri", "model", "vdb", "stock")}
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT asset_type, payload FROM assets ORDER BY name COLLATE NOCASE, asset_id"
@@ -391,7 +397,7 @@ class CatalogWriter:
 
 
 def _validate_asset_type(asset_type: str) -> None:
-    if asset_type not in {"texture_set", "atlas", "hdri", "model", "stock"}:
+    if asset_type not in {"texture_set", "atlas", "hdri", "model", "vdb", "stock"}:
         raise ValueError(f"Unsupported asset type: {asset_type}")
 
 

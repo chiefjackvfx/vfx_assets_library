@@ -24,6 +24,10 @@ class FakeParm:
     def set(self, value):
         self.value = value
 
+    @staticmethod
+    def menuItems():
+        return ("error", "nogeometry")
+
 
 class FakeCategory:
     def __init__(self, name):
@@ -83,6 +87,8 @@ class FakeNode:
             }
         elif node_type.startswith("usdimport"):
             self.parms = {"filepath": FakeParm(), "unpack": FakeParm()}
+        elif node_type == "file":
+            self.parms = {"file": FakeParm(), "missingframe": FakeParm()}
         elif node_type == "material":
             self.parms = {
                 name: FakeParm()
@@ -124,7 +130,7 @@ class FakeNode:
             number += 1
         if node_type.startswith(("domelight", "reference")):
             category = "Lop"
-        elif node_type.startswith("usdimport") or node_type == "material":
+        elif node_type.startswith("usdimport") or node_type in {"material", "file"}:
             category = "Sop"
         elif node_type == "geo":
             category = "Object"
@@ -272,6 +278,57 @@ def test_rejects_paths_outside_library_and_wrong_formats(tmp_path) -> None:
     wrong.write_bytes(b"jpg")
     with pytest.raises(actions.ActionError, match="Only managed HDR"):
         actions.create_hdri_dome(FakeHou(), _payload(library, wrong), "session")
+
+
+def test_vdb_creates_new_file_sop_with_sequence_and_selected_network(tmp_path) -> None:
+    library = tmp_path / "library"
+    source = library / "vdbs" / "smoke" / "volumes" / "high" / "smoke_high_1001.vdb"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"vdb")
+    hou = FakeHou()
+    obj = hou.node("/").createNode("objnet", "obj")
+    geo = obj.createNode("geo", "selected_geo")
+    upstream = geo.createNode("file", "upstream")
+    hou.selected = [upstream]
+    payload = {
+        "asset_id": "smoke-one",
+        "asset_name": "Hero Smoke",
+        "variant": "High",
+        "vdb_path": str(source).replace("1001", "$F4"),
+        "library_root": str(library),
+        "is_sequence": True,
+        "frame_start": 1001,
+        "frame_end": 1003,
+        "padding": 4,
+        "missing_frames": [1002],
+    }
+
+    first = actions.import_vdb(hou, payload, "session")
+    second = actions.import_vdb(hou, payload, "session")
+
+    first_node = hou.node(first["node_path"])
+    second_node = hou.node(second["node_path"])
+    assert first_node.parent() is geo
+    assert second_node.parent() is geo
+    assert first_node is not second_node
+    assert first_node.parm("file").value.endswith("smoke_high_$F4.vdb")
+    assert first_node.parm("missingframe").value == "nogeometry"
+    assert first_node.userData("shotbox_role") == "vdb_file_sop"
+
+
+def test_vdb_falls_back_to_new_geometry_object(tmp_path) -> None:
+    library = tmp_path / "library"
+    source = library / "cloud.vdb"
+    library.mkdir()
+    source.write_bytes(b"vdb")
+    hou = FakeHou()
+    response = actions.import_vdb(hou, {
+        "asset_id": "cloud-one", "asset_name": "Cloud One", "variant": "Mid",
+        "vdb_path": str(source), "library_root": str(library), "is_sequence": False,
+    }, "session")
+    node = hou.node(response["node_path"])
+    assert node.parent().path().startswith("/obj/shotbox_cloud_one")
+    assert node.parm("file").value == source.as_posix()
 
 
 def test_creates_unassigned_solaris_materialx_and_updates_owned_library(tmp_path) -> None:

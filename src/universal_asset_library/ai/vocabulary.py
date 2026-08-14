@@ -10,6 +10,7 @@ TAG_FILENAMES = {
     "atlas": "allowed_tags_texture.json",
     "hdri": "allowed_tags.json",
     "model": "allowed_tags_model.json",
+    "vdb": "allowed_tags_vdb.json",
     "stock": "allowed_tags_stock.json",
 }
 

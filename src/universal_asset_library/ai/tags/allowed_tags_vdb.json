@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "asset_type": "vdb",
+  "tags": [
+    "cloud", "smoke", "fire", "explosion", "fog", "dust", "water",
+    "magic", "pyro", "atmosphere", "mist", "steam", "plume", "wispy",
+    "billowing", "dense", "thin", "turbulent", "soft", "layered",
+    "cumulus", "storm", "ground-fog", "rising", "falling", "burst",
+    "static", "sequence", "large-scale", "small-scale", "realistic",
+    "stylized", "isolated", "environment", "effect"
+  ]
+}

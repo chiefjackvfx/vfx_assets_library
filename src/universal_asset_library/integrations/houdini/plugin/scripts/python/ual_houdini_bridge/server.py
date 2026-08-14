@@ -15,7 +15,7 @@ from .actions import ActionError, execute
 from .protocol import PROTOCOL_VERSION, encode_message, receive_message
 
 
-BRIDGE_VERSION = "0.5.0"
+BRIDGE_VERSION = "0.6.0"
 REQUEST_TIMEOUT = 300.0
 _INSTANCE = None
 
@@ -134,7 +134,7 @@ class BridgeServer:
             raise ValueError("Unsupported ShotBox Assets Houdini Bridge protocol version.")
         if request.get("token") != self.token:
             raise PermissionError("ShotBox Assets Houdini Bridge authentication failed.")
-        if request.get("action") not in {"ping", "create_hdri_dome", "create_texture_material", "import_usd_model"}:
+        if request.get("action") not in {"ping", "create_hdri_dome", "create_texture_material", "import_usd_model", "import_vdb"}:
             raise ActionError("Unsupported bridge action.")
         if not str(request.get("request_id", "")):
             raise ValueError("Bridge request has no request ID.")
@@ -166,7 +166,7 @@ class BridgeServer:
             "houdini_version": version,
             "hip_file": hip_file,
             "started_at": self.started_at,
-            "capabilities": ["hdri", "texture_material", "usd_model"],
+            "capabilities": ["hdri", "texture_material", "usd_model", "vdb_file"],
         }
         temporary = self.descriptor.with_suffix(".tmp")
         temporary.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")

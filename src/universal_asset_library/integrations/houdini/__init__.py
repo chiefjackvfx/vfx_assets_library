@@ -6,6 +6,7 @@ from .bridge import (
     HoudiniBridgeError,
     HoudiniSession,
     choose_hdri_file,
+    choose_vdb_variant,
 )
 from .installer import HoudiniInstallation, HoudiniPluginInstaller, PluginStatus
 
@@ -20,4 +21,5 @@ __all__ = [
     "HoudiniSession",
     "PluginStatus",
     "choose_hdri_file",
+    "choose_vdb_variant",
 ]

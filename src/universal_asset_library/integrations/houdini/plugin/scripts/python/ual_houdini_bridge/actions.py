@@ -31,6 +31,8 @@ def execute(hou, action, payload, session_id):
         return create_texture_material(hou, payload, session_id)
     if action == "import_usd_model":
         return import_usd_model(hou, payload, session_id)
+    if action == "import_vdb":
+        return import_vdb(hou, payload, session_id)
     raise ActionError(f"Unsupported bridge action: {action}")
 
 
@@ -85,6 +87,61 @@ def create_hdri_dome(hou, payload, session_id):
         "prim_path": prim_path,
         "diagnostic": f"{asset_name} was assigned to {node.path()}.",
         "data": _session_data(hou),
+    }
+
+
+def import_vdb(hou, payload, session_id):
+    path_expression, _library_root = _validated_vdb_path(payload)
+    asset_id = _required_text(payload, "asset_id")
+    asset_name = _required_text(payload, "asset_name")
+    variant = _required_text(payload, "variant")
+    is_sequence = bool(payload.get("is_sequence", False))
+    network, created_container = _selected_sop_network(hou, asset_name)
+    node = None
+    with hou.undos.group("Import VDB from ShotBox Assets"):
+        try:
+            node = _create_first_node(network, ("file",), f"shotbox_{_slug(asset_name)}_{_slug(variant)}")
+            _set_first_parm(node, ("file", "file1"), path_expression)
+            if is_sequence:
+                _set_missing_frame_no_geometry(node)
+            node.setUserData(OWNER_KEY, OWNER_VALUE)
+            node.setUserData("shotbox_asset_id", asset_id)
+            node.setUserData("shotbox_asset_name", asset_name)
+            node.setUserData("shotbox_variant", variant)
+            node.setUserData("shotbox_role", "vdb_file_sop")
+            try:
+                node.setDisplayFlag(True)
+                node.setRenderFlag(True)
+                node.moveToGoodPosition()
+                node.setSelected(True, clear_all_selected=True)
+                node.setCurrent(True, clear_all_selected=True)
+            except Exception:
+                pass
+        except Exception:
+            if created_container is not None:
+                _destroy(created_container)
+            elif node is not None:
+                _destroy(node)
+            raise
+    grids = []
+    try:
+        geometry = node.geometry()
+        for primitive in geometry.prims():
+            name = str(primitive.stringAttribValue("name") or "").strip()
+            if name and name not in grids:
+                grids.append(name)
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "node_path": node.path(),
+        "network_path": network.path(),
+        "diagnostic": (
+            f"Created {node.path()} for {asset_name} ({variant})."
+            + (f" Grids: {', '.join(grids)}." if grids else "")
+        ),
+        "data": {**_session_data(hou), "grids": grids},
     }
 
 
@@ -713,6 +770,47 @@ def _validated_paths(payload):
     return resolved_source, resolved_library
 
 
+def _validated_vdb_path(payload):
+    expression = _required_text(payload, "vdb_path")
+    library = Path(_required_text(payload, "library_root")).expanduser()
+    try:
+        resolved_library = library.resolve(strict=True)
+    except OSError as error:
+        raise ActionError(f"The managed VDB library is unavailable: {error}") from error
+    if not resolved_library.is_dir():
+        raise ActionError("The supplied library root is not a directory.")
+    sample = expression
+    if bool(payload.get("is_sequence", False)):
+        try:
+            frame = int(payload["frame_start"])
+            padding = max(1, int(payload.get("padding", 1)))
+        except (KeyError, TypeError, ValueError) as error:
+            raise ActionError("The VDB sequence has invalid frame metadata.") from error
+        sample = sample.replace(f"$F{padding}", f"{frame:0{padding}d}")
+    try:
+        resolved_sample = Path(sample).expanduser().resolve(strict=True)
+        resolved_sample.relative_to(resolved_library)
+    except (OSError, ValueError) as error:
+        raise ActionError("The VDB path is unavailable or outside the managed library root.") from error
+    if resolved_sample.suffix.casefold() != ".vdb" or not resolved_sample.is_file():
+        raise ActionError("Only managed .vdb files can be sent to Houdini.")
+    return expression, resolved_library
+
+
+def _set_missing_frame_no_geometry(node):
+    for name in ("missingframe", "missingfile"):
+        parm = node.parm(name)
+        if parm is None:
+            continue
+        try:
+            tokens = tuple(parm.menuItems())
+            token = next((value for value in tokens if "nogeo" in value.casefold()), None)
+            parm.set(token if token is not None else 1)
+        except Exception:
+            parm.set(1)
+        return
+
+
 def _required_text(payload, key):
     value = str(payload.get(key, "")).strip()
     if not value:
@@ -771,6 +869,6 @@ def _session_data(hou):
     return {
         "houdini_version": version,
         "hip_file": hip_file,
-        "bridge_version": "0.5.0",
-        "capabilities": ["hdri", "texture_material", "usd_model"],
+        "bridge_version": "0.6.0",
+        "capabilities": ["hdri", "texture_material", "usd_model", "vdb_file"],
     }

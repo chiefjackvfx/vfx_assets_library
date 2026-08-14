@@ -127,6 +127,19 @@ STOCK_CATEGORIES = (
     "Uncategorized",
 )
 
+VDB_CATEGORIES = (
+    "Clouds",
+    "Smoke",
+    "Fire",
+    "Explosions",
+    "Fog",
+    "Dust",
+    "Water",
+    "Magic",
+    "Miscellaneous",
+    "Uncategorized",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class TextureAsset:

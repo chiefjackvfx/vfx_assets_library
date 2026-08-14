@@ -8,7 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from universal_asset_library.domain import LibraryHdriAsset, LibraryHdriFile, LibraryHdriVariant
+from universal_asset_library.domain import (
+    LibraryHdriAsset,
+    LibraryHdriFile,
+    LibraryHdriVariant,
+    LibraryVdbAsset,
+    LibraryVdbFile,
+    LibraryVdbVariant,
+)
 from universal_asset_library.integrations.houdini import (
     BridgeRequest,
     HoudiniBridgeClient,
@@ -16,6 +23,7 @@ from universal_asset_library.integrations.houdini import (
     HoudiniInstallation,
     HoudiniPluginInstaller,
     choose_hdri_file,
+    choose_vdb_variant,
 )
 from universal_asset_library.integrations.houdini.bridge import MAX_MESSAGE_BYTES, encode_message, receive_message
 from universal_asset_library.integrations import ModelExportFile, ModelExportPayload
@@ -48,6 +56,39 @@ def test_hdri_default_and_format_precedence(tmp_path) -> None:
     assert selected.path == "maps/sky_4k.exr"
     label, selected = choose_hdri_file(asset, "8K")
     assert (label, selected.path) == ("8K", "maps/sky_8k.exr")
+
+
+def test_vdb_default_and_sequence_expression_preserve_padding(tmp_path) -> None:
+    asset_dir = tmp_path / "vdbs" / "clouds" / "cloud-one"
+    paths = []
+    for frame in (1001, 1003):
+        path = asset_dir / "volumes" / "Mid" / f"cloud_mid_{frame:04d}.vdb"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"vdb")
+        paths.append(path)
+    asset = LibraryVdbAsset(
+        "vdb-id", "Cloud One", "Clouds", (), "", "", "", "", asset_dir,
+        {
+            "Low": LibraryVdbVariant("Low", (LibraryVdbFile("low.vdb", "low.vdb", 3, "a"),)),
+            "Mid": LibraryVdbVariant(
+                "Mid",
+                tuple(
+                    LibraryVdbFile(
+                        path.relative_to(asset_dir).as_posix(), path.name, 3, str(frame), frame, 4,
+                    )
+                    for path, frame in zip(paths, (1001, 1003))
+                ),
+                True, 1001, 1003, 4, (1002,),
+            ),
+        },
+        None, None, None, "fingerprint", "2026-01-01T00:00:00+00:00", 6,
+    )
+
+    label, variant, expression = choose_vdb_variant(asset)
+
+    assert label == "Mid"
+    assert variant.missing_frames == (1002,)
+    assert expression.endswith("cloud_mid_$F4.vdb")
 
 
 def test_protocol_framing_and_limits() -> None:
@@ -85,8 +126,8 @@ def test_installer_detects_installs_updates_and_uninstalls(tmp_path) -> None:
     assert config.stat().st_mode & 0o077 == 0
     package = json.loads((h21 / "packages" / "shotbox_assets_bridge.json").read_text(encoding="utf-8"))
     assert package["enable"] is True
-    assert package["version"] == "0.5.0"
-    assert package["path"].endswith("shotbox-assets-plugin-0.5.0")
+    assert package["version"] == "0.6.0"
+    assert package["path"].endswith("shotbox-assets-plugin-0.6.0")
     plugin_root = Path(package["path"])
     assert (plugin_root / "python3.11libs" / "uiready.py").is_file()
     assert (plugin_root / "python3.13libs" / "uiready.py").is_file()

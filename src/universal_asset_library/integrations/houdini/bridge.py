@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import struct
 import uuid
@@ -15,11 +16,11 @@ from universal_asset_library.integrations.texture_export import TextureExportPay
 from .paths import bridge_config_path, legacy_bridge_config_path, legacy_runtime_dir, runtime_dir
 
 if TYPE_CHECKING:
-    from universal_asset_library.domain import LibraryHdriAsset, LibraryHdriFile
+    from universal_asset_library.domain import LibraryHdriAsset, LibraryHdriFile, LibraryVdbAsset
 
 
 PROTOCOL_VERSION = 1
-BRIDGE_VERSION = "0.5.0"
+BRIDGE_VERSION = "0.6.0"
 MAX_MESSAGE_BYTES = 64 * 1024
 
 
@@ -239,6 +240,46 @@ class HoudiniBridgeClient:
             raise HoudiniBridgeError(response.diagnostic or "Houdini could not import the USD model.")
         return response
 
+    def import_vdb(
+        self,
+        session: HoudiniSession,
+        asset: "LibraryVdbAsset",
+        variant: str = "",
+        *,
+        library_root: Path,
+    ) -> BridgeResponse:
+        if "vdb_file" not in session.capabilities:
+            raise HoudiniBridgeError("Update the Houdini plug-in in Settings and restart Houdini.")
+        label, record, path_expression = choose_vdb_variant(asset, variant)
+        try:
+            root = library_root.expanduser().resolve(strict=True)
+            asset.asset_dir.resolve(strict=True).relative_to(root)
+        except (OSError, ValueError) as error:
+            raise HoudiniBridgeError("The managed VDB asset is outside the configured library.") from error
+        for item in record.files:
+            try:
+                path = (asset.asset_dir / item.path).resolve(strict=True)
+                path.relative_to(root)
+            except (OSError, ValueError) as error:
+                raise HoudiniBridgeError("A managed VDB file is unavailable or outside the configured library.") from error
+            if path.suffix.casefold() != ".vdb" or not path.is_file():
+                raise HoudiniBridgeError(f"Managed VDB file is missing: {path}")
+        response = self._request(session, BridgeRequest("import_vdb", {
+            "asset_id": asset.id,
+            "asset_name": asset.name,
+            "variant": label,
+            "vdb_path": path_expression,
+            "library_root": root.as_posix(),
+            "is_sequence": record.is_sequence,
+            "frame_start": record.frame_start,
+            "frame_end": record.frame_end,
+            "padding": record.padding,
+            "missing_frames": list(record.missing_frames),
+        }))
+        if not response.ok:
+            raise HoudiniBridgeError(response.diagnostic or "Houdini could not create the VDB File SOP.")
+        return response
+
     def _request(self, session: HoudiniSession, request: BridgeRequest) -> BridgeResponse:
         token = self._load_token(session.config_file)
         try:
@@ -279,6 +320,31 @@ def choose_hdri_file(asset: "LibraryHdriAsset", resolution: str = "") -> tuple[s
         item.path.casefold(),
     ))
     return label, valid[0]
+
+
+def choose_vdb_variant(asset: "LibraryVdbAsset", label: str = ""):
+    if not asset.variants:
+        raise HoudiniBridgeError("This VDB asset has no managed variants.")
+    if label not in asset.variants:
+        label = next(
+            (value for preferred in ("mid", "low", "high") for value in asset.variants if value.casefold() == preferred),
+            next(iter(asset.variants)),
+        )
+    variant = asset.variants[label]
+    if not variant.files:
+        raise HoudiniBridgeError(f"The {label} VDB variant contains no files.")
+    first = asset.asset_dir / variant.files[0].path
+    expression = first.resolve().as_posix()
+    if variant.is_sequence:
+        padding = max(1, variant.padding)
+        frame = variant.files[0].frame
+        if frame is None:
+            raise HoudiniBridgeError(f"The {label} VDB sequence has no frame metadata.")
+        match = re.search(rf"{frame:0{padding}d}(?=\.vdb$)", expression, re.IGNORECASE)
+        if not match:
+            raise HoudiniBridgeError("The managed VDB sequence filename does not contain its padded frame number.")
+        expression = expression[:match.start()] + f"$F{padding}" + expression[match.end():]
+    return label, variant, expression
 
 
 def _default_resolution(resolutions: dict[str, Any]) -> str:

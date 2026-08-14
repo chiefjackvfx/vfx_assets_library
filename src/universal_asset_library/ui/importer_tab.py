@@ -50,6 +50,7 @@ from universal_asset_library.importer import (
     ModelCandidate,
     ModelFile,
     StockCandidate,
+    VdbCandidate,
     StockTaxonomy,
     StockTaxonomyStore,
     PreflightResult,
@@ -64,6 +65,7 @@ from universal_asset_library.importer import (
     scan_mixed_folder,
     scan_model_folder,
     scan_stock_folder,
+    scan_vdb_folder,
     scan_texture_folder,
     default_stock_taxonomy,
     unzip_all_zip_files,
@@ -119,7 +121,8 @@ class ScanWorker(QRunnable):
             else:
                 scanners = {
                     "atlas": scan_atlas_folder, "hdri": scan_hdri_folder,
-                    "model": scan_model_folder, "stock": scan_stock_folder,
+                    "model": scan_model_folder, "vdb": scan_vdb_folder,
+                    "stock": scan_stock_folder,
                 }
                 scanner = scanners.get(self.mode, scan_texture_folder)
                 category = self.default_model_category if self.mode == "model" else self.default_category
@@ -282,7 +285,7 @@ class ImporterTab(QWidget):
         self._stock_taxonomy: StockTaxonomy = default_stock_taxonomy()
         self._category_catalogs = {
             asset_type: default_category_catalog(asset_type)
-            for asset_type in ("texture_set", "atlas", "hdri", "model", "stock")
+            for asset_type in ("texture_set", "atlas", "hdri", "model", "vdb", "stock")
         }
         self._scan_token = 0
         self._result = ScanResult()
@@ -485,6 +488,7 @@ class ImporterTab(QWidget):
         self.detected_type.addItem("Atlas", "atlas")
         self.detected_type.addItem("HDRI", "hdri")
         self.detected_type.addItem("3D model", "model")
+        self.detected_type.addItem("VDB volume", "vdb")
         self.detected_type.addItem("Stock footage", "stock")
         self.reclassify_button = QPushButton("Reclassify folder")
         self.reclassify_button.clicked.connect(self._reclassify_selected)
@@ -905,12 +909,16 @@ class ImporterTab(QWidget):
         )
         is_model = isinstance(material, ModelCandidate)
         is_hdri = isinstance(material, HdriCandidate)
+        is_vdb = isinstance(material, VdbCandidate)
         self.files_heading.setText(
             "Source video" if is_stock else
             "Model textures by resolution" if is_model else
+            "VDB files by variant" if is_vdb else
             "Environment variants" if is_hdri else "Files by resolution"
         )
         self.channel_table.setHorizontalHeaderLabels(
+            ["Variant", "Mode", "File", "Format", "Frame", "Padding", "Details"]
+            if is_vdb else
             ["Type", "Preferred", "File", "Format", "Bits", "Color", "Details"]
             if is_hdri else
             ["Channel", "Preferred", "File", "Format", "Bits", "Color", "Normal / packing"]
@@ -1036,7 +1044,32 @@ class ImporterTab(QWidget):
         target.setPixmap(pixmap.scaled(target.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
     def _show_resolution(self, label: str) -> None:
-        if self._loading or not self._current or label not in self._current.resolutions:
+        if self._loading or not self._current:
+            return
+        if isinstance(self._current, VdbCandidate):
+            variant = self._current.variants.get(label)
+            if not variant:
+                return
+            self.channel_table.setRowCount(len(variant.files))
+            for row, vdb_file in enumerate(variant.files):
+                details = (
+                    f"{variant.frame_start}–{variant.frame_end} · "
+                    f"{len(variant.missing_frames)} missing"
+                    if variant.is_sequence else "Single volume"
+                )
+                values = (
+                    label,
+                    "Sequence" if variant.is_sequence else "Static",
+                    vdb_file.relative_path,
+                    "VDB",
+                    str(vdb_file.frame) if vdb_file.frame is not None else "—",
+                    str(vdb_file.padding) if vdb_file.padding else "—",
+                    details,
+                )
+                for column, value in enumerate(values):
+                    self.channel_table.setItem(row, column, self._readonly_item(value))
+            return
+        if label not in self._current.resolutions:
             return
         variant = self._current.resolutions[label]
         rows = [(channel, texture_map) for channel, maps in variant.maps.items() for texture_map in maps]
@@ -1108,6 +1141,12 @@ class ImporterTab(QWidget):
         if isinstance(material, ModelCandidate):
             preferred = material.preferred_model.file_format if material.preferred_model else "No model"
             detail = f"{preferred} · {'USD Ready' if material.usd_ready else 'No USD'} · {material.model_file_count} models"
+        elif isinstance(material, VdbCandidate):
+            sequences = sum(variant.is_sequence for variant in material.variants.values())
+            detail = (
+                f"{', '.join(material.resolution_labels)} · {material.map_count} VDB files · "
+                f"{sequences} sequence{'s' if sequences != 1 else ''}"
+            )
         elif isinstance(material, StockCandidate) and material.media_info:
             info = material.media_info
             preview = "existing preview" if material.preview_policy == "use_existing" else "generate 480p"
@@ -1121,7 +1160,7 @@ class ImporterTab(QWidget):
                 detail = f"{material.archive_source.file_format} package · {detail}"
         type_label = {
             "model": "MODEL", "hdri": "HDRI", "atlas": "ATLAS",
-            "texture_set": "TEXTURE", "stock": "STOCK",
+            "texture_set": "TEXTURE", "stock": "STOCK", "vdb": "VDB",
         }.get(material.asset_type, "ASSET")
         item.setText(
             f"{icons.get(state, '•')} {material.name}\n"
@@ -1316,7 +1355,20 @@ class ImporterTab(QWidget):
     def _preflight_progressed(self, progress: ImportProgress) -> None:
         fraction = progress.completed_bytes / progress.total_bytes if progress.total_bytes else 0
         self.import_progress.setValue(min(1000, int(fraction * 1000)))
-        self.status.setText(f"Checking {progress.material} · {progress.file}")
+        details = ["Preflight", progress.phase or "Checking"]
+        if progress.material:
+            details.append(progress.material)
+        if progress.file:
+            details.append(progress.file)
+        if progress.total_items:
+            details.append(
+                f"file {min(progress.completed_items, progress.total_items)}/{progress.total_items}"
+            )
+        if progress.total_bytes:
+            details.append(
+                f"{_display_bytes(progress.completed_bytes)} / {_display_bytes(progress.total_bytes)}"
+            )
+        self.status.setText(" · ".join(details))
 
     def _preflight_finished(self, result: PreflightResult) -> None:
         self._preflight_result = result
@@ -1598,7 +1650,7 @@ class ImporterTab(QWidget):
         else:
             self._category_catalogs = {
                 asset_type: default_category_catalog(asset_type)
-                for asset_type in ("texture_set", "atlas", "hdri", "model", "stock")
+                for asset_type in ("texture_set", "atlas", "hdri", "model", "vdb", "stock")
             }
 
     def _category_names(self, asset_type: str) -> tuple[str, ...]:
@@ -1622,10 +1674,12 @@ class ImporterTab(QWidget):
         mode = self._mode()
         is_hdri = mode == "hdri"
         is_model = mode == "model"
+        is_vdb = mode == "vdb"
         is_atlas = mode == "atlas"
         is_stock = mode == "stock"
         self.title.setText(
             "Import 3D Models" if is_model else
+            "Import VDB Volumes" if is_vdb else
             "Import HDRIs" if is_hdri else
             "Import Atlases" if is_atlas else
             "Import Stock Footage" if is_stock else
@@ -1634,6 +1688,8 @@ class ImporterTab(QWidget):
         self.subtitle.setText(
             "Scan model folders, preserve their local source tree, and prefer USD whenever it is available."
             if is_model else
+            "Scan OpenVDB files, group Low/Mid/High variants, and preserve numbered cache sequences."
+            if is_vdb else
             "Scan local HDR/EXR variants, provider metadata, previews, and companion files."
             if is_hdri else
             "Scan Megascans atlases and other PBR cutouts, preserving opacity, translucency, previews, and metadata."
@@ -1645,6 +1701,8 @@ class ImporterTab(QWidget):
         self.source_path.setPlaceholderText(
             "Choose one model folder or a parent containing multiple models"
             if is_model else
+            "Choose a VDB folder or a parent containing multiple volume assets"
+            if is_vdb else
             "Choose one HDRI folder or a parent containing multiple HDRIs"
             if is_hdri else
             "Choose one atlas folder or a parent containing multiple atlases"
@@ -1653,6 +1711,8 @@ class ImporterTab(QWidget):
             if is_stock else "Choose one material folder or a parent library folder"
         )
         self.channel_table.setHorizontalHeaderLabels(
+            ["Variant", "Mode", "File", "Format", "Frame", "Padding", "Details"]
+            if is_vdb else
             ["Type", "Preferred", "File", "Format", "Bits", "Color", "Details"]
             if is_hdri else
             ["Channel", "Preferred", "File", "Format", "Bits", "Color", "Normal / packing"]
@@ -1683,6 +1743,15 @@ def _cleanup_scan_workspaces(result: ScanResult) -> None:
         if path.name.startswith("shotbox-archive-import-"):
             shutil.rmtree(path, ignore_errors=True)
     result.temporary_roots.clear()
+
+
+def _display_bytes(value: int) -> str:
+    amount = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if amount < 1024.0 or unit == "TB":
+            return f"{amount:.0f} {unit}" if unit in {"B", "KB"} else f"{amount:.1f} {unit}"
+        amount /= 1024.0
+    return "0 B"
 
 
 def _paths_overlap(first: Path, second: Path) -> bool:
