@@ -8,6 +8,20 @@ set "PROJECT_READY=0"
 if exist "pyproject.toml" if exist "run_vfx_asset_library.py" if exist "src" set "PROJECT_READY=1"
 set "SHOTBOX_INSTALL_ROOT=%LOCALAPPDATA%\ShotBoxAssets"
 if not defined LOCALAPPDATA set "SHOTBOX_INSTALL_ROOT=%USERPROFILE%\AppData\Local\ShotBoxAssets"
+if "%SHOTBOX_ARCHIVE_INSTALL%"=="1" goto configure_runtime
+if exist ".git" goto configure_runtime
+if /i "%SHOTBOX_AUTO_UPDATE%"=="0" if "%PROJECT_READY%"=="1" goto configure_runtime
+if /i "%SHOTBOX_AUTO_UPDATE%"=="false" if "%PROJECT_READY%"=="1" goto configure_runtime
+if /i "%~1"=="--no-update" if "%PROJECT_READY%"=="1" goto configure_runtime
+call :download_project_from_github
+if errorlevel 1 goto github_download_error
+cd /d "%DOWNLOADED_PROJECT%"
+if errorlevel 1 goto project_directory_error
+set "PROJECT_READY=1"
+set "SHOTBOX_ARCHIVE_INSTALL=1"
+set "SHOTBOX_VENV_ROOT=%SHOTBOX_INSTALL_ROOT%\application\.venv"
+
+:configure_runtime
 set "BOOTSTRAP_PYTHON_DIRECTORY=%SHOTBOX_INSTALL_ROOT%\runtime\python"
 set "BOOTSTRAP_PYTHON=%BOOTSTRAP_PYTHON_DIRECTORY%\python.exe"
 set "VENV_DIRECTORY=.venv"
@@ -137,6 +151,31 @@ if defined PYTHON_MANAGER exit /b 0
 for /f "delims=" %%P in ('where py 2^>nul') do if not defined PYTHON_MANAGER set "PYTHON_MANAGER=%%~fP"
 exit /b 0
 
+:download_project_from_github
+where powershell >nul 2>&1
+if errorlevel 1 exit /b 1
+set "SHOTBOX_BOOTSTRAP_SOURCE=%~f0"
+set "SHOTBOX_BOOTSTRAP_SCRIPT=%TEMP%\shotbox-archive-bootstrap-%RANDOM%-%RANDOM%.ps1"
+set "SHOTBOX_BOOTSTRAP_RESULT=%TEMP%\shotbox-archive-result-%RANDOM%-%RANDOM%.txt"
+powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $source=[IO.File]::ReadAllText($env:SHOTBOX_BOOTSTRAP_SOURCE); $marker='# SHOTBOX_EMBEDDED_POWERSHELL'; $index=$source.LastIndexOf($marker); if($index -lt 0){throw 'Embedded GitHub installer is missing.'}; [IO.File]::WriteAllText($env:SHOTBOX_BOOTSTRAP_SCRIPT,$source.Substring($index + $marker.Length),[Text.UTF8Encoding]::new($false))"
+if errorlevel 1 exit /b 1
+powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SHOTBOX_BOOTSTRAP_SCRIPT%" -InstallRoot "%SHOTBOX_INSTALL_ROOT%" -ResultFile "%SHOTBOX_BOOTSTRAP_RESULT%"
+set "BOOTSTRAP_EXIT_CODE=%ERRORLEVEL%"
+if not "%BOOTSTRAP_EXIT_CODE%"=="0" goto github_bootstrap_cleanup
+if not exist "%SHOTBOX_BOOTSTRAP_RESULT%" goto github_bootstrap_result_error
+set /p "DOWNLOADED_PROJECT="<"%SHOTBOX_BOOTSTRAP_RESULT%"
+if not defined DOWNLOADED_PROJECT goto github_bootstrap_result_error
+if not exist "%DOWNLOADED_PROJECT%\pyproject.toml" goto github_bootstrap_result_error
+goto github_bootstrap_cleanup
+
+:github_bootstrap_result_error
+set "BOOTSTRAP_EXIT_CODE=1"
+
+:github_bootstrap_cleanup
+if exist "%SHOTBOX_BOOTSTRAP_SCRIPT%" del /q "%SHOTBOX_BOOTSTRAP_SCRIPT%" >nul 2>&1
+if exist "%SHOTBOX_BOOTSTRAP_RESULT%" del /q "%SHOTBOX_BOOTSTRAP_RESULT%" >nul 2>&1
+exit /b %BOOTSTRAP_EXIT_CODE%
+
 :updater_missing
 if "%PROJECT_READY%"=="1" (
     echo Warning: the automatic updater could not be downloaded; starting the installed version.
@@ -197,3 +236,116 @@ echo.
 echo Press any key to close this window...
 pause >nul
 endlocal & exit /b %FAILURE_CODE%
+
+# SHOTBOX_EMBEDDED_POWERSHELL
+param(
+    [Parameter(Mandatory = $true)][string]$InstallRoot,
+    [Parameter(Mandatory = $true)][string]$ResultFile
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$applicationRoot = Join-Path $InstallRoot 'application'
+$versionsRoot = Join-Path $applicationRoot 'versions'
+$stateFile = Join-Path $applicationRoot 'state.json'
+$requiredPaths = @(
+    'pyproject.toml',
+    'run_vfx_asset_library.bat',
+    'run_vfx_asset_library.py',
+    'scripts\windows_auto_update.py',
+    'src'
+)
+
+function Test-ShotBoxProject([string]$Path) {
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    foreach ($relative in $requiredPaths) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Path $relative))) { return $false }
+    }
+    return $true
+}
+
+function Get-CachedProject {
+    if (-not (Test-Path -LiteralPath $stateFile -PathType Leaf)) { return $null }
+    try {
+        $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+        if ($state.commit -notmatch '^[0-9a-f]{40}$') { return $null }
+        $candidate = Join-Path $versionsRoot $state.commit
+        if (Test-ShotBoxProject $candidate) { return $candidate }
+    } catch {}
+    return $null
+}
+
+function Get-GitHubHeaders {
+    $headers = @{
+        Accept = 'application/vnd.github+json'
+        'User-Agent' = 'ShotBox-Assets-Windows-Bootstrap'
+        'X-GitHub-Api-Version' = '2022-11-28'
+    }
+    if ($env:SHOTBOX_GITHUB_TOKEN) { $headers.Authorization = 'Bearer ' + $env:SHOTBOX_GITHUB_TOKEN }
+    return $headers
+}
+
+New-Item -ItemType Directory -Path $versionsRoot -Force | Out-Null
+$cachedProject = Get-CachedProject
+$archivePath = $null
+$stagingPath = $null
+
+try {
+    $headers = Get-GitHubHeaders
+    $commitResponse = Invoke-RestMethod -UseBasicParsing -Headers $headers -Uri 'https://api.github.com/repos/chiefjackvfx/vfx_assets_library/commits/main' -TimeoutSec 30
+    $commit = [string]$commitResponse.sha
+    if ($commit -notmatch '^[0-9a-f]{40}$') { throw 'GitHub returned an invalid commit identifier.' }
+    $destination = Join-Path $versionsRoot $commit
+
+    if (-not (Test-ShotBoxProject $destination)) {
+        $archivePath = Join-Path $applicationRoot ('download-' + [Guid]::NewGuid().ToString('N') + '.zip')
+        $stagingPath = Join-Path $versionsRoot ('stage-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $stagingPath -Force | Out-Null
+        Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri ('https://api.github.com/repos/chiefjackvfx/vfx_assets_library/zipball/' + $commit) -OutFile $archivePath -TimeoutSec 30
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [IO.Compression.ZipFile]::OpenRead($archivePath)
+        try {
+            $totalSize = [int64]0
+            $roots = @{}
+            foreach ($entry in $archive.Entries) {
+                $name = $entry.FullName.Replace('\', '/')
+                $parts = $name.Split('/', [StringSplitOptions]::RemoveEmptyEntries)
+                if ($name.StartsWith('/') -or $parts.Count -eq 0 -or $parts -contains '..') { throw 'The GitHub archive contains an unsafe path.' }
+                $roots[$parts[0]] = $true
+                $totalSize += $entry.Length
+                if ($totalSize -gt 2147483648) { throw 'The GitHub archive exceeds the extraction limit.' }
+            }
+            if ($roots.Count -ne 1) { throw 'The GitHub archive does not contain one project root.' }
+        } finally {
+            $archive.Dispose()
+        }
+
+        Expand-Archive -LiteralPath $archivePath -DestinationPath $stagingPath -Force
+        $projectRoots = @(Get-ChildItem -LiteralPath $stagingPath -Directory)
+        if ($projectRoots.Count -ne 1 -or -not (Test-ShotBoxProject $projectRoots[0].FullName)) { throw 'The downloaded archive is missing required ShotBox Assets files.' }
+        Move-Item -LiteralPath $projectRoots[0].FullName -Destination $destination
+    }
+
+    $state = [ordered]@{
+        commit = $commit
+        checked_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        updated_at = [DateTime]::UtcNow.ToString('o')
+    }
+    $temporaryState = $stateFile + '.tmp'
+    $state | ConvertTo-Json | Set-Content -LiteralPath $temporaryState -Encoding UTF8
+    Move-Item -LiteralPath $temporaryState -Destination $stateFile -Force
+    [IO.File]::WriteAllText($ResultFile, $destination, [Text.UTF8Encoding]::new($false))
+    exit 0
+} catch {
+    if ($cachedProject) {
+        Write-Warning ('GitHub is unavailable; using cached ShotBox Assets. ' + $_.Exception.Message)
+        [IO.File]::WriteAllText($ResultFile, $cachedProject, [Text.UTF8Encoding]::new($false))
+        exit 0
+    }
+    Write-Error ('ShotBox Assets could not be downloaded from GitHub: ' + $_.Exception.Message)
+    exit 1
+} finally {
+    if ($archivePath -and (Test-Path -LiteralPath $archivePath)) { Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue }
+    if ($stagingPath -and (Test-Path -LiteralPath $stagingPath)) { Remove-Item -LiteralPath $stagingPath -Recurse -Force -ErrorAction SilentlyContinue }
+}

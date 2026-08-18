@@ -218,6 +218,19 @@ def test_batch_can_install_its_own_isolated_python_runtime() -> None:
     assert 'set "BOOTSTRAP_PYTHON=%BOOTSTRAP_PYTHON_DIRECTORY%\\python.exe"' in source
 
 
+def test_batch_extracts_the_final_embedded_powershell_payload() -> None:
+    source = (Path(__file__).parents[1] / "run_vfx_asset_library.bat").read_text(encoding="utf-8")
+    marker = "# SHOTBOX_EMBEDDED_POWERSHELL"
+
+    assert source.count(marker) == 2
+    assert "$source.LastIndexOf($marker)" in source
+    payload = source[source.rindex(marker) + len(marker):].lstrip()
+    assert payload.startswith("param(")
+    assert "/commits/main" in payload
+    assert "/zipball/" in payload
+    assert "[IO.File]::WriteAllText($ResultFile" in payload
+
+
 def test_archive_download_installs_commit_and_uses_fresh_cache(tmp_path: Path) -> None:
     archive = tmp_path / "github.zip"
     github_archive(archive)
