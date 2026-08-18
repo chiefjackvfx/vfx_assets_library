@@ -34,7 +34,12 @@ def test_protocol_framing_and_limits() -> None:
         encode_message({"value": "x" * MAX_MESSAGE_BYTES})
 
 
-def test_client_discovers_authenticated_blender_session(tmp_path) -> None:
+def test_client_discovers_authenticated_blender_session_without_signalling_process(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail("Session discovery must never signal the Blender process"),
+    )
     token = "b" * 64
     config = tmp_path / "bridge.json"
     config.write_text(json.dumps({"token": token}), encoding="utf-8")

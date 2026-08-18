@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import socket
 import struct
 import uuid
@@ -145,7 +144,7 @@ class BlenderBridgeClient:
                     descriptor_path=descriptor,
                     config_file=self.config_file,
                 )
-                if session.port not in range(1, 65536) or not _process_exists(session.pid):
+                if session.port not in range(1, 65536):
                     continue
                 response = self._request(session, "ping", {})
                 if response.ok and response.session_id == session.id:
@@ -241,15 +240,3 @@ class BlenderBridgeClient:
         if len(token) < 32:
             raise BlenderBridgeError("The Blender Bridge authentication token is invalid.")
         return token
-
-
-def _process_exists(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
