@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from urllib.error import URLError
@@ -229,6 +230,28 @@ def test_batch_extracts_the_final_embedded_powershell_payload() -> None:
     assert "/commits/main" in payload
     assert "/zipball/" in payload
     assert "[IO.File]::WriteAllText($ResultFile" in payload
+
+
+def test_batch_repairs_an_incomplete_virtual_environment_without_manual_files() -> None:
+    source = (Path(__file__).parents[1] / "run_vfx_asset_library.bat").read_text(encoding="utf-8")
+
+    assert 'if exist "%VENV_DIRECTORY%" set "VENV_NEEDS_REPAIR=1"' in source
+    assert '-m venv --clear "%VENV_DIRECTORY%"' in source
+    assert "Repair or remove" not in source
+    assert "goto venv_version_error" not in source
+
+
+def test_batch_goto_targets_are_defined() -> None:
+    source = (Path(__file__).parents[1] / "run_vfx_asset_library.bat").read_text(encoding="utf-8")
+    batch = source.rsplit("# SHOTBOX_EMBEDDED_POWERSHELL", 1)[0]
+    labels = {
+        line.strip()[1:].lower()
+        for line in batch.splitlines()
+        if line.strip().startswith(":")
+    }
+    targets = set(re.findall(r"(?im)\bgoto\s+:?([a-z0-9_]+)", batch))
+
+    assert {target.lower() for target in targets} <= labels | {"eof"}
 
 
 def test_archive_download_installs_commit_and_uses_fresh_cache(tmp_path: Path) -> None:

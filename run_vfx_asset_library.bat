@@ -32,9 +32,12 @@ set "PYTHON_ARGUMENT="
 set "UPDATE_PYTHON="
 set "UPDATE_PYTHON_ARGUMENT="
 set "UPDATE_SCRIPT=scripts\windows_auto_update.py"
+set "VENV_NEEDS_REPAIR=0"
 
 if exist "%VENV_PYTHON%" goto validate_existing_venv
-if exist "%VENV_DIRECTORY%" goto broken_venv
+if exist "%VENV_DIRECTORY%" set "VENV_NEEDS_REPAIR=1"
+
+:find_base_python
 if exist "%BOOTSTRAP_PYTHON%" goto validate_bootstrap_python
 
 where py >nul 2>&1
@@ -89,7 +92,11 @@ goto validate_bootstrap_python
 
 :validate_existing_venv
 "%VENV_PYTHON%" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
-if errorlevel 1 goto venv_version_error
+if not errorlevel 1 goto existing_venv_ready
+set "VENV_NEEDS_REPAIR=1"
+goto find_base_python
+
+:existing_venv_ready
 set "UPDATE_PYTHON=%VENV_PYTHON%"
 
 :check_for_update
@@ -118,13 +125,20 @@ if errorlevel 1 goto updater_error
 if exist "%VENV_PYTHON%" goto synchronize_dependencies
 
 :create_venv
+if "%VENV_NEEDS_REPAIR%"=="1" goto repair_venv
 echo Creating the ShotBox Assets virtual environment...
 "%PYTHON_COMMAND%" %PYTHON_ARGUMENT% -m venv "%VENV_DIRECTORY%"
+if errorlevel 1 goto create_venv_error
+goto synchronize_dependencies
+
+:repair_venv
+echo Repairing the ShotBox Assets virtual environment...
+"%PYTHON_COMMAND%" %PYTHON_ARGUMENT% -m venv --clear "%VENV_DIRECTORY%"
 if errorlevel 1 goto create_venv_error
 
 :synchronize_dependencies
 "%VENV_PYTHON%" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
-if errorlevel 1 goto venv_version_error
+if errorlevel 1 goto create_venv_error
 
 echo Synchronizing ShotBox Assets dependencies...
 "%VENV_PYTHON%" -m pip install -e "."
@@ -199,12 +213,6 @@ echo Error: the ShotBox Assets updater failed before the application was downloa
 set "FAILURE_CODE=1"
 goto pause_on_error
 
-:broken_venv
-echo Error: the virtual environment directory exists but does not contain %VENV_PYTHON%.
-echo Repair or remove %VENV_DIRECTORY%, then run this launcher again.
-set "FAILURE_CODE=1"
-goto pause_on_error
-
 :python_install_error
 echo Error: the automatic per-user Python installation failed.
 echo Check the messages above, then run this launcher again.
@@ -212,13 +220,7 @@ set "FAILURE_CODE=1"
 goto pause_on_error
 
 :create_venv_error
-echo Error: could not create .venv. Ensure the Python venv module is installed.
-set "FAILURE_CODE=1"
-goto pause_on_error
-
-:venv_version_error
-echo Error: the .venv interpreter must be Python 3.11 or newer.
-"%VENV_PYTHON%" --version
+echo Error: could not create or repair the ShotBox Assets virtual environment.
 set "FAILURE_CODE=1"
 goto pause_on_error
 
