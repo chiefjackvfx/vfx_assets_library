@@ -1,16 +1,17 @@
 @echo off
-setlocal
+setlocal EnableExtensions DisableDelayedExpansion
 
 cd /d "%~dp0"
 if errorlevel 1 goto project_directory_error
 
 set "VENV_PYTHON=.venv\Scripts\python.exe"
-
-if exist "%VENV_PYTHON%" goto validate_venv
-if exist ".venv" goto broken_venv
-
 set "PYTHON_COMMAND="
 set "PYTHON_ARGUMENT="
+set "UPDATE_PYTHON="
+set "UPDATE_PYTHON_ARGUMENT="
+
+if exist "%VENV_PYTHON%" goto validate_existing_venv
+if exist ".venv" goto broken_venv
 
 where py >nul 2>&1
 if errorlevel 1 goto try_python
@@ -18,7 +19,9 @@ py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
 if errorlevel 1 goto try_python
 set "PYTHON_COMMAND=py"
 set "PYTHON_ARGUMENT=-3"
-goto create_venv
+set "UPDATE_PYTHON=py"
+set "UPDATE_PYTHON_ARGUMENT=-3"
+goto check_for_update
 
 :try_python
 where python >nul 2>&1
@@ -26,13 +29,31 @@ if errorlevel 1 goto python_error
 python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
 if errorlevel 1 goto python_error
 set "PYTHON_COMMAND=python"
+set "UPDATE_PYTHON=python"
+goto check_for_update
+
+:validate_existing_venv
+"%VENV_PYTHON%" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+if errorlevel 1 goto venv_version_error
+set "UPDATE_PYTHON=%VENV_PYTHON%"
+
+:check_for_update
+if /i "%SHOTBOX_AUTO_UPDATE%"=="0" goto after_update
+if /i "%SHOTBOX_AUTO_UPDATE%"=="false" goto after_update
+if "%SHOTBOX_UPDATE_RELAUNCHED%"=="1" goto after_update
+if not exist "scripts\windows_auto_update.py" goto updater_missing
+echo Checking GitHub for ShotBox Assets updates...
+"%UPDATE_PYTHON%" %UPDATE_PYTHON_ARGUMENT% "scripts\windows_auto_update.py" --project "%CD%" --launcher "%~f0" -- %* & if errorlevel 10 exit /b 0
+
+:after_update
+if exist "%VENV_PYTHON%" goto synchronize_dependencies
 
 :create_venv
 echo Creating the ShotBox Assets virtual environment...
 %PYTHON_COMMAND% %PYTHON_ARGUMENT% -m venv ".venv"
 if errorlevel 1 goto create_venv_error
 
-:validate_venv
+:synchronize_dependencies
 "%VENV_PYTHON%" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
 if errorlevel 1 goto venv_version_error
 
@@ -51,6 +72,10 @@ endlocal & exit /b 0
 echo Error: could not open the ShotBox Assets project directory.
 set "FAILURE_CODE=1"
 goto pause_on_error
+
+:updater_missing
+echo Warning: the automatic updater is missing; starting the installed version.
+goto after_update
 
 :broken_venv
 echo Error: .venv exists but does not contain %VENV_PYTHON%.

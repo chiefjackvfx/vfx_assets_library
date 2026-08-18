@@ -9,6 +9,12 @@ import sys
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+LAUNCHER_ONLY_ARGUMENTS = {"--no-update"}
+
+
+def application_arguments(arguments: list[str]) -> list[str]:
+    """Remove flags consumed by the source-checkout launcher."""
+    return [value for value in arguments if value not in LAUNCHER_ONLY_ARGUMENTS]
 
 
 def _restart_in_project_venv() -> None:
@@ -27,6 +33,7 @@ def _restart_in_project_venv() -> None:
 
 
 def main() -> int:
+    sys.argv[:] = [sys.argv[0], *application_arguments(sys.argv[1:])]
     _restart_in_project_venv()
 
     source_directory = PROJECT_ROOT / "src"

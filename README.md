@@ -18,7 +18,7 @@ On Linux, run:
 ./run_vfx_asset_library.sh
 ```
 
-On Windows, double-click `run_vfx_asset_library.bat` or run it from Command Prompt. The launchers create `.venv` when needed, synchronize the editable installation on every start, and then open ShotBox Assets. An internet connection may be required while installing or updating dependencies.
+On Windows, double-click `run_vfx_asset_library.bat` or run it from Command Prompt. A clean `main` checkout checks `origin/main` on startup and installs available fast-forward updates before opening the application. Offline startup remains available, and updates are skipped rather than overwriting tracked local changes or a diverged branch. Pass `--no-update` for one launch or set `SHOTBOX_AUTO_UPDATE=0` to disable the check. The launchers create `.venv` when needed, synchronize the editable installation on every start, and then open ShotBox Assets. Git for Windows is optional but required for automatic source updates; an internet connection may be required while updating code or dependencies.
 
 To set up and run the app manually instead:
 
