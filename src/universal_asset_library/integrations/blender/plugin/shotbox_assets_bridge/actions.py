@@ -631,6 +631,6 @@ def session_data(bpy):
     return {
         "blender_version": version,
         "blend_file": blend_file,
-        "bridge_version": "0.4.3",
+        "bridge_version": "0.4.4",
         "capabilities": ["hdri", "texture_material", "usd_model"],
     }

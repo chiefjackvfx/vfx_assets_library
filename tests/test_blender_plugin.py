@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import importlib
-import queue
+import json
+import socket
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -14,6 +14,7 @@ PLUGIN_ROOT = Path(__file__).parents[1] / "src/universal_asset_library/integrati
 sys.path.insert(0, str(PLUGIN_ROOT))
 actions = importlib.import_module("shotbox_assets_bridge.actions")
 server_module = importlib.import_module("shotbox_assets_bridge.server")
+protocol_module = importlib.import_module("shotbox_assets_bridge.protocol")
 
 
 class Socket:
@@ -309,100 +310,147 @@ def test_edit_rejects_missing_or_custom_world_and_unsafe_paths(tmp_path) -> None
 
 
 def test_expired_request_is_discarded_before_bpy_action(monkeypatch) -> None:
+    class Connection:
+        def __init__(self):
+            self.response = b""
+            self.closed = False
+
+        def recv(self, _size):
+            raise AssertionError("An expired connection must not be read")
+
+        def send(self, payload):
+            self.response += payload
+            return len(payload)
+
+        def close(self):
+            self.closed = True
+
+    class Listener:
+        def accept(self):
+            raise BlockingIOError
+
     bridge = object.__new__(server_module.BridgeServer)
     bridge.bpy = object()
     bridge.session_id = "session"
-    bridge.pending = queue.Queue()
-    bridge.stopping = threading.Event()
+    bridge._stopping = False
+    bridge.listener = Listener()
     bridge.cached_session_data = {"blender_version": "5.2.0", "blend_file": ""}
     bridge.last_result = ""
     bridge.last_asset = ""
     bridge.last_resolution = ""
     bridge.last_world = ""
-    request = {
-        "request_id": "expired",
-        "action": "set_hdri_world",
-        "payload": {"asset_name": "Sky", "resolution": "4K"},
-    }
-    pending = server_module.PendingRequest(request, time.monotonic() - 1)
-    bridge.pending.put(pending)
+    connection = Connection()
+    client = server_module.ClientConnection(connection, time.monotonic() - 1, request_id="expired")
+    bridge.clients = {client}
     called = []
     monkeypatch.setattr(server_module.actions, "execute", lambda *_args: called.append(True))
-    assert bridge.process_pending() == 0.1
-    assert pending.ready.is_set()
-    assert pending.response["ok"] is False
-    assert "expired" in pending.response["diagnostic"]
+    assert bridge.process_pending() == server_module.TIMER_INTERVAL
+    response = json.loads(connection.response[4:].decode("utf-8"))
+    assert response["ok"] is False
+    assert response["request_id"] == "expired"
+    assert "expired" in response["diagnostic"]
+    assert connection.closed
     assert called == []
 
 
-def test_bridge_stop_closes_connections_joins_threads_and_releases_requests(tmp_path) -> None:
+def test_bridge_stop_closes_connections_and_unregisters_exact_timer(tmp_path) -> None:
     class Closeable:
         def __init__(self):
             self.closed = False
-            self.shutdown_called = False
-
-        def shutdown(self, _how):
-            self.shutdown_called = True
-
         def close(self):
             self.closed = True
-
-    class Joinable:
-        def __init__(self, alive=True):
-            self.alive = alive
-            self.joined = False
-
-        def is_alive(self):
-            return self.alive
-
-        def join(self, _timeout):
-            self.joined = True
-            self.alive = False
 
     class Timers:
         def __init__(self):
             self.unregistered = False
+            self.callback = None
 
-        def is_registered(self, _callback):
+        def is_registered(self, callback):
+            self.callback = callback
             return True
 
-        def unregister(self, _callback):
+        def unregister(self, callback):
+            assert callback is self.callback
             self.unregistered = True
 
     bridge = object.__new__(server_module.BridgeServer)
     bridge.bpy = type("Bpy", (), {"app": type("App", (), {"timers": Timers()})()})()
     bridge.session_id = "session"
-    bridge.pending = queue.Queue()
-    bridge.stopping = threading.Event()
-    bridge._stop_lock = threading.Lock()
-    bridge._connections_lock = threading.Lock()
+    bridge._stopping = False
     bridge._stopped = False
+    bridge._timer_callback = bridge.process_pending
     bridge.listener = Closeable()
     connection = Closeable()
-    worker = Joinable()
-    bridge._connections = {connection}
-    bridge._workers = {worker}
-    bridge.thread = Joinable()
+    client = server_module.ClientConnection(connection, time.monotonic() + 60)
+    bridge.clients = {client}
     bridge.descriptor_path = tmp_path / "session.json"
     bridge.descriptor_path.write_text("{}", encoding="utf-8")
     bridge.cached_session_data = {"blender_version": "5.2.0", "blend_file": ""}
-    pending = server_module.PendingRequest(
-        {"request_id": "waiting", "action": "ping", "payload": {}},
-        time.monotonic() + 60,
-    )
-    bridge.pending.put(pending)
 
     bridge.stop()
 
-    assert bridge.stopping.is_set()
+    assert bridge._stopping
     assert bridge.listener.closed
-    assert connection.shutdown_called and connection.closed
-    assert bridge.thread.joined and worker.joined
+    assert connection.closed
+    assert bridge.clients == set()
     assert bridge.bpy.app.timers.unregistered
-    assert pending.ready.is_set()
-    assert pending.response["ok"] is False
-    assert "shutting down" in pending.response["diagnostic"]
     assert not bridge.descriptor_path.exists()
+
+
+def test_bridge_server_uses_no_persistent_python_threads_or_atexit() -> None:
+    source = Path(server_module.__file__).read_text(encoding="utf-8")
+
+    assert "import threading" not in source
+    assert "import atexit" not in source
+    assert ".setblocking(False)" in source
+
+
+def test_bridge_handles_ping_from_blender_timer_without_threads(monkeypatch, tmp_path) -> None:
+    token = "t" * 64
+    config = tmp_path / "bridge.json"
+    config.write_text(json.dumps({"token": token}), encoding="utf-8")
+    runtime = tmp_path / "runtime"
+    monkeypatch.setattr(server_module, "_config_path", lambda: config)
+    monkeypatch.setattr(server_module, "_runtime_dir", lambda: runtime)
+
+    class Timers:
+        def __init__(self):
+            self.callback = None
+
+        def register(self, callback, **_kwargs):
+            self.callback = callback
+
+        def is_registered(self, callback):
+            return callback is self.callback
+
+        def unregister(self, callback):
+            assert callback is self.callback
+            self.callback = None
+
+    bpy = Bpy()
+    bpy.app.timers = Timers()
+    bridge = server_module.BridgeServer(bpy)
+    bridge.start()
+    request = {
+        "protocol_version": server_module.PROTOCOL_VERSION,
+        "request_id": "ping-one",
+        "token": token,
+        "action": "ping",
+        "payload": {},
+    }
+    try:
+        with socket.create_connection(("127.0.0.1", bridge.port), timeout=1) as connection:
+            connection.sendall(protocol_module.encode_message(request))
+            for _index in range(4):
+                bridge.process_pending()
+            response = protocol_module.receive_message(connection)
+    finally:
+        bridge.stop()
+
+    assert response["ok"] is True
+    assert response["request_id"] == "ping-one"
+    assert response["data"]["bridge_version"] == "0.4.4"
+    assert bpy.app.timers.callback is None
 
 
 def test_bridge_start_failure_rolls_back_without_publishing_instance(monkeypatch) -> None:

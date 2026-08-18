@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import atexit
 import json
 import os
-import queue
 import socket
-import threading
+import struct
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -13,13 +11,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import actions
-from .protocol import encode_message, receive_message
+from .protocol import MAX_MESSAGE_BYTES, decode_payload, encode_message
 
 
 PROTOCOL_VERSION = 1
-BRIDGE_VERSION = "0.4.3"
+BRIDGE_VERSION = "0.4.4"
 REQUEST_TIMEOUT = 300.0
-THREAD_JOIN_TIMEOUT = 2.0
+TIMER_INTERVAL = 0.05
+MAX_ACCEPTS_PER_TICK = 8
+MAX_READS_PER_TICK = 8
 
 
 def _config_path():
@@ -44,15 +44,20 @@ def _runtime_dir():
     return Path(root) / "shotbox-assets-blender" if root else Path("/tmp") / f"shotbox-assets-blender-{os.getuid()}"
 
 
-@dataclass
-class PendingRequest:
-    request: dict
+@dataclass(eq=False)
+class ClientConnection:
+    connection: socket.socket
     deadline: float
-    ready: threading.Event = field(default_factory=threading.Event)
-    response: dict | None = None
+    buffer: bytearray = field(default_factory=bytearray)
+    expected_size: int | None = None
+    response: bytes = b""
+    sent: int = 0
+    request_id: str = ""
 
 
 class BridgeServer:
+    """A non-blocking localhost bridge polled only from Blender's main thread."""
+
     def __init__(self, bpy):
         self.bpy = bpy
         self.session_id = str(uuid.uuid4())
@@ -61,16 +66,12 @@ class BridgeServer:
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(8)
-        self.listener.settimeout(0.5)
+        self.listener.setblocking(False)
         self.port = self.listener.getsockname()[1]
-        self.pending = queue.Queue()
-        self.stopping = threading.Event()
-        self._stop_lock = threading.Lock()
-        self._connections_lock = threading.Lock()
-        self._connections = set()
-        self._workers = set()
+        self.clients: set[ClientConnection] = set()
+        self._stopping = False
         self._stopped = False
-        self.thread = threading.Thread(target=self._listen, name="ShotBoxBlenderBridge", daemon=True)
+        self._timer_callback = self.process_pending
         self.descriptor_path = _runtime_dir() / f"session-{self.session_id}.json"
         self.last_result = "Waiting for an asset from ShotBox Assets."
         self.last_asset = ""
@@ -83,157 +84,149 @@ class BridgeServer:
             self._token()
             self.descriptor_path.parent.mkdir(parents=True, exist_ok=True)
             self._write_descriptor()
-            self.thread.start()
-            self.bpy.app.timers.register(self.process_pending, first_interval=0.1, persistent=True)
+            self.bpy.app.timers.register(
+                self._timer_callback,
+                first_interval=TIMER_INTERVAL,
+                persistent=True,
+            )
         except Exception:
             self.stop()
             raise
 
     def stop(self, unregister_timer=True):
-        with self._stop_lock:
-            if self._stopped:
-                return
-            self._stopped = True
-            self.stopping.set()
-            self._fail_pending("Blender is shutting down.")
+        if self._stopped:
+            return
+        self._stopping = True
+        self._stopped = True
+        for client in tuple(self.clients):
+            self._drop_client(client)
+        try:
+            self.listener.close()
+        except OSError:
+            pass
+        if unregister_timer:
             try:
-                self.listener.close()
-            except OSError:
+                if self.bpy.app.timers.is_registered(self._timer_callback):
+                    self.bpy.app.timers.unregister(self._timer_callback)
+            except Exception:
                 pass
-            with self._connections_lock:
-                connections = tuple(self._connections)
-                workers = tuple(self._workers)
-            for connection in connections:
-                try:
-                    connection.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                try:
-                    connection.close()
-                except OSError:
-                    pass
-            if unregister_timer:
-                try:
-                    if self.bpy.app.timers.is_registered(self.process_pending):
-                        self.bpy.app.timers.unregister(self.process_pending)
-                except Exception:
-                    pass
-            current = threading.current_thread()
-            if self.thread is not current and self.thread.is_alive():
-                self.thread.join(THREAD_JOIN_TIMEOUT)
-            for worker in workers:
-                if worker is not current and worker.is_alive():
-                    worker.join(THREAD_JOIN_TIMEOUT)
-            self._fail_pending("Blender is shutting down.")
-            try:
-                self.descriptor_path.unlink()
-            except OSError:
-                pass
+        try:
+            self.descriptor_path.unlink()
+        except OSError:
+            pass
 
     def process_pending(self):
-        if self.stopping.is_set():
-            self._fail_pending("Blender is shutting down.")
+        if self._stopping:
             return None
-        for _index in range(8):
+        self._accept_connections()
+        for client in tuple(self.clients):
             try:
-                pending = self.pending.get_nowait()
-            except queue.Empty:
-                break
-            request_id = str(pending.request.get("request_id", ""))
-            if time.monotonic() >= pending.deadline:
-                pending.response = self._failure(request_id, "The request expired before Blender could process it.")
-            else:
-                try:
-                    pending.response = actions.execute(
-                        self.bpy,
-                        pending.request["action"],
-                        pending.request["payload"],
-                        self.session_id,
-                    )
-                    pending.response["request_id"] = request_id
-                    self.cached_session_data = dict(pending.response.get("data", self.cached_session_data))
-                    if pending.request["action"] in {"set_hdri_world", "create_texture_material", "import_usd_model"} and pending.response.get("ok"):
-                        payload = pending.request["payload"]
-                        self.last_asset = str(payload.get("asset_name", ""))
-                        self.last_resolution = str(payload.get("resolution", ""))
-                        self.last_world = str(pending.response.get("world_name", ""))
-                        self.last_result = str(pending.response.get("diagnostic", ""))
-                except Exception as error:
-                    self.last_result = str(error)
-                    pending.response = self._failure(request_id, str(error))
-            pending.ready.set()
-        return None if self.stopping.is_set() else 0.1
+                self._poll_client(client)
+            except Exception as error:
+                self._queue_response(client, self._failure(client.request_id, str(error)))
+                self._flush_response(client)
+        return None if self._stopping else TIMER_INTERVAL
 
-    def _listen(self):
-        while not self.stopping.is_set():
+    def _accept_connections(self):
+        for _index in range(MAX_ACCEPTS_PER_TICK):
             try:
                 connection, _address = self.listener.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            worker = threading.Thread(
-                target=self._handle_connection,
-                args=(connection,),
-                name="ShotBoxBlenderBridgeClient",
-                daemon=True,
-            )
-            with self._connections_lock:
-                if self.stopping.is_set():
-                    connection.close()
-                    break
-                self._connections.add(connection)
-                self._workers.add(worker)
-                worker.start()
-
-    def _handle_connection(self, connection):
-        try:
-            self._handle(connection)
-        finally:
-            with self._connections_lock:
-                self._connections.discard(connection)
-                self._workers.discard(threading.current_thread())
-
-    def _handle(self, connection):
-        with connection:
-            connection.settimeout(REQUEST_TIMEOUT + 1.0)
-            request_id = ""
-            try:
-                request = receive_message(connection)
-                request_id = str(request.get("request_id", ""))
-                self._validate(request)
-                if self.stopping.is_set():
-                    raise RuntimeError("Blender is shutting down.")
-                pending = PendingRequest(request, time.monotonic() + REQUEST_TIMEOUT)
-                self.pending.put(pending)
-                while (
-                    not pending.ready.wait(0.1)
-                    and not self.stopping.is_set()
-                    and time.monotonic() < pending.deadline
-                ):
-                    pass
-                if self.stopping.is_set() and not pending.ready.is_set():
-                    response = self._failure(request_id, "Blender is shutting down.")
-                elif not pending.ready.is_set():
-                    response = self._failure(request_id, "Blender did not process the request before it timed out.")
-                else:
-                    response = pending.response
-            except Exception as error:
-                response = self._failure(request_id, str(error))
-            try:
-                connection.sendall(encode_message(response))
-            except OSError:
-                pass
-
-    def _fail_pending(self, diagnostic):
-        while True:
-            try:
-                pending = self.pending.get_nowait()
-            except queue.Empty:
+            except (BlockingIOError, InterruptedError):
                 return
-            request_id = str(pending.request.get("request_id", ""))
-            pending.response = self._failure(request_id, diagnostic)
-            pending.ready.set()
+            except OSError:
+                if self._stopping:
+                    return
+                raise
+            connection.setblocking(False)
+            self.clients.add(ClientConnection(connection, time.monotonic() + REQUEST_TIMEOUT))
+
+    def _poll_client(self, client):
+        if client.response:
+            self._flush_response(client)
+            return
+        if time.monotonic() >= client.deadline:
+            self._queue_response(client, self._failure(client.request_id, "The request expired before Blender could process it."))
+            self._flush_response(client)
+            return
+
+        for _index in range(MAX_READS_PER_TICK):
+            try:
+                chunk = client.connection.recv(MAX_MESSAGE_BYTES + 4)
+            except (BlockingIOError, InterruptedError):
+                break
+            if not chunk:
+                self._drop_client(client)
+                return
+            client.buffer.extend(chunk)
+            self._read_header(client)
+            if client.expected_size is not None and len(client.buffer) >= client.expected_size:
+                self._handle_request(client)
+                self._flush_response(client)
+                return
+
+    def _read_header(self, client):
+        if client.expected_size is not None or len(client.buffer) < 4:
+            return
+        client.expected_size = struct.unpack("!I", bytes(client.buffer[:4]))[0]
+        del client.buffer[:4]
+        if client.expected_size < 2 or client.expected_size > MAX_MESSAGE_BYTES:
+            raise ValueError("Bridge message has an invalid length.")
+
+    def _handle_request(self, client):
+        if client.expected_size is None:
+            return
+        if len(client.buffer) != client.expected_size:
+            raise ValueError("Bridge connection sent unexpected trailing data.")
+        request = decode_payload(bytes(client.buffer))
+        client.request_id = str(request.get("request_id", ""))
+        self._validate(request)
+        try:
+            response = actions.execute(
+                self.bpy,
+                request["action"],
+                request["payload"],
+                self.session_id,
+            )
+            response["request_id"] = client.request_id
+            self.cached_session_data = dict(response.get("data", self.cached_session_data))
+            if request["action"] in {"set_hdri_world", "create_texture_material", "import_usd_model"} and response.get("ok"):
+                payload = request["payload"]
+                self.last_asset = str(payload.get("asset_name", ""))
+                self.last_resolution = str(payload.get("resolution", ""))
+                self.last_world = str(response.get("world_name", ""))
+                self.last_result = str(response.get("diagnostic", ""))
+        except Exception as error:
+            self.last_result = str(error)
+            response = self._failure(client.request_id, str(error))
+        self._queue_response(client, response)
+
+    def _queue_response(self, client, response):
+        if not client.response:
+            client.response = encode_message(response)
+
+    def _flush_response(self, client):
+        if not client.response or client not in self.clients:
+            return
+        try:
+            sent = client.connection.send(client.response[client.sent:])
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            self._drop_client(client)
+            return
+        if sent <= 0:
+            self._drop_client(client)
+            return
+        client.sent += sent
+        if client.sent >= len(client.response):
+            self._drop_client(client)
+
+    def _drop_client(self, client):
+        self.clients.discard(client)
+        try:
+            client.connection.close()
+        except OSError:
+            pass
 
     def _validate(self, request):
         if request.get("protocol_version") != PROTOCOL_VERSION:
@@ -308,13 +301,3 @@ def stop():
 
 def instance():
     return _INSTANCE
-
-
-def _stop_at_exit():
-    global _INSTANCE
-    if _INSTANCE is not None:
-        _INSTANCE.stop(unregister_timer=False)
-        _INSTANCE = None
-
-
-atexit.register(_stop_at_exit)

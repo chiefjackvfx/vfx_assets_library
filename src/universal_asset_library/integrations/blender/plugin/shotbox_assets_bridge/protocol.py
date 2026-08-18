@@ -19,8 +19,12 @@ def receive_message(connection):
     length = struct.unpack("!I", header)[0]
     if length < 2 or length > MAX_MESSAGE_BYTES:
         raise ValueError("Bridge message has an invalid length.")
+    return decode_payload(_receive_exact(connection, length))
+
+
+def decode_payload(payload):
     try:
-        document = json.loads(_receive_exact(connection, length).decode("utf-8"))
+        document = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("Bridge request is malformed JSON.") from error
     if not isinstance(document, dict):
