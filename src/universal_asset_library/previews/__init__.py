@@ -22,6 +22,15 @@ from .texture_renderer import (
     select_texture_maps,
     select_texture_variant,
 )
+from .vdb_renderer import (
+    VdbPreviewError,
+    VdbPreviewRequest,
+    VdbPreviewResult,
+    render_vdb_preview,
+    resolve_houdini_executable,
+    resolve_iconvert,
+    validate_houdini_executable,
+)
 from .blender_preview_session import (
     BlenderPreviewSession,
     BlenderPreviewSessionError,
@@ -48,4 +57,11 @@ __all__ = [
     "select_texture_variant",
     "BlenderPreviewSession",
     "BlenderPreviewSessionError",
+    "VdbPreviewError",
+    "VdbPreviewRequest",
+    "VdbPreviewResult",
+    "render_vdb_preview",
+    "resolve_houdini_executable",
+    "resolve_iconvert",
+    "validate_houdini_executable",
 ]

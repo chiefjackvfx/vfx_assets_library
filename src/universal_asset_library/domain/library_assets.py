@@ -500,6 +500,7 @@ class LibraryVdbAsset:
     asset_type: str = "vdb"
     physical_size: str = ""
     rating: int = 0
+    preview_render: dict = field(default_factory=dict)
 
     @property
     def extras(self) -> tuple[LibraryExtraFile, ...]:

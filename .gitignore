@@ -5,5 +5,6 @@ __pycache__/
 .coverage
 dist/
 build/
+temp_cache/
 *.egg-info/
 *.blend1

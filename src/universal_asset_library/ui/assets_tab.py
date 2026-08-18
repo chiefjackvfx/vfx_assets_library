@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PyQt6.QtCore import QAbstractListModel, QEvent, QItemSelectionModel, QModelIndex, QObject, QPoint, QPersistentModelIndex, QProcess, QRect, QRectF, QRunnable, QSettings, QSize, Qt, QSortFilterProxyModel, QThreadPool, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QDesktopServices, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QLayoutItem,
     QListView,
     QMessageBox,
+    QMenu,
     QPushButton,
     QProgressBar,
     QRadioButton,
@@ -910,6 +911,16 @@ class TextureCardDelegate(QStyledItemDelegate):
         self._hover_asset_id = ""
         self._hover_pixmap = QPixmap()
 
+    def preview_rect(self, item_rect: QRect) -> QRect:
+        """Return the viewport-space rectangle painted as the card preview."""
+        outer = QRectF(item_rect.adjusted(4, 4, -4, -4))
+        return QRectF(
+            outer.left() + 1,
+            outer.top() + 1,
+            outer.width() - 2,
+            self.preview_height,
+        ).toAlignedRect()
+
     def set_rating_enabled(self, enabled: bool) -> None:
         self._rating_enabled = bool(enabled)
 
@@ -999,7 +1010,7 @@ class TextureCardDelegate(QStyledItemDelegate):
         painter.setPen(QPen(QColor("#FF6B35" if selected else "#2F3542"), 2 if selected else 1))
         painter.setBrush(QColor("#23272D" if selected else "#1E2228"))
         painter.drawRoundedRect(outer, 5, 5)
-        preview = QRectF(outer.left() + 1, outer.top() + 1, outer.width() - 2, self.preview_height)
+        preview = QRectF(self.preview_rect(option.rect))
         clip = QPainterPath()
         clip.addRoundedRect(preview, 4, 4)
         painter.save()
@@ -1051,6 +1062,8 @@ class TextureCardDelegate(QStyledItemDelegate):
         small.setBold(True)
         painter.setFont(small)
         painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, badge_text)
+        if self._has_3d_preview(asset):
+            self._paint_3d_preview_badge(painter, preview)
 
         name_font = QFont(option.font)
         name_font.setPointSize(10)
@@ -1122,6 +1135,56 @@ class TextureCardDelegate(QStyledItemDelegate):
                 self._paint_task_spinner(painter, preview)
             elif state == "failed":
                 self._paint_failed_badge(painter, preview)
+        painter.restore()
+
+    @staticmethod
+    def _has_3d_preview(asset) -> bool:
+        return (
+            isinstance(asset, LibraryVdbAsset)
+            and asset.preview_path is not None
+            and asset.preview_path.suffix.casefold() == ".mp4"
+        )
+
+    @staticmethod
+    def _preview_3d_badge_rect(preview: QRectF) -> QRectF:
+        return QRectF(preview.right() - 36, preview.bottom() - 36, 28, 28)
+
+    def _paint_3d_preview_badge(
+        self,
+        painter: QPainter,
+        preview: QRectF,
+    ) -> None:
+        badge = self._preview_3d_badge_rect(preview)
+        painter.save()
+        painter.setPen(QPen(QColor(255, 255, 255, 38), 1))
+        painter.setBrush(QColor(12, 16, 21, 218))
+        painter.drawRoundedRect(badge, 5, 5)
+
+        center_x = int(badge.center().x())
+        top = QPoint(center_x, int(badge.top() + 5))
+        upper_left = QPoint(int(badge.left() + 6), int(badge.top() + 10))
+        middle = QPoint(center_x, int(badge.top() + 14))
+        upper_right = QPoint(int(badge.right() - 6), int(badge.top() + 10))
+        lower_left = QPoint(int(badge.left() + 6), int(badge.bottom() - 7))
+        bottom = QPoint(center_x, int(badge.bottom() - 3))
+        lower_right = QPoint(int(badge.right() - 6), int(badge.bottom() - 7))
+        cube_pen = QPen(QColor("#F2F5F8"), 1.5)
+        cube_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        cube_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(cube_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for start, end in (
+            (top, upper_left),
+            (upper_left, middle),
+            (middle, upper_right),
+            (upper_right, top),
+            (upper_left, lower_left),
+            (middle, bottom),
+            (upper_right, lower_right),
+            (lower_left, bottom),
+            (bottom, lower_right),
+        ):
+            painter.drawLine(start, end)
         painter.restore()
 
     def _paint_task_spinner(self, painter: QPainter, preview: QRectF) -> None:
@@ -1263,17 +1326,26 @@ class StockHoverPreviewController(QObject):
         self._pending_index = QPersistentModelIndex()
         self._active_index = QPersistentModelIndex()
         self._active_asset_id = ""
+        self._scrub_active = False
+        self._scrub_decoder_ready = False
+        self._pending_scrub_position: int | None = None
+        self._last_scrub_position: int | None = None
         self._failed_asset_ids: set[str] = set()
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.setInterval(delay_ms)
         self.timer.timeout.connect(self._start_pending)
+        self.scrub_timer = QTimer(self)
+        self.scrub_timer.setSingleShot(True)
+        self.scrub_timer.setInterval(30)
+        self.scrub_timer.timeout.connect(self._apply_pending_scrub)
         self.player = QMediaPlayer(self)
         self.video_sink = QVideoSink(self)
         self.player.setVideoOutput(self.video_sink)
         self.player.setLoops(QMediaPlayer.Loops.Infinite)
         self.video_sink.videoFrameChanged.connect(self._frame_changed)
         self.player.errorOccurred.connect(self._playback_failed)
+        self.player.durationChanged.connect(self._duration_changed)
 
         self.view.setMouseTracking(True)
         self._viewport.setMouseTracking(True)
@@ -1319,6 +1391,12 @@ class StockHoverPreviewController(QObject):
         ):
             self.stop()
             return
+        if self._is_scrubbable_turntable(asset):
+            # MouseMove supplies the thumbnail-relative position.  Do not
+            # start normal hover playback for generated VDB turntables.
+            if not self._scrub_active or asset.id != self._active_asset_id:
+                self.stop()
+            return
         if asset.id == self._active_asset_id:
             return
         self.stop()
@@ -1330,23 +1408,130 @@ class StockHoverPreviewController(QObject):
 
     def stop(self, *_args) -> None:
         self.timer.stop()
+        self.scrub_timer.stop()
         previous = self._active_index
         self._pending_index = QPersistentModelIndex()
         self._active_index = QPersistentModelIndex()
         self._active_asset_id = ""
+        self._scrub_active = False
+        self._scrub_decoder_ready = False
+        self._pending_scrub_position = None
+        self._last_scrub_position = None
         self.player.stop()
         self.player.setSource(QUrl())
         self.delegate.clear_hover_frame()
         self._update_index(previous)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is getattr(self, "_viewport", None) and event.type() in {
-            QEvent.Type.Leave,
-            QEvent.Type.Hide,
-            QEvent.Type.Wheel,
-        }:
-            self.stop()
+        if watched is getattr(self, "_viewport", None):
+            if event.type() == QEvent.Type.MouseMove:
+                position = event.position().toPoint()
+                index = self.view.indexAt(position)
+                asset = index.data(ASSET_ROLE) if index.isValid() else None
+                if self._is_scrubbable_turntable(asset):
+                    preview_rect = self.delegate.preview_rect(
+                        self.view.visualRect(index)
+                    )
+                    if preview_rect.contains(position):
+                        self._scrub_at(index, position.x(), preview_rect)
+                    elif asset.id in {
+                        self._active_asset_id,
+                        getattr(
+                            self._pending_index.data(ASSET_ROLE), "id", ""
+                        ),
+                    }:
+                        self.stop()
+                elif self._scrub_active:
+                    self.stop()
+            elif event.type() in {
+                QEvent.Type.Leave,
+                QEvent.Type.Hide,
+                QEvent.Type.Wheel,
+            }:
+                self.stop()
         return super().eventFilter(watched, event)
+
+    @staticmethod
+    def _is_scrubbable_turntable(asset) -> bool:
+        if not isinstance(asset, LibraryVdbAsset):
+            return False
+        render = asset.preview_render
+        return (
+            str(render.get("status", "")).casefold() == "ready"
+            and str(render.get("mode", "")).casefold() == "turntable"
+            and asset.preview_path is not None
+            and asset.preview_path.is_file()
+        )
+
+    @staticmethod
+    def _turntable_position(asset: LibraryVdbAsset, ratio: float) -> int:
+        render = asset.preview_render
+        try:
+            frame_start = int(render.get("frame_start", 1))
+            frame_end = int(render.get("frame_end", frame_start))
+            fps = float(render.get("fps", 24.0))
+        except (TypeError, ValueError):
+            frame_start, frame_end, fps = 1, 1, 24.0
+        frame_count = max(1, frame_end - frame_start + 1)
+        if fps <= 0:
+            fps = 24.0
+        clamped = min(1.0, max(0.0, float(ratio)))
+        frame_offset = int(clamped * (frame_count - 1) + 0.5)
+        return max(0, round(frame_offset * 1000.0 / fps))
+
+    def _scrub_at(
+        self,
+        index: QModelIndex,
+        pointer_x: int,
+        preview_rect: QRect,
+    ) -> None:
+        if not self.enabled or self.suspended or not index.isValid():
+            self.stop()
+            return
+        asset = index.data(ASSET_ROLE)
+        if (
+            not self._is_scrubbable_turntable(asset)
+            or asset.id in self._failed_asset_ids
+        ):
+            self.stop()
+            return
+        if asset.id != self._active_asset_id or not self._scrub_active:
+            self.stop()
+            self._active_index = QPersistentModelIndex(index)
+            self._active_asset_id = asset.id
+            self._scrub_active = True
+            self._scrub_decoder_ready = False
+            self.player.setSource(QUrl.fromLocalFile(str(asset.preview_path)))
+            self.player.pause()
+        span = max(1, preview_rect.width() - 1)
+        ratio = (pointer_x - preview_rect.left()) / span
+        self._pending_scrub_position = self._turntable_position(asset, ratio)
+        if not self.scrub_timer.isActive():
+            self.scrub_timer.start()
+
+    def _apply_pending_scrub(self, *, force: bool = False) -> None:
+        position = self._pending_scrub_position
+        if (
+            not self._scrub_active
+            or not self._scrub_decoder_ready
+            or position is None
+            or (position == self._last_scrub_position and not force)
+        ):
+            return
+        self.player.pause()
+        self.player.setPosition(position)
+        self._last_scrub_position = position
+
+    def _scrub_decoder_became_ready(self) -> None:
+        if self._scrub_active and not self._scrub_decoder_ready:
+            self._scrub_decoder_ready = True
+            self.player.pause()
+            self._last_scrub_position = None
+            self._apply_pending_scrub(force=True)
+
+    def _duration_changed(self, duration: int) -> None:
+        if self._scrub_active and duration > 0:
+            self.player.pause()
 
     def _start_pending(self) -> None:
         if not self.enabled or self.suspended or not self._pending_index.isValid():
@@ -1364,6 +1549,10 @@ class StockHoverPreviewController(QObject):
         self._active_index = self._pending_index
         self._pending_index = QPersistentModelIndex()
         self._active_asset_id = asset.id
+        self._scrub_active = False
+        self._scrub_decoder_ready = False
+        self._pending_scrub_position = None
+        self._last_scrub_position = None
         self.player.setSource(QUrl.fromLocalFile(str(asset.preview_path)))
         self.player.setPosition(0)
         self.player.play()
@@ -1374,6 +1563,7 @@ class StockHoverPreviewController(QObject):
         image = frame.toImage()
         if image.isNull():
             return
+        self._scrub_decoder_became_ready()
         self.delegate.set_hover_frame(
             self._active_asset_id, QPixmap.fromImage(image)
         )
@@ -1519,6 +1709,8 @@ class DetailPanel(QFrame):
     model_rescan_canceled = pyqtSignal()
     hdri_render_requested = pyqtSignal(object)
     hdri_render_canceled = pyqtSignal()
+    vdb_render_requested = pyqtSignal(object, str, int, str)
+    vdb_render_canceled = pyqtSignal()
     houdini_send_requested = pyqtSignal(object, str, str, object)
     houdini_refresh_requested = pyqtSignal()
     blender_send_requested = pyqtSignal(object, str, str, object)
@@ -1692,12 +1884,48 @@ class DetailPanel(QFrame):
         self.model_rescan_status.setWordWrap(True)
         self.hdri_render_button = QPushButton("Render preview")
         self.hdri_render_button.setObjectName("primaryButton")
-        self.hdri_render_button.clicked.connect(lambda: self._asset and self.hdri_render_requested.emit(self._asset))
+        self.hdri_render_button.clicked.connect(
+            self._request_primary_preview_render
+        )
+        self.vdb_preview_menu = QMenu(self.hdri_render_button)
+        self.vdb_still_action = QAction("Still", self.vdb_preview_menu)
+        self.vdb_turntable_action = QAction(
+            "Generate turn table", self.vdb_preview_menu
+        )
+        self.vdb_preview_menu.addAction(self.vdb_still_action)
+        self.vdb_preview_menu.addAction(self.vdb_turntable_action)
+        self.vdb_still_action.triggered.connect(
+            lambda _checked=False: self._request_preview_render("still")
+        )
+        self.vdb_turntable_action.triggered.connect(
+            lambda _checked=False: self._request_preview_render("turntable")
+        )
         self.hdri_cancel_button = QPushButton("Cancel render")
-        self.hdri_cancel_button.clicked.connect(self.hdri_render_canceled)
+        self.hdri_cancel_button.clicked.connect(self._cancel_preview_render)
         self.hdri_render_status = QLabel()
         self.hdri_render_status.setObjectName("mutedLabel")
         self.hdri_render_status.setWordWrap(True)
+        self.vdb_preview_variant_label = QLabel("Preview variant")
+        self.vdb_preview_variant_label.setObjectName("mutedLabel")
+        self.vdb_preview_variant = QComboBox()
+        self.vdb_preview_variant.setToolTip(
+            "Select the managed VDB variant used for this still preview."
+        )
+        self.vdb_density_label = QLabel("Density")
+        self.vdb_density_label.setObjectName("mutedLabel")
+        self.vdb_density_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vdb_density_slider.setRange(10, 500)
+        self.vdb_density_slider.setValue(100)
+        self.vdb_density_slider.setMinimumWidth(120)
+        self.vdb_density_slider.setToolTip(
+            "Set the Karma Pyro shader density scale from 10 to 500."
+        )
+        self.vdb_density_value = QLabel("100")
+        self.vdb_density_value.setMinimumWidth(28)
+        self.vdb_density_value.setObjectName("mutedLabel")
+        self.vdb_density_slider.valueChanged.connect(
+            lambda value: self.vdb_density_value.setText(str(value))
+        )
         self.polyhaven_check_button = QPushButton("Check online resolutions")
         self.polyhaven_check_button.clicked.connect(
             lambda: self._asset and self.polyhaven_check_requested.emit(self._asset)
@@ -1820,8 +2048,15 @@ class DetailPanel(QFrame):
         asset_actions.addWidget(self.view_3d_button)
         asset_actions.addWidget(self.model_convert_button)
         asset_actions.addWidget(self.model_rescan_button)
+        asset_actions.addWidget(self.vdb_preview_variant_label)
+        asset_actions.addWidget(self.vdb_preview_variant)
         asset_actions.addWidget(self.hdri_render_button)
         asset_actions.addStretch()
+        vdb_density_actions = QHBoxLayout()
+        vdb_density_actions.setSpacing(6)
+        vdb_density_actions.addWidget(self.vdb_density_label)
+        vdb_density_actions.addWidget(self.vdb_density_slider, 1)
+        vdb_density_actions.addWidget(self.vdb_density_value)
         path_actions = QHBoxLayout()
         path_actions.setSpacing(6)
         path_actions.addWidget(self.path_button)
@@ -1875,6 +2110,7 @@ class DetailPanel(QFrame):
         layout.addLayout(primary_actions)
         layout.addWidget(self.ai_status)
         layout.addLayout(asset_actions)
+        layout.addLayout(vdb_density_actions)
         layout.addLayout(path_actions)
         layout.addWidget(self.hdri_cancel_button)
         layout.addWidget(self.hdri_render_status)
@@ -1937,8 +2173,14 @@ class DetailPanel(QFrame):
         self.model_rescan_cancel.hide()
         self.model_rescan_status.hide()
         self.hdri_render_button.hide()
+        self.hdri_render_button.setMenu(None)
         self.hdri_cancel_button.hide()
         self.hdri_render_status.hide()
+        self.vdb_preview_variant_label.hide()
+        self.vdb_preview_variant.hide()
+        self.vdb_density_label.hide()
+        self.vdb_density_slider.hide()
+        self.vdb_density_value.hide()
         self.model_convert_cancel.hide()
         self.model_convert_status.hide()
         for widget in (
@@ -1960,8 +2202,14 @@ class DetailPanel(QFrame):
         self.stock_player_error.clear()
         self._asset = asset
         self.hdri_render_button.hide()
+        self.hdri_render_button.setMenu(None)
         self.hdri_cancel_button.hide()
         self.hdri_render_status.hide()
+        self.vdb_preview_variant_label.hide()
+        self.vdb_preview_variant.hide()
+        self.vdb_density_label.hide()
+        self.vdb_density_slider.hide()
+        self.vdb_density_value.hide()
         self.model_rescan_cancel.hide()
         self.model_rescan_status.hide()
         self.export_footer.hide()
@@ -1980,7 +2228,7 @@ class DetailPanel(QFrame):
             and asset.preview_path.is_file()
         )
         self.stock_player_frame.setVisible(has_video_preview)
-        self.hero.setVisible(not has_video_preview)
+        self.hero.setVisible(not has_video_preview or isinstance(asset, LibraryVdbAsset))
         if has_video_preview:
             self.stock_player.setSource(QUrl.fromLocalFile(str(asset.preview_path)))
         if is_stock:
@@ -2191,6 +2439,49 @@ class DetailPanel(QFrame):
                 f"<span style='color:#8792a1'>Playback</span><br>"
                 f"{'Source frame numbers are preserved' if asset.is_sequence else 'Static volume variants'}"
             )
+            labels = self._ordered_vdb_variants(asset)
+            self.vdb_preview_variant.clear()
+            self.vdb_preview_variant.addItems(labels)
+            rendered_variant = str(asset.preview_render.get("variant", ""))
+            default_variant = self._default_vdb_variant(labels)
+            self.vdb_preview_variant.setCurrentText(default_variant)
+            try:
+                density_scale = int(
+                    asset.preview_render.get("density_scale", 100)
+                )
+            except (TypeError, ValueError):
+                density_scale = 100
+            density_scale = max(10, min(500, density_scale))
+            self.vdb_density_slider.setValue(density_scale)
+            self.vdb_preview_variant_label.show()
+            self.vdb_preview_variant.show()
+            self.vdb_density_label.show()
+            self.vdb_density_slider.show()
+            self.vdb_density_value.show()
+            render = asset.preview_render
+            status = str(render.get("status", "pending"))
+            diagnostic = str(render.get("diagnostic", ""))
+            self.hdri_render_button.setText(
+                "Regenerate preview" if status == "ready" else "Generate preview"
+            )
+            self.hdri_render_button.setMenu(self.vdb_preview_menu)
+            self.hdri_render_button.setEnabled(bool(labels))
+            self.hdri_render_button.show()
+            self.hdri_render_status.setText(
+                (
+                    f"Houdini {'turntable' if render.get('mode') == 'turntable' else 'still'} ready · "
+                    f"{rendered_variant} · "
+                    f"{'frames 1–50' if render.get('mode') == 'turntable' else 'frame 1'}"
+                    if status == "ready" and rendered_variant
+                    else "Houdini preview ready"
+                    if status == "ready"
+                    else diagnostic or f"Preview render: {status}"
+                )
+            )
+            self.hdri_render_status.setStyleSheet(
+                "color:#78c995;" if status == "ready" else "color:#e6b566;"
+            )
+            self.hdri_render_status.show()
             self._configure_vdb_dcc(asset)
         elif isinstance(asset, LibraryStockAsset):
             info = asset.media_info
@@ -2681,14 +2972,10 @@ class DetailPanel(QFrame):
         self.export_footer.show()
 
     def _configure_vdb_dcc(self, asset: LibraryVdbAsset) -> None:
-        labels = list(asset.variants)
-        order = {"low": 0, "mid": 1, "high": 2}
-        labels.sort(key=lambda label: (order.get(label.casefold(), 99), label.casefold()))
+        labels = self._ordered_vdb_variants(asset)
         self.houdini_resolution.clear()
         self.houdini_resolution.addItems(labels)
-        default = next((label for label in labels if label.casefold() == "mid"), "")
-        if not default:
-            default = next((label for label in labels if label.casefold() == "low"), labels[0] if labels else "")
+        default = self._default_vdb_variant(labels)
         self.houdini_resolution.setCurrentText(default)
         self.houdini_target.hide()
         self.houdini_send_button.setText("Create File SOP in Houdini")
@@ -2699,14 +2986,57 @@ class DetailPanel(QFrame):
         self.dcc_stack.show()
         self.export_footer.show()
 
+    @staticmethod
+    def _ordered_vdb_variants(asset: LibraryVdbAsset) -> list[str]:
+        labels = list(asset.variants)
+        order = {"low": 0, "mid": 1, "high": 2}
+        labels.sort(
+            key=lambda label: (order.get(label.casefold(), 99), label.casefold())
+        )
+        return labels
+
+    @staticmethod
+    def _default_vdb_variant(labels: list[str]) -> str:
+        for preferred in ("mid", "low", "high"):
+            match = next(
+                (label for label in labels if label.casefold() == preferred), ""
+            )
+            if match:
+                return match
+        return labels[0] if labels else ""
+
+    def _request_preview_render(self, mode: str = "still") -> None:
+        if isinstance(self._asset, LibraryVdbAsset):
+            self.vdb_render_requested.emit(
+                self._asset,
+                self.vdb_preview_variant.currentText(),
+                self.vdb_density_slider.value(),
+                mode,
+            )
+        elif self._asset is not None:
+            self.hdri_render_requested.emit(self._asset)
+
+    def _request_primary_preview_render(self) -> None:
+        if not isinstance(self._asset, LibraryVdbAsset):
+            self._request_preview_render("still")
+
+    def _cancel_preview_render(self) -> None:
+        if isinstance(self._asset, LibraryVdbAsset):
+            self.vdb_render_canceled.emit()
+        else:
+            self.hdri_render_canceled.emit()
+
     def set_hdri_rendering(self, active: bool, message: str = "") -> None:
         if not (
             isinstance(self._asset, LibraryHdriAsset)
             or isinstance(self._asset, LibraryTextureAsset)
             and self._asset.asset_type == "texture_set"
+            or isinstance(self._asset, LibraryVdbAsset)
         ):
             return
         self.hdri_render_button.setEnabled(not active)
+        self.vdb_preview_variant.setEnabled(not active)
+        self.vdb_density_slider.setEnabled(not active)
         self.hdri_cancel_button.setVisible(active)
         if message:
             self.hdri_render_status.setText(message)
@@ -2835,6 +3165,9 @@ class PreviewRenderJob:
     asset_type: str
     asset_name: str
     notify_failure: bool = False
+    variant: str = ""
+    density_scale: int = 100
+    mode: str = "still"
 
 
 class HdriRenderWorker(QRunnable):
@@ -2845,6 +3178,12 @@ class HdriRenderWorker(QRunnable):
         blender_path: str,
         token: CancelToken,
         asset_type: str = "hdri",
+        houdini_path: str = "",
+        ffmpeg_path: str = "",
+        variant: str = "",
+        density_scale: int = 100,
+        mode: str = "still",
+        parallel_processes: int = 2,
         save_texture_preview_blend: bool = False,
         preview_session: BlenderPreviewSession | None = None,
     ) -> None:
@@ -2854,6 +3193,12 @@ class HdriRenderWorker(QRunnable):
         self.blender_path = blender_path
         self.token = token
         self.asset_type = asset_type
+        self.houdini_path = houdini_path
+        self.ffmpeg_path = ffmpeg_path
+        self.variant = variant
+        self.density_scale = density_scale
+        self.mode = mode
+        self.parallel_processes = parallel_processes
         self.save_texture_preview_blend = bool(
             save_texture_preview_blend
         )
@@ -2865,21 +3210,34 @@ class HdriRenderWorker(QRunnable):
             repository = LibraryRepository(
                 self.library_path,
                 blender_path=self.blender_path,
+                houdini_path=self.houdini_path,
+                ffmpeg_path=self.ffmpeg_path,
+                vdb_parallel_renders=self.parallel_processes,
                 save_texture_preview_blend=(
                     self.save_texture_preview_blend
                 ),
             )
-            renderer = (
-                repository.render_texture_preview
-                if self.asset_type == "texture_set"
-                else repository.render_hdri_preview
-            )
-            result = renderer(
-                self.asset_id,
-                progress=self.signals.progress.emit,
-                cancel_token=self.token,
-                preview_session=self.preview_session,
-            )
+            if self.asset_type == "vdb":
+                result = repository.render_vdb_preview(
+                    self.asset_id,
+                    self.variant,
+                    density_scale=self.density_scale,
+                    mode=self.mode,
+                    progress=self.signals.progress.emit,
+                    cancel_token=self.token,
+                )
+            else:
+                renderer = (
+                    repository.render_texture_preview
+                    if self.asset_type == "texture_set"
+                    else repository.render_hdri_preview
+                )
+                result = renderer(
+                    self.asset_id,
+                    progress=self.signals.progress.emit,
+                    cancel_token=self.token,
+                    preview_session=self.preview_session,
+                )
         except Exception:
             self._emit("failed", traceback.format_exc(limit=5))
         else:
@@ -3338,6 +3696,9 @@ class AssetsTab(QWidget):
         super().__init__()
         self._library_path = ""
         self._blender_path = ""
+        self._houdini_path = ""
+        self._ffmpeg_path = ""
+        self._vdb_parallel_renders = 2
         self._save_texture_preview_blend = False
         self._render_hdri_previews_on_import = True
         self._render_texture_previews_on_import = True
@@ -3508,6 +3869,8 @@ class AssetsTab(QWidget):
         self.detail.model_rescan_canceled.connect(self._cancel_model_rescan)
         self.detail.hdri_render_requested.connect(self._render_hdri_preview)
         self.detail.hdri_render_canceled.connect(self._cancel_hdri_render)
+        self.detail.vdb_render_requested.connect(self._render_vdb_preview)
+        self.detail.vdb_render_canceled.connect(self._cancel_hdri_render)
         self.detail.houdini_refresh_requested.connect(self.refresh_houdini_sessions)
         self.detail.houdini_send_requested.connect(self._send_hdri_to_houdini)
         self.detail.blender_refresh_requested.connect(self.refresh_blender_sessions)
@@ -3591,10 +3954,27 @@ class AssetsTab(QWidget):
         bulk_layout.addWidget(self.bulk_ai_button)
         self.bulk_preview_button = QPushButton("Queue Previews")
         self.bulk_preview_button.setToolTip(
-            "Add the selected texture or HDRI previews to the Blender queue."
+            "Add the selected assets to the preview render queue."
+        )
+        self.bulk_vdb_preview_menu = QMenu(self.bulk_preview_button)
+        self.bulk_vdb_still_action = QAction(
+            "Still previews", self.bulk_vdb_preview_menu
+        )
+        self.bulk_vdb_turntable_action = QAction(
+            "Turntable previews", self.bulk_vdb_preview_menu
+        )
+        self.bulk_vdb_preview_menu.addAction(self.bulk_vdb_still_action)
+        self.bulk_vdb_preview_menu.addAction(
+            self.bulk_vdb_turntable_action
+        )
+        self.bulk_vdb_still_action.triggered.connect(
+            lambda _checked=False: self._queue_selected_previews("still")
+        )
+        self.bulk_vdb_turntable_action.triggered.connect(
+            lambda _checked=False: self._queue_selected_previews("turntable")
         )
         self.bulk_preview_button.clicked.connect(
-            self._queue_selected_previews
+            self._bulk_preview_clicked
         )
         self.bulk_preview_button.hide()
         bulk_layout.addWidget(self.bulk_preview_button)
@@ -4877,11 +5257,29 @@ class AssetsTab(QWidget):
             isinstance(asset, LibraryHdriAsset)
             or isinstance(asset, LibraryTextureAsset)
             and asset.asset_type == "texture_set"
+            or isinstance(asset, LibraryVdbAsset)
             for asset in assets
         )
-        self.bulk_preview_button.setText(
-            f"Queue Previews ({renderable_count})"
+        vdb_count = sum(
+            isinstance(asset, LibraryVdbAsset) for asset in assets
         )
+        if vdb_count:
+            self.bulk_preview_button.setText(
+                f"Generate Previews ({vdb_count})"
+            )
+            self.bulk_preview_button.setMenu(self.bulk_vdb_preview_menu)
+            self.bulk_preview_button.setToolTip(
+                "Generate still or turntable previews for all selected VDBs "
+                "using the current preview variant and density."
+            )
+        else:
+            self.bulk_preview_button.setText(
+                f"Queue Previews ({renderable_count})"
+            )
+            self.bulk_preview_button.setMenu(None)
+            self.bulk_preview_button.setToolTip(
+                "Add the selected assets to the preview render queue."
+            )
         self.bulk_preview_button.setVisible(
             count > 1 and renderable_count > 0
         )
@@ -4910,7 +5308,17 @@ class AssetsTab(QWidget):
         self.view.setCurrentIndex(QModelIndex())
         self.detail.clear()
 
-    def _queue_selected_previews(self) -> None:
+    def _bulk_preview_clicked(self, _checked: bool = False) -> None:
+        if any(
+            isinstance(asset, LibraryVdbAsset)
+            for asset in self._selected_assets()
+        ):
+            return
+        self._queue_selected_previews("still")
+
+    def _queue_selected_previews(self, mode: str = "still") -> None:
+        if mode not in {"still", "turntable"}:
+            mode = "still"
         selected = self._selected_assets()
         renderable = tuple(
             asset
@@ -4918,9 +5326,23 @@ class AssetsTab(QWidget):
             if isinstance(asset, LibraryHdriAsset)
             or isinstance(asset, LibraryTextureAsset)
             and asset.asset_type == "texture_set"
+            or isinstance(asset, LibraryVdbAsset)
+        )
+        vdbs = tuple(
+            asset for asset in renderable
+            if isinstance(asset, LibraryVdbAsset)
+        )
+        requested_variant = (
+            self.detail.vdb_preview_variant.currentText()
+            if isinstance(self.detail._asset, LibraryVdbAsset)
+            else "Mid"
         )
         added = self.queue_preview_renders(
-            renderable, automatic=False
+            renderable,
+            automatic=False,
+            vdb_variant=requested_variant if vdbs else "",
+            vdb_density_scale=self.detail.vdb_density_slider.value(),
+            vdb_mode=str(mode),
         )
         skipped = len(renderable) - added
         message = f"Added {added} preview render(s)"
@@ -5044,6 +5466,42 @@ class AssetsTab(QWidget):
         self._render_texture_previews_on_import = bool(
             render_texture_on_import
         )
+
+    def set_vdb_preview_settings(
+        self,
+        houdini_path: str,
+        ffmpeg_path: str = "",
+        parallel_renders: int = 2,
+    ) -> None:
+        parallel_renders = max(1, min(4, int(parallel_renders)))
+        if (
+            houdini_path == self._houdini_path
+            and ffmpeg_path == self._ffmpeg_path
+            and parallel_renders == self._vdb_parallel_renders
+        ):
+            return
+        self._houdini_path = houdini_path
+        self._ffmpeg_path = ffmpeg_path
+        self._vdb_parallel_renders = parallel_renders
+        pending_ids = {
+            job.asset_id
+            for job in self._preview_render_jobs
+            if job.asset_type == "vdb"
+        }
+        self._preview_render_jobs = [
+            job for job in self._preview_render_jobs
+            if job.asset_type != "vdb"
+        ]
+        self._preview_render_ids.difference_update(pending_ids)
+        self.card_delegate.clear_task_states(pending_ids)
+        active = self._active_preview_render_job
+        if (
+            active is not None
+            and active.asset_type == "vdb"
+            and self._hdri_render_token is not None
+        ):
+            self._hdri_render_token.cancel()
+        self._update_preview_queue_controls()
 
     def refresh_houdini_sessions(self) -> None:
         if self._houdini_worker is not None:
@@ -5258,6 +5716,21 @@ class AssetsTab(QWidget):
     def _render_hdri_preview(self, asset: AssetRecord) -> None:
         self.queue_preview_renders((asset,), automatic=False)
 
+    def _render_vdb_preview(
+        self,
+        asset: AssetRecord,
+        variant: str,
+        density_scale: int,
+        mode: str,
+    ) -> None:
+        self.queue_preview_renders(
+            (asset,),
+            automatic=False,
+            vdb_variant=variant,
+            vdb_density_scale=density_scale,
+            vdb_mode=mode,
+        )
+
     def queue_import_previews(self, assets) -> int:
         """Queue missing previews after imports have been published."""
         eligible = []
@@ -5279,14 +5752,28 @@ class AssetsTab(QWidget):
         return self.queue_preview_renders(eligible, automatic=True)
 
     def queue_preview_renders(
-        self, assets, *, automatic: bool = False
+        self,
+        assets,
+        *,
+        automatic: bool = False,
+        vdb_variant: str = "",
+        vdb_density_scale: int = 100,
+        vdb_mode: str = "still",
     ) -> int:
         added = 0
         new_jobs = []
         for asset in assets:
+            selected_vdb_variant = (
+                self._vdb_preview_variant(asset, vdb_variant)
+                if isinstance(asset, LibraryVdbAsset) and vdb_variant
+                else ""
+            )
             renderable = isinstance(asset, LibraryHdriAsset) or (
                 isinstance(asset, LibraryTextureAsset)
                 and asset.asset_type == "texture_set"
+            ) or (
+                isinstance(asset, LibraryVdbAsset)
+                and bool(selected_vdb_variant)
             )
             if (
                 not renderable
@@ -5301,6 +5788,13 @@ class AssetsTab(QWidget):
                     asset.asset_type,
                     asset.name,
                     notify_failure=not automatic,
+                    variant=selected_vdb_variant,
+                    density_scale=(
+                        vdb_density_scale
+                        if isinstance(asset, LibraryVdbAsset)
+                        else 100
+                    ),
+                    mode=vdb_mode if isinstance(asset, LibraryVdbAsset) else "still",
                 )
             )
             self._preview_render_ids.add(asset.id)
@@ -5318,6 +5812,25 @@ class AssetsTab(QWidget):
         self._update_preview_queue_controls()
         self._sync_preview_render_status()
         return added
+
+    @staticmethod
+    def _vdb_preview_variant(
+        asset: LibraryVdbAsset,
+        requested: str,
+    ) -> str:
+        requested = requested.strip()
+        if requested:
+            match = next(
+                (
+                    label for label in asset.variants
+                    if label.casefold() == requested.casefold()
+                ),
+                "",
+            )
+            if match:
+                return match
+        labels = DetailPanel._ordered_vdb_variants(asset)
+        return DetailPanel._default_vdb_variant(labels)
 
     def _start_next_preview_render(self) -> None:
         if self._hdri_render_worker is not None:
@@ -5339,22 +5852,36 @@ class AssetsTab(QWidget):
             self._sync_preview_render_status()
             return
         self._active_preview_render_job = job
+        application = "Houdini" if job.asset_type == "vdb" else "Blender"
+        task_message = (
+            "Rendering VDB turntable in Houdini"
+            if job.asset_type == "vdb" and job.mode == "turntable"
+            else f"Rendering preview in {application}"
+        )
         self.card_delegate.set_task_state(
             job.asset_id,
             "preview_rendering",
-            "Rendering preview in Blender",
+            task_message,
         )
         token = CancelToken()
-        if self._preview_session is None:
+        if job.asset_type != "vdb" and self._preview_session is None:
             self._preview_session = BlenderPreviewSession(self._blender_path)
         worker = HdriRenderWorker(
             job.library_path,
             job.asset_id,
             self._blender_path,
             token,
-            job.asset_type,
-            self._save_texture_preview_blend,
-            self._preview_session,
+            asset_type=job.asset_type,
+            houdini_path=self._houdini_path,
+            ffmpeg_path=self._ffmpeg_path,
+            variant=job.variant,
+            density_scale=job.density_scale,
+            mode=job.mode,
+            parallel_processes=self._vdb_parallel_renders,
+            save_texture_preview_blend=self._save_texture_preview_blend,
+            preview_session=(
+                None if job.asset_type == "vdb" else self._preview_session
+            ),
         )
         self._hdri_render_token = token
         self._hdri_render_worker = worker
@@ -5365,7 +5892,7 @@ class AssetsTab(QWidget):
         )
         worker.signals.finished.connect(self._hdri_render_finished)
         worker.signals.failed.connect(self._hdri_render_failed)
-        self._sync_preview_render_status("Starting Blender…")
+        self._sync_preview_render_status(f"Starting {application}…")
         QThreadPool.globalInstance().start(worker)
 
     def _cancel_hdri_render(self) -> None:
@@ -5379,7 +5906,10 @@ class AssetsTab(QWidget):
             and self._hdri_render_token
         ):
             self._hdri_render_token.cancel()
-            self.detail.set_hdri_rendering(True, "Canceling Blender safely…")
+            application = "Houdini" if active.asset_type == "vdb" else "Blender"
+            self.detail.set_hdri_rendering(
+                True, f"Canceling {application} safely…"
+            )
             return
         before = len(self._preview_render_jobs)
         self._preview_render_jobs = [

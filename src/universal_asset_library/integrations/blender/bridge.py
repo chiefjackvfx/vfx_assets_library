@@ -16,7 +16,7 @@ from .paths import config_path, runtime_dir
 
 
 PROTOCOL_VERSION = 1
-BRIDGE_VERSION = "0.4.2"
+BRIDGE_VERSION = "0.4.3"
 MAX_MESSAGE_BYTES = 64 * 1024
 WORLD_MODES = ("new", "edit_current")
 

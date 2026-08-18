@@ -54,11 +54,13 @@ class AppSettings:
     default_import_category: str = DEFAULT_IMPORT_CATEGORY
     default_model_category: str = DEFAULT_IMPORT_CATEGORY
     blender_path: str = ""
+    houdini_path: str = ""
     render_hdri_on_import: bool = True
     render_texture_on_import: bool = True
     save_texture_preview_blend: bool = False
     ffmpeg_path: str = ""
     stock_hover_previews: bool = True
+    vdb_parallel_renders: int = 2
 
     def normalized(self) -> "AppSettings":
         library_path = normalize_library_path(self.library_path)
@@ -74,6 +76,7 @@ class AppSettings:
             default_import_category=category,
             default_model_category=model_category,
             blender_path=normalize_executable_path(self.blender_path),
+            houdini_path=normalize_executable_path(self.houdini_path),
             render_hdri_on_import=bool(self.render_hdri_on_import),
             render_texture_on_import=bool(self.render_texture_on_import),
             save_texture_preview_blend=bool(
@@ -81,6 +84,9 @@ class AppSettings:
             ),
             ffmpeg_path=normalize_executable_path(self.ffmpeg_path),
             stock_hover_previews=bool(self.stock_hover_previews),
+            vdb_parallel_renders=max(
+                1, min(4, _setting_int(self.vdb_parallel_renders, 2))
+            ),
         )
 
 
@@ -95,6 +101,7 @@ class SettingsStore:
             default_import_category=str(self._settings.value("import/default_category", DEFAULT_IMPORT_CATEGORY)),
             default_model_category=str(self._settings.value("import/default_model_category", DEFAULT_IMPORT_CATEGORY)),
             blender_path=str(self._settings.value("tools/blender_path", "") or ""),
+            houdini_path=str(self._settings.value("tools/houdini_path", "") or ""),
             render_hdri_on_import=_setting_bool(self._settings.value("previews/render_hdri_on_import", True)),
             render_texture_on_import=_setting_bool(
                 self._settings.value("previews/render_texture_on_import", True)
@@ -108,6 +115,9 @@ class SettingsStore:
             stock_hover_previews=_setting_bool(
                 self._settings.value("display/stock_hover_previews", True)
             ),
+            vdb_parallel_renders=_setting_int(
+                self._settings.value("previews/vdb_parallel_renders", 2), 2
+            ),
         ).normalized()
 
     def save(self, settings: AppSettings) -> AppSettings:
@@ -120,6 +130,7 @@ class SettingsStore:
         self._settings.setValue("import/default_category", normalized.default_import_category)
         self._settings.setValue("import/default_model_category", normalized.default_model_category)
         self._settings.setValue("tools/blender_path", normalized.blender_path)
+        self._settings.setValue("tools/houdini_path", normalized.houdini_path)
         self._settings.setValue("previews/render_hdri_on_import", normalized.render_hdri_on_import)
         self._settings.setValue(
             "previews/render_texture_on_import",
@@ -133,6 +144,10 @@ class SettingsStore:
         self._settings.setValue(
             "display/stock_hover_previews", normalized.stock_hover_previews
         )
+        self._settings.setValue(
+            "previews/vdb_parallel_renders",
+            normalized.vdb_parallel_renders,
+        )
         self._settings.sync()
         if self._settings.status() != QSettings.Status.NoError:
             raise OSError("The application settings could not be written.")
@@ -143,3 +158,10 @@ def _setting_bool(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().casefold() not in {"", "0", "false", "no", "off"}
     return bool(value)
+
+
+def _setting_int(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default

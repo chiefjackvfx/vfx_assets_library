@@ -46,6 +46,21 @@ def test_blender_and_hdri_render_preferences_round_trip(tmp_path) -> None:
     assert store.load() == saved
 
 
+def test_houdini_preview_path_round_trip(tmp_path) -> None:
+    store = make_store(tmp_path)
+    executable = tmp_path / "hython"
+    executable.write_bytes(b"fixture")
+
+    saved = store.save(AppSettings(
+        houdini_path=str(executable),
+        vdb_parallel_renders=4,
+    ))
+
+    assert saved.houdini_path == str(executable)
+    assert saved.vdb_parallel_renders == 4
+    assert store.load() == saved
+
+
 def test_ffmpeg_path_round_trip(tmp_path) -> None:
     store = make_store(tmp_path)
     executable = tmp_path / "ffmpeg"

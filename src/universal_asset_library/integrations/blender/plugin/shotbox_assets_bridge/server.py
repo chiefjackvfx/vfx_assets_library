@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import queue
@@ -16,8 +17,9 @@ from .protocol import encode_message, receive_message
 
 
 PROTOCOL_VERSION = 1
-BRIDGE_VERSION = "0.4.2"
+BRIDGE_VERSION = "0.4.3"
 REQUEST_TIMEOUT = 300.0
+THREAD_JOIN_TIMEOUT = 2.0
 
 
 def _config_path():
@@ -63,6 +65,11 @@ class BridgeServer:
         self.port = self.listener.getsockname()[1]
         self.pending = queue.Queue()
         self.stopping = threading.Event()
+        self._stop_lock = threading.Lock()
+        self._connections_lock = threading.Lock()
+        self._connections = set()
+        self._workers = set()
+        self._stopped = False
         self.thread = threading.Thread(target=self._listen, name="ShotBoxBlenderBridge", daemon=True)
         self.descriptor_path = _runtime_dir() / f"session-{self.session_id}.json"
         self.last_result = "Waiting for an asset from ShotBox Assets."
@@ -72,29 +79,61 @@ class BridgeServer:
         self.cached_session_data = actions.session_data(self.bpy)
 
     def start(self):
-        self._token()
-        self.descriptor_path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_descriptor()
-        self.thread.start()
-        self.bpy.app.timers.register(self.process_pending, first_interval=0.1, persistent=True)
-
-    def stop(self):
-        self.stopping.set()
         try:
-            self.listener.close()
-        except OSError:
-            pass
-        try:
-            if self.bpy.app.timers.is_registered(self.process_pending):
-                self.bpy.app.timers.unregister(self.process_pending)
+            self._token()
+            self.descriptor_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_descriptor()
+            self.thread.start()
+            self.bpy.app.timers.register(self.process_pending, first_interval=0.1, persistent=True)
         except Exception:
-            pass
-        try:
-            self.descriptor_path.unlink()
-        except OSError:
-            pass
+            self.stop()
+            raise
+
+    def stop(self, unregister_timer=True):
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            self.stopping.set()
+            self._fail_pending("Blender is shutting down.")
+            try:
+                self.listener.close()
+            except OSError:
+                pass
+            with self._connections_lock:
+                connections = tuple(self._connections)
+                workers = tuple(self._workers)
+            for connection in connections:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+            if unregister_timer:
+                try:
+                    if self.bpy.app.timers.is_registered(self.process_pending):
+                        self.bpy.app.timers.unregister(self.process_pending)
+                except Exception:
+                    pass
+            current = threading.current_thread()
+            if self.thread is not current and self.thread.is_alive():
+                self.thread.join(THREAD_JOIN_TIMEOUT)
+            for worker in workers:
+                if worker is not current and worker.is_alive():
+                    worker.join(THREAD_JOIN_TIMEOUT)
+            self._fail_pending("Blender is shutting down.")
+            try:
+                self.descriptor_path.unlink()
+            except OSError:
+                pass
 
     def process_pending(self):
+        if self.stopping.is_set():
+            self._fail_pending("Blender is shutting down.")
+            return None
         for _index in range(8):
             try:
                 pending = self.pending.get_nowait()
@@ -133,7 +172,27 @@ class BridgeServer:
                 continue
             except OSError:
                 break
-            threading.Thread(target=self._handle, args=(connection,), daemon=True).start()
+            worker = threading.Thread(
+                target=self._handle_connection,
+                args=(connection,),
+                name="ShotBoxBlenderBridgeClient",
+                daemon=True,
+            )
+            with self._connections_lock:
+                if self.stopping.is_set():
+                    connection.close()
+                    break
+                self._connections.add(connection)
+                self._workers.add(worker)
+                worker.start()
+
+    def _handle_connection(self, connection):
+        try:
+            self._handle(connection)
+        finally:
+            with self._connections_lock:
+                self._connections.discard(connection)
+                self._workers.discard(threading.current_thread())
 
     def _handle(self, connection):
         with connection:
@@ -143,9 +202,19 @@ class BridgeServer:
                 request = receive_message(connection)
                 request_id = str(request.get("request_id", ""))
                 self._validate(request)
+                if self.stopping.is_set():
+                    raise RuntimeError("Blender is shutting down.")
                 pending = PendingRequest(request, time.monotonic() + REQUEST_TIMEOUT)
                 self.pending.put(pending)
-                if not pending.ready.wait(REQUEST_TIMEOUT):
+                while (
+                    not pending.ready.wait(0.1)
+                    and not self.stopping.is_set()
+                    and time.monotonic() < pending.deadline
+                ):
+                    pass
+                if self.stopping.is_set() and not pending.ready.is_set():
+                    response = self._failure(request_id, "Blender is shutting down.")
+                elif not pending.ready.is_set():
                     response = self._failure(request_id, "Blender did not process the request before it timed out.")
                 else:
                     response = pending.response
@@ -155,6 +224,16 @@ class BridgeServer:
                 connection.sendall(encode_message(response))
             except OSError:
                 pass
+
+    def _fail_pending(self, diagnostic):
+        while True:
+            try:
+                pending = self.pending.get_nowait()
+            except queue.Empty:
+                return
+            request_id = str(pending.request.get("request_id", ""))
+            pending.response = self._failure(request_id, diagnostic)
+            pending.ready.set()
 
     def _validate(self, request):
         if request.get("protocol_version") != PROTOCOL_VERSION:
@@ -209,9 +288,14 @@ _INSTANCE = None
 def start(bpy):
     global _INSTANCE
     if _INSTANCE is None:
-        _INSTANCE = BridgeServer(bpy)
-        _INSTANCE.start()
-        print(f"ShotBox Assets Blender Bridge {BRIDGE_VERSION} listening on 127.0.0.1:{_INSTANCE.port}")
+        bridge = BridgeServer(bpy)
+        try:
+            bridge.start()
+        except Exception:
+            bridge.stop()
+            raise
+        _INSTANCE = bridge
+        print(f"ShotBox Assets Blender Bridge {BRIDGE_VERSION} listening on 127.0.0.1:{bridge.port}")
     return _INSTANCE
 
 
@@ -224,3 +308,13 @@ def stop():
 
 def instance():
     return _INSTANCE
+
+
+def _stop_at_exit():
+    global _INSTANCE
+    if _INSTANCE is not None:
+        _INSTANCE.stop(unregister_timer=False)
+        _INSTANCE = None
+
+
+atexit.register(_stop_at_exit)

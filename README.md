@@ -6,11 +6,21 @@ The current milestone contains three surfaces:
 
 - **Assets** — searchable Textures, Atlases, HDRIs, Models, VDBs, and Stock sections loaded from portable manifests.
 - **Importer** — Texture/Atlas/HDRI/Model/VDB/Stock modes with provider-aware scanning, checked batch import, progress, cancellation, and duplicate protection.
-- **Settings** — persistent library path, thumbnail size, importer defaults, Blender and FFmpeg executables, and independent automatic texture/HDRI preview preferences.
+- **Settings** — persistent library path, thumbnail size, importer defaults, Blender, Houdini, and FFmpeg executables, and independent automatic texture/HDRI preview preferences.
 
 ## Run locally
 
 Python 3.11 or newer is required.
+
+On Linux, run:
+
+```bash
+./run_vfx_asset_library.sh
+```
+
+On Windows, double-click `run_vfx_asset_library.bat` or run it from Command Prompt. The launchers create `.venv` when needed, synchronize the editable installation on every start, and then open ShotBox Assets. An internet connection may be required while installing or updating dependencies.
+
+To set up and run the app manually instead:
 
 ```bash
 python -m venv .venv
@@ -43,6 +53,12 @@ Choose Blender in **Settings**, or leave the executable empty to search `PATH`. 
 Texture-set imports can use the immutable `templates/shader_preview.blend` scene to render a square 512×512 catalog thumbnail and a landscape 1024×512 inspector preview. ShotBox selects the highest managed resolution up to 4K (or the smallest larger variant), then rebuilds `Material.001` with the same complete Principled graph used by **Send material**. Every preferred supported map is included: Base Color, AO, Cavity, Roughness or inverted Glossiness, Metalness, Specular, Normal, Bump, Height, Displacement, Opacity, Emission, and Translucency, including supported channels extracted from packed textures. Base Color is required and DirectX normals are converted to the OpenGL convention. The template remains authoritative for its geometry, lighting, cameras, Cycles sampling, denoising, and color management.
 
 The `render_ball` camera produces `_Texture_Thumbnail.jpg` for catalog cards, while `render_plane` produces `_Texture_Preview.jpg` for the inspector hero. During import, Blender is requested only when the source contains no usable provider preview; an existing thumbnail or hero is retained unchanged. Desktop imports publish the asset first and place missing texture and HDRI renders into one background queue, which runs one Blender process at a time. Manual inspector requests move ahead of pending automatic jobs. Multiple texture or HDRI cards can also be selected and added together with **Queue Previews**. Queued and rendering cards display an animated loading circle, the toolbar reports queue length and can clear pending work, and selecting a queued asset allows that individual job to be canceled. Queue errors remain non-blocking and processing continues with the next asset. Missing-preview rendering has its own default-on Settings preference. A separate default-off debugging preference saves a self-contained `_Texture_Preview.blend` beside generated images in the managed asset's `previews/` folder; the material maps are packed into it so the exact render state can be opened after temporary import files are removed. Blender remains optional: a failed or unavailable render never fails the texture import. Texture details expose **Render preview** for a retained source image, or **Regenerate preview** after a shader render, with progress, cancellation, and diagnostics. Manual rendering verifies the unchanged manifest and every selected map hash before atomically publishing both images and, when enabled, the debug scene. Atlases retain their source previews.
+
+## Houdini VDB still previews
+
+VDB details provide a manual Low/Mid/High variant selector, a Karma Pyro density slider from 10–500 (default 100), and a **Generate preview** menu. **Still** renders timeline frame 1 to the existing JPEG preview. **Generate turn table** renders the template timeline from frame 1 through 50, uses the first frame as the JPEG hero/thumbnail, and encodes all 50 frames into a managed H.264 MP4 at the HIP frame rate. ShotBox launches Houdini 22 or newer headlessly, opens a staging copy of `templates/VDB_preview_v001.hip`, assigns the managed file to `/obj/VDB/file1`, sets `kma_pyroshader1`'s Density Scale, and renders `/stage/usdrender_rop1`. The authoritative template remains untouched and controls camera, animation, lighting, materials, Karma settings, sampling, and output resolution. Any readable resolution is accepted; odd dimensions are padded by at most one pixel for H.264 compatibility. Sequence variants use their padded `$F` expression and must contain source frame 1.
+
+Choose Houdini, hbatch, or hython in **Settings**, or leave the path empty to search installed Houdini 22+ versions. **Check Houdini** verifies the version and companion `iconvert` tool; turntables also require the configured or auto-detected FFmpeg. **Parallel VDB turntable renders** allows one to four simultaneous Houdini instances and defaults to two. The 50 frames are divided into contiguous ranges, each instance loads a separate staged HIP, and any worker failure or cancellation stops the complete group before encoding or publication. More instances require sufficient Houdini licenses, RAM, and GPU capacity. Temporary HIP copies, EXRs, and encoding files are written beneath the application folder's local `temp_cache/vdb-preview-<id>/` directory, keeping frame traffic off the managed library or network share. The job directory is discarded after success, failure, or cancellation; only the final JPEG and MP4 are atomically copied into the managed asset. VDB jobs share the serial preview queue but are manual-only: imports and bulk **Queue Previews** do not enqueue them. Cancellation terminates every active headless process tree. Failed, canceled, timed-out, or stale renders retain the previous preview, and neither the template, VDB, nor any HIP file is saved or modified.
 
 ## Houdini HDRI Bridge
 
@@ -81,16 +97,12 @@ Model assets also expose **Rescan asset** for files created or corrected manuall
 
 The bridge is separate from Blender-based HDRI preview rendering. Each interactive Blender process advertises its own authenticated ephemeral loopback port, and all Blender data changes are queued onto Blender's main thread. If a session is missing, restart Blender after installing, use **Refresh Connection**, and confirm both applications run as the same user with access to the managed library.
 
-## Poly Haven downloads
-
-Imported Poly Haven textures, HDRIs, and models expose an explicit **Poly Haven Downloads** section in the Assets inspector. **Check online resolutions** contacts the public API only on request. Texture assets can add higher-resolution PBR maps or a self-contained MaterialX package; HDRIs can add both HDR and EXR alternatives at another resolution; model assets can add self-contained USD/USDC packages. Every package includes all dependencies declared by Poly Haven and preserves their relative paths.
-
-The app displays file count, channels or dependency count, and total size before confirmation. Downloads run in the background with progress, cancellation, MD5 and SHA-256 verification, safe URL/path validation, and atomic publication under the library lock. Existing variants remain available; downloaded HDRIs prefer EXR when available, while the newest downloaded USD becomes the preferred model entry. Poly Haven USD entries are organized into `usd/` and their canonical textures into `maps/<resolution>/`. Because Poly Haven's binary USDC files retain relative `textures/...` references, `usd/textures/` contains compatibility hard links where the filesystem supports them, falling back to copies when necessary. If the live API is unavailable, preserved Poly Haven metadata can provide a clearly labelled cached catalog. Installed packages can be opened, copied, or revealed from the inspector. Powered by [Poly Haven](https://polyhaven.com).
 
 ## Current limitations
 
 - SQLite indexing is deferred; the catalog currently scans portable manifests.
 - Blender must be installed separately for rendered texture and HDRI previews; without it, imports retain their provider or generated fallback preview.
+- Houdini 22 or newer is required only for manual VDB still rendering; VDB import and Houdini 21/22 bridge sending remain available independently.
 - Blender model imports are editable snapshots; Houdini LOP and packed-SOP imports retain their external managed-USD reference.
 
 ## Importer behavior

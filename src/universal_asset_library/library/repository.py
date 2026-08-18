@@ -66,8 +66,11 @@ from universal_asset_library.previews import (
     TexturePreviewMap,
     TexturePreviewRequest,
     TexturePreviewResult,
+    VdbPreviewRequest,
+    VdbPreviewResult,
     render_hdri_preview,
     render_texture_preview,
+    render_vdb_preview,
     select_hdri_variant,
     select_texture_maps,
     select_texture_variant,
@@ -109,6 +112,7 @@ NAMING_VERSION = 2
 LAYOUT_VERSION = 2
 MODEL_LAYOUT_VERSION = 6
 STOCK_LAYOUT_VERSION = 2
+VDB_PREVIEW_CACHE_ROOT = Path(__file__).resolve().parents[3] / "temp_cache"
 SPACE_CUSHION = 64 * 1024 * 1024
 AssetRecord = (
     LibraryTextureAsset | LibraryHdriAsset | LibraryModelAsset | LibraryStockAsset | LibraryVdbAsset
@@ -160,6 +164,12 @@ class HdriPreviewUpdate:
 class TexturePreviewUpdate:
     asset: LibraryTextureAsset
     render: TexturePreviewResult
+
+
+@dataclass(frozen=True, slots=True)
+class VdbPreviewUpdate:
+    asset: LibraryVdbAsset
+    render: VdbPreviewResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +273,9 @@ class LibraryRepository:
         texture_template_path: str | Path | None = None,
         save_texture_preview_blend: bool = False,
         ffmpeg_path: str = "",
+        houdini_path: str = "",
+        vdb_template_path: str | Path | None = None,
+        vdb_parallel_renders: int = 2,
     ) -> None:
         self.root = Path(root).expanduser().absolute()
         self.last_warnings: list[str] = []
@@ -275,6 +288,9 @@ class LibraryRepository:
         )
         self.save_texture_preview_blend = bool(save_texture_preview_blend)
         self.ffmpeg_path = ffmpeg_path
+        self.houdini_path = houdini_path
+        self.vdb_template_path = Path(vdb_template_path) if vdb_template_path else None
+        self.vdb_parallel_renders = max(1, min(4, int(vdb_parallel_renders)))
 
     def initialize(self) -> None:
         if not self.root.exists() or not self.root.is_dir():
@@ -1026,6 +1042,170 @@ class LibraryRepository:
             if render_stage.exists():
                 shutil.rmtree(render_stage, ignore_errors=True)
 
+    def render_vdb_preview(
+        self,
+        asset_id: str,
+        variant_label: str,
+        *,
+        density_scale: int = 100,
+        mode: str = "still",
+        progress: Callable[[str], None] | None = None,
+        cancel_token: CancelToken | None = None,
+    ) -> VdbPreviewUpdate:
+        """Render frame one outside the lock and atomically publish a VDB still."""
+        self.initialize()
+        token = cancel_token or CancelToken()
+        manifest_path, original = self._manifest_by_id(asset_id)
+        asset = _asset_from_manifest(original, manifest_path.parent)
+        if not isinstance(asset, LibraryVdbAsset):
+            raise LibraryError("VDB preview rendering is only available for VDB assets.")
+        if mode not in {"still", "turntable"}:
+            raise LibraryError(f"Unknown VDB preview mode: {mode}")
+        label = _selected_vdb_variant_label(asset, variant_label)
+        if not 10 <= density_scale <= 500:
+            raise LibraryError("VDB preview density must be between 10 and 500.")
+        variant = asset.variants[label]
+        source_record, path_expression = _vdb_frame_one_source(asset, variant)
+        source_path = asset.asset_dir / source_record.path
+        if not source_record.sha256:
+            raise LibraryError("The selected VDB has no managed source hash; reimport it before rendering.")
+        manifest_stamp = str(original.get("updated_at", ""))
+        manifest_fingerprint = str(original.get("fingerprint", ""))
+        VDB_PREVIEW_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        render_stage = VDB_PREVIEW_CACHE_ROOT / f"vdb-preview-{uuid4()}"
+        request = VdbPreviewRequest(
+            source_path=source_path,
+            vdb_path=path_expression,
+            source_relative=source_record.path,
+            source_sha256=source_record.sha256,
+            output_dir=render_stage,
+            asset_name=asset.name,
+            variant=label,
+            density_scale=density_scale,
+            mode=mode,
+            ffmpeg_path=self.ffmpeg_path,
+            houdini_path=self.houdini_path,
+            template_path=self.vdb_template_path,
+            frame=1,
+            timeout_seconds=7200 if mode == "turntable" else 1800,
+            parallel_processes=self.vdb_parallel_renders,
+        )
+        try:
+            result = render_vdb_preview(
+                request,
+                progress=progress,
+                cancel_token=token,
+            )
+            if (
+                result.status != "ready"
+                or result.thumbnail_path is None
+                or result.hero_path is None
+            ):
+                return VdbPreviewUpdate(
+                    self._record_vdb_render_status(asset_id, result.metadata),
+                    result,
+                )
+            token.check()
+            with _ImportLock(self.root / ".ual" / "import.lock"):
+                current_path, current = self._manifest_by_id(asset_id)
+                if (
+                    current_path != manifest_path
+                    or str(current.get("updated_at", "")) != manifest_stamp
+                    or str(current.get("fingerprint", "")) != manifest_fingerprint
+                ):
+                    raise StaleSourceError(
+                        "The VDB manifest changed while its preview was rendering; "
+                        "the result was not published."
+                    )
+                current_asset = _asset_from_manifest(current, current_path.parent)
+                if not isinstance(current_asset, LibraryVdbAsset):
+                    raise LibraryError("The asset is no longer a VDB.")
+                current_variant = current_asset.variants.get(label)
+                current_record = next(
+                    (
+                        item for item in current_variant.files
+                        if item.path == source_record.path and item.frame == source_record.frame
+                    ),
+                    None,
+                ) if current_variant else None
+                if (
+                    current_record is None
+                    or current_record.sha256 != source_record.sha256
+                    or _sha256_path(source_path) != source_record.sha256
+                ):
+                    raise StaleSourceError(
+                        "The selected VDB changed while its preview was rendering; "
+                        "regenerate from the current managed file."
+                    )
+                preview_dir = current_asset.asset_dir / "previews"
+                preview_dir.mkdir(parents=True, exist_ok=True)
+                target = preview_dir / result.hero_path.name
+                video_target = (
+                    preview_dir / result.video_path.name
+                    if result.video_path is not None
+                    else None
+                )
+                rollback: dict[Path, Path | None] = {}
+                for index, publish_target in enumerate(
+                    item for item in (target, video_target) if item is not None
+                ):
+                    backup = None
+                    if publish_target.exists():
+                        backup = render_stage / (
+                            f"published-backup-{index}{publish_target.suffix}"
+                        )
+                        shutil.copyfile(publish_target, backup)
+                    rollback[publish_target] = backup
+                try:
+                    if result.video_path is not None and video_target is not None:
+                        _publish_preview_files(
+                            result.hero_path,
+                            target,
+                            result.video_path,
+                            video_target,
+                        )
+                    else:
+                        _publish_preview_files(
+                            result.hero_path, target,
+                            result.thumbnail_path, target,
+                        )
+                    previews = current.setdefault("previews", {})
+                    relative = target.relative_to(current_asset.asset_dir).as_posix()
+                    previews["hero"] = relative
+                    previews["thumbnail"] = relative
+                    if video_target is not None:
+                        previews["video"] = video_target.relative_to(
+                            current_asset.asset_dir
+                        ).as_posix()
+                    previews["render"] = result.metadata
+                    originals = current.setdefault("preview_original_paths", {})
+                    originals["hero"] = None
+                    originals["thumbnail"] = None
+                    if video_target is not None:
+                        originals["video"] = None
+                    current["updated_at"] = _utc_now()
+                    _asset_from_manifest(current, current_asset.asset_dir)
+                    _atomic_json(current_path, current)
+                except Exception:
+                    for publish_target, backup in rollback.items():
+                        if backup is None:
+                            publish_target.unlink(missing_ok=True)
+                        else:
+                            os.replace(backup, publish_target)
+                    _sync_directory(preview_dir)
+                    raise
+                result.hero_path = target
+                result.thumbnail_path = target
+                if video_target is not None:
+                    result.video_path = video_target
+                updated = _asset_from_manifest(current, current_asset.asset_dir)
+                if not isinstance(updated, LibraryVdbAsset):
+                    raise LibraryError("The rendered manifest did not produce a VDB asset.")
+                return VdbPreviewUpdate(updated, result)
+        finally:
+            if render_stage.exists():
+                shutil.rmtree(render_stage, ignore_errors=True)
+
     def render_hdri_preview(
         self,
         asset_id: str,
@@ -1568,6 +1748,22 @@ class LibraryRepository:
                 raise LibraryError(
                     "The updated manifest did not produce a texture asset."
                 )
+            return updated
+
+    def _record_vdb_render_status(
+        self, asset_id: str, metadata: dict
+    ) -> LibraryVdbAsset:
+        with _ImportLock(self.root / ".ual" / "import.lock"):
+            manifest_path, document = self._manifest_by_id(asset_id)
+            asset = _asset_from_manifest(document, manifest_path.parent)
+            if not isinstance(asset, LibraryVdbAsset):
+                raise LibraryError("The asset is no longer a VDB.")
+            document.setdefault("previews", {})["render"] = dict(metadata)
+            document["updated_at"] = _utc_now()
+            _atomic_json(manifest_path, document)
+            updated = _asset_from_manifest(document, manifest_path.parent)
+            if not isinstance(updated, LibraryVdbAsset):
+                raise LibraryError("The updated manifest did not produce a VDB asset.")
             return updated
 
     def _manifest_by_id(self, asset_id: str) -> tuple[Path, dict]:
@@ -3655,7 +3851,21 @@ class LibraryRepository:
                 shutil.rmtree(stage)
                 return None, copied_bytes
 
-            preview_manifest = {"thumbnail": "", "hero": "", "video": ""}
+            preview_manifest = {
+                "thumbnail": "", "hero": "", "video": "",
+                "render": {
+                    "type": "vdb_still",
+                    "status": "pending",
+                    "variant": "",
+                    "frame": 1,
+                    "density_scale": 100,
+                    "mode": "still",
+                    "generated_at": "",
+                    "houdini_version": "",
+                    "template_sha256": "",
+                    "diagnostic": "Render a still manually from the VDB inspector.",
+                },
+            }
             preview_original_paths: dict[str, str | None] = {
                 "thumbnail": None, "hero": None, "video": None,
             }
@@ -4354,6 +4564,11 @@ def _vdb_asset_from_manifest(document: dict, asset_dir: Path) -> LibraryVdbAsset
         source_metadata=source_metadata,
         physical_size=str(document.get("physical_size", "")),
         rating=_manifest_rating(document),
+        preview_render=(
+            dict(previews.get("render", {}))
+            if isinstance(previews.get("render", {}), dict)
+            else {}
+        ),
     )
 
 
@@ -5281,6 +5496,53 @@ def _contains(parent: Path, child: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _selected_vdb_variant_label(asset: LibraryVdbAsset, requested: str = "") -> str:
+    if requested in asset.variants:
+        return requested
+    if requested:
+        match = next(
+            (label for label in asset.variants if label.casefold() == requested.casefold()),
+            None,
+        )
+        if match:
+            return match
+        raise LibraryError(f"The requested VDB variant is unavailable: {requested}")
+    for preferred in ("mid", "low", "high"):
+        match = next((label for label in asset.variants if label.casefold() == preferred), None)
+        if match:
+            return match
+    if not asset.variants:
+        raise LibraryError("The VDB asset has no managed variants.")
+    return next(iter(asset.variants))
+
+
+def _vdb_frame_one_source(
+    asset: LibraryVdbAsset,
+    variant: LibraryVdbVariant,
+) -> tuple[LibraryVdbFile, str]:
+    if not variant.files:
+        raise LibraryError(f"The {variant.label} VDB variant has no managed files.")
+    if not variant.is_sequence:
+        record = variant.files[0]
+        return record, (asset.asset_dir / record.path).resolve().as_posix()
+    record = next((item for item in variant.files if item.frame == 1), None)
+    if record is None:
+        raise LibraryError(
+            f"The {variant.label} VDB sequence has no source frame 1. "
+            "Still-preview V1 evaluates the sequence at timeline frame 1."
+        )
+    padding = max(1, variant.padding, record.padding)
+    expression = (asset.asset_dir / record.path).resolve().as_posix()
+    token = f"{1:0{padding}d}"
+    match = re.search(rf"{re.escape(token)}(?=\.vdb$)", expression, re.IGNORECASE)
+    if not match:
+        raise LibraryError(
+            f"The {variant.label} frame-1 filename does not contain its "
+            f"{padding}-digit frame token."
+        )
+    return record, expression[:match.start()] + f"$F{padding}" + expression[match.end():]
 
 
 def _safe_source(root: Path, relative: str) -> Path:

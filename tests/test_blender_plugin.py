@@ -335,6 +335,104 @@ def test_expired_request_is_discarded_before_bpy_action(monkeypatch) -> None:
     assert called == []
 
 
+def test_bridge_stop_closes_connections_joins_threads_and_releases_requests(tmp_path) -> None:
+    class Closeable:
+        def __init__(self):
+            self.closed = False
+            self.shutdown_called = False
+
+        def shutdown(self, _how):
+            self.shutdown_called = True
+
+        def close(self):
+            self.closed = True
+
+    class Joinable:
+        def __init__(self, alive=True):
+            self.alive = alive
+            self.joined = False
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, _timeout):
+            self.joined = True
+            self.alive = False
+
+    class Timers:
+        def __init__(self):
+            self.unregistered = False
+
+        def is_registered(self, _callback):
+            return True
+
+        def unregister(self, _callback):
+            self.unregistered = True
+
+    bridge = object.__new__(server_module.BridgeServer)
+    bridge.bpy = type("Bpy", (), {"app": type("App", (), {"timers": Timers()})()})()
+    bridge.session_id = "session"
+    bridge.pending = queue.Queue()
+    bridge.stopping = threading.Event()
+    bridge._stop_lock = threading.Lock()
+    bridge._connections_lock = threading.Lock()
+    bridge._stopped = False
+    bridge.listener = Closeable()
+    connection = Closeable()
+    worker = Joinable()
+    bridge._connections = {connection}
+    bridge._workers = {worker}
+    bridge.thread = Joinable()
+    bridge.descriptor_path = tmp_path / "session.json"
+    bridge.descriptor_path.write_text("{}", encoding="utf-8")
+    bridge.cached_session_data = {"blender_version": "5.2.0", "blend_file": ""}
+    pending = server_module.PendingRequest(
+        {"request_id": "waiting", "action": "ping", "payload": {}},
+        time.monotonic() + 60,
+    )
+    bridge.pending.put(pending)
+
+    bridge.stop()
+
+    assert bridge.stopping.is_set()
+    assert bridge.listener.closed
+    assert connection.shutdown_called and connection.closed
+    assert bridge.thread.joined and worker.joined
+    assert bridge.bpy.app.timers.unregistered
+    assert pending.ready.is_set()
+    assert pending.response["ok"] is False
+    assert "shutting down" in pending.response["diagnostic"]
+    assert not bridge.descriptor_path.exists()
+
+
+def test_bridge_start_failure_rolls_back_without_publishing_instance(monkeypatch) -> None:
+    class BrokenBridge:
+        def __init__(self, bpy):
+            self.bpy = bpy
+            self.port = 0
+            self.stopped = False
+
+        def start(self):
+            raise RuntimeError("timer registration failed")
+
+        def stop(self):
+            self.stopped = True
+
+    created = []
+
+    def bridge_factory(bpy):
+        bridge = BrokenBridge(bpy)
+        created.append(bridge)
+        return bridge
+
+    monkeypatch.setattr(server_module, "BridgeServer", bridge_factory)
+    monkeypatch.setattr(server_module, "_INSTANCE", None)
+    with pytest.raises(RuntimeError, match="timer registration failed"):
+        server_module.start(object())
+    assert created[0].stopped
+    assert server_module.instance() is None
+
+
 def test_texture_material_is_created_unassigned_and_updated_by_asset_id(tmp_path) -> None:
     library = tmp_path / "library"
     base = library / "base.jpg"

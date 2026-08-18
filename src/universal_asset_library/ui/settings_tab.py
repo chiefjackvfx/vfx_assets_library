@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -37,7 +38,12 @@ from universal_asset_library.library import (
     RepairProgress,
     RepairSummary,
 )
-from universal_asset_library.previews import resolve_blender_executable, validate_blender_executable
+from universal_asset_library.previews import (
+    resolve_blender_executable,
+    resolve_houdini_executable,
+    validate_blender_executable,
+    validate_houdini_executable,
+)
 from universal_asset_library.integrations.houdini import HoudiniBridgeClient, HoudiniInstallation, HoudiniPluginInstaller
 from universal_asset_library.integrations.blender import (
     BlenderBridgeClient,
@@ -437,8 +443,9 @@ class SettingsTab(QWidget):
         tools_title = QLabel("Media and preview tools")
         tools_title.setObjectName("sectionTitle")
         tools_help = QLabel(
-            "Blender renders texture and HDRI previews. FFmpeg probes Stock clips, generates playable 480p previews, "
-            "and extracts midpoint thumbnails. Leave either executable empty to search PATH."
+            "Blender renders texture and HDRI previews. Houdini 22+ renders manual VDB stills. "
+            "FFmpeg probes Stock clips, generates playable 480p previews, and extracts midpoint thumbnails. "
+            "Leave an executable empty to auto-detect it."
         )
         tools_help.setObjectName("mutedLabel")
         tools_help.setWordWrap(True)
@@ -458,6 +465,35 @@ class SettingsTab(QWidget):
         self.blender_status = QLabel()
         self.blender_status.setObjectName("mutedLabel")
         self.blender_status.setWordWrap(True)
+        houdini_preview_row = QHBoxLayout()
+        self.houdini_path = QLineEdit()
+        self.houdini_path.setPlaceholderText("Auto-detect Houdini 22 for VDB previews")
+        self.houdini_browse = QPushButton("Browse Houdini…")
+        self.houdini_browse.clicked.connect(self._browse_houdini)
+        self.houdini_clear = QPushButton("Clear")
+        self.houdini_clear.clicked.connect(self.houdini_path.clear)
+        self.houdini_check = QPushButton("Check Houdini")
+        self.houdini_check.clicked.connect(self._check_houdini)
+        houdini_preview_row.addWidget(self.houdini_path, 1)
+        houdini_preview_row.addWidget(self.houdini_browse)
+        houdini_preview_row.addWidget(self.houdini_clear)
+        houdini_preview_row.addWidget(self.houdini_check)
+        self.houdini_preview_status = QLabel()
+        self.houdini_preview_status.setObjectName("mutedLabel")
+        self.houdini_preview_status.setWordWrap(True)
+        vdb_parallel_row = QHBoxLayout()
+        vdb_parallel_label = QLabel("Parallel VDB turntable renders")
+        self.vdb_parallel_renders = QSpinBox()
+        self.vdb_parallel_renders.setRange(1, 4)
+        self.vdb_parallel_renders.setValue(2)
+        self.vdb_parallel_renders.setSuffix(" instances")
+        self.vdb_parallel_renders.setToolTip(
+            "Each instance loads its own HIP and VDB. More instances require "
+            "additional Houdini licenses, memory, and GPU capacity."
+        )
+        vdb_parallel_row.addWidget(vdb_parallel_label)
+        vdb_parallel_row.addWidget(self.vdb_parallel_renders)
+        vdb_parallel_row.addStretch()
         self.render_hdri_on_import = QCheckBox("Render composite previews automatically during HDRI import")
         self.render_texture_on_import = QCheckBox(
             "Render missing shader previews automatically during texture import"
@@ -485,6 +521,9 @@ class SettingsTab(QWidget):
         tools_layout.addWidget(tools_help)
         tools_layout.addLayout(blender_row)
         tools_layout.addWidget(self.blender_status)
+        tools_layout.addLayout(houdini_preview_row)
+        tools_layout.addWidget(self.houdini_preview_status)
+        tools_layout.addLayout(vdb_parallel_row)
         tools_layout.addWidget(self.render_texture_on_import)
         tools_layout.addWidget(self.save_texture_preview_blend)
         tools_layout.addWidget(self.render_hdri_on_import)
@@ -599,6 +638,8 @@ class SettingsTab(QWidget):
         self.default_category.currentIndexChanged.connect(self._changed)
         self.default_model_category.currentIndexChanged.connect(self._changed)
         self.blender_path.textChanged.connect(self._changed)
+        self.houdini_path.textChanged.connect(self._changed)
+        self.vdb_parallel_renders.valueChanged.connect(self._changed)
         self.ffmpeg_path.textChanged.connect(self._changed)
         self.render_hdri_on_import.toggled.connect(self._changed)
         self.render_texture_on_import.toggled.connect(self._changed)
@@ -620,6 +661,16 @@ class SettingsTab(QWidget):
         if filename:
             self.blender_path.setText(filename)
             self._check_blender()
+
+    def _browse_houdini(self) -> None:
+        current = self.houdini_path.text().strip()
+        start = current if current and os.path.isfile(current) else ""
+        filename, _filter = QFileDialog.getOpenFileName(
+            self, "Choose Houdini, hbatch, or hython executable", start
+        )
+        if filename:
+            self.houdini_path.setText(filename)
+            self._check_houdini()
 
     def _taxonomy_store(self) -> StockTaxonomyStore | None:
         path = self._saved.library_path
@@ -696,6 +747,17 @@ class SettingsTab(QWidget):
         self.blender_status.setStyleSheet(f"color: {'#78c995' if valid else '#e6b566'};")
         self.blender_check.setEnabled(True)
         self._refresh_blender_installations()
+
+    def _check_houdini(self) -> None:
+        self.houdini_check.setEnabled(False)
+        valid, message, _version = validate_houdini_executable(
+            self.houdini_path.text()
+        )
+        self.houdini_preview_status.setText(message)
+        self.houdini_preview_status.setStyleSheet(
+            f"color: {'#78c995' if valid else '#e6b566'};"
+        )
+        self.houdini_check.setEnabled(True)
 
     def _refresh_houdini_installations(self) -> None:
         selected = {
@@ -878,6 +940,7 @@ class SettingsTab(QWidget):
             default_import_category=self.default_category.currentText(),
             default_model_category=self.default_model_category.currentText(),
             blender_path=self.blender_path.text(),
+            houdini_path=self.houdini_path.text(),
             render_hdri_on_import=self.render_hdri_on_import.isChecked(),
             render_texture_on_import=self.render_texture_on_import.isChecked(),
             save_texture_preview_blend=(
@@ -885,6 +948,7 @@ class SettingsTab(QWidget):
             ),
             ffmpeg_path=self.ffmpeg_path.text(),
             stock_hover_previews=self.stock_hover_previews.isChecked(),
+            vdb_parallel_renders=self.vdb_parallel_renders.value(),
         ).normalized()
 
     def _show(self, settings: AppSettings) -> None:
@@ -897,6 +961,8 @@ class SettingsTab(QWidget):
         self.default_category.setCurrentText(settings.default_import_category)
         self.default_model_category.setCurrentText(settings.default_model_category)
         self.blender_path.setText(settings.blender_path)
+        self.houdini_path.setText(settings.houdini_path)
+        self.vdb_parallel_renders.setValue(settings.vdb_parallel_renders)
         self.ffmpeg_path.setText(settings.ffmpeg_path)
         self.render_hdri_on_import.setChecked(settings.render_hdri_on_import)
         self.render_texture_on_import.setChecked(
@@ -913,6 +979,15 @@ class SettingsTab(QWidget):
         else:
             self.blender_status.setText("Blender is unavailable; imports will keep their fallback preview.")
             self.blender_status.setStyleSheet("color: #e6b566;")
+        detected_houdini = resolve_houdini_executable(settings.houdini_path)
+        self.houdini_preview_status.setText(
+            f"Houdini preview executable: {detected_houdini}. Use Check Houdini to verify its license and version."
+            if detected_houdini else
+            "Houdini 22 is unavailable; VDB still rendering is disabled."
+        )
+        self.houdini_preview_status.setStyleSheet(
+            "color: #8792a1;" if detected_houdini else "color: #e6b566;"
+        )
         from universal_asset_library.previews import resolve_ffmpeg
         detected_ffmpeg = resolve_ffmpeg(settings.ffmpeg_path)
         self.ffmpeg_status.setText(

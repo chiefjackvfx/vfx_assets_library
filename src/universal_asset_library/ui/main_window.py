@@ -88,6 +88,11 @@ class MainWindow(QMainWindow):
             settings.render_hdri_on_import,
             settings.render_texture_on_import,
         )
+        self.assets_tab.set_vdb_preview_settings(
+            settings.houdini_path,
+            settings.ffmpeg_path,
+            settings.vdb_parallel_renders,
+        )
         library = settings.library_path or "not configured"
         self.statusBar().showMessage(f"Texture, Atlas, HDRI, model, VDB, and Stock library · Library: {library}")
 

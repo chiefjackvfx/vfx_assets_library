@@ -7,7 +7,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtCore import QPoint, QItemSelectionModel, QSettings, QThreadPool, Qt
+from PyQt6.QtCore import QEvent, QPoint, QRect, QItemSelectionModel, QSettings, QThreadPool, Qt
 from PyQt6.QtGui import QColor, QCloseEvent, QImage, QPixmap
 from PyQt6.QtMultimedia import QMediaPlayer
 from PyQt6.QtTest import QTest
@@ -132,6 +132,42 @@ def stock_asset(tmp_path, asset_id: str, *, preview_exists: bool = True) -> Libr
         fingerprint="a" * 64,
         created_at="2026-01-01T00:00:00+00:00",
         total_size=16,
+    )
+
+
+def vdb_video_asset(
+    tmp_path,
+    asset_id: str,
+    *,
+    generated_turntable: bool,
+):
+    source = tmp_path / f"{asset_id}-source"
+    library = tmp_path / f"{asset_id}-library"
+    source.mkdir()
+    library.mkdir()
+    for label in ("Low", "Mid", "High"):
+        (source / f"{asset_id}_{label}_Res.vdb").write_bytes(label.encode())
+    asset = LibraryRepository(library).import_vdbs(
+        scan_vdb_folder(source).materials
+    ).imported[0]
+    preview = asset.asset_dir / "previews" / f"{asset_id}.mp4"
+    preview.parent.mkdir(exist_ok=True)
+    preview.write_bytes(b"video")
+    return replace(
+        asset,
+        preview_path=preview,
+        preview_render=(
+            {
+                "status": "ready",
+                "mode": "turntable",
+                "frame_start": 1,
+                "frame_end": 50,
+                "fps": 24.0,
+                "scrub_optimized": True,
+            }
+            if generated_turntable
+            else {}
+        ),
     )
 
 
@@ -274,9 +310,145 @@ def test_vdb_importer_review_and_catalog_detail_defaults_to_mid(app, tmp_path) -
     panel.show_asset(asset)
     assert panel.eyebrow.text() == "VDB · STATIC"
     assert panel.houdini_resolution.currentText() == "Mid"
+    assert panel.vdb_preview_variant.currentText() == "Mid"
+    assert not panel.vdb_preview_variant.isHidden()
+    assert (panel.vdb_density_slider.minimum(), panel.vdb_density_slider.maximum()) == (10, 500)
+    assert panel.vdb_density_slider.value() == 100
+    assert panel.hdri_render_button.text() == "Generate preview"
+    assert panel.hdri_render_button.menu() is panel.vdb_preview_menu
+    assert [action.text() for action in panel.vdb_preview_menu.actions()] == [
+        "Still", "Generate turn table"
+    ]
     assert panel.houdini_send_button.text() == "Create File SOP in Houdini"
     assert panel.dcc_app.isHidden()
     assert panel.dcc_stack.currentWidget() is panel.houdini_dcc_page
+
+
+def test_vdb_preview_is_manual_only_and_uses_houdini_serial_queue(
+    app, tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "clouds"
+    library = tmp_path / "library"
+    source.mkdir()
+    library.mkdir()
+    for label in ("Low", "Mid", "High"):
+        (source / f"cloud_formation_001_{label}_Res.vdb").write_bytes(
+            label.encode()
+        )
+    asset = LibraryRepository(library).import_vdbs(
+        scan_vdb_folder(source).materials
+    ).imported[0]
+    tab = AssetsTab()
+    tab._library_path = str(library)
+    tab._houdini_path = "/opt/hfs22.0.368/bin/hython"
+    tab._ffmpeg_path = "/usr/bin/ffmpeg"
+    tab._vdb_parallel_renders = 3
+    tab._all_assets = [asset]
+    tab._reindex_all_assets()
+    tab.source_model.replace([asset])
+    started = []
+    monkeypatch.setattr(
+        QThreadPool,
+        "start",
+        lambda _pool, worker, *_args: started.append(worker),
+    )
+
+    assert tab.queue_import_previews((asset,)) == 0
+    assert tab.queue_preview_renders((asset,), automatic=False) == 0
+    tab.detail.show_asset(asset)
+    tab.detail.vdb_preview_variant.setCurrentText("High")
+    tab.detail.vdb_density_slider.setValue(275)
+    tab.detail.vdb_turntable_action.trigger()
+
+    assert len(started) == 1
+    assert started[0].asset_type == "vdb"
+    assert started[0].variant == "High"
+    assert started[0].density_scale == 275
+    assert started[0].mode == "turntable"
+    assert started[0].ffmpeg_path == "/usr/bin/ffmpeg"
+    assert started[0].parallel_processes == 3
+    assert started[0].houdini_path == "/opt/hfs22.0.368/bin/hython"
+    assert started[0].preview_session is None
+    assert tab._preview_session is None
+    assert tab.card_delegate.task_state(asset.id) == (
+        "preview_rendering", "Rendering VDB turntable in Houdini"
+    )
+    tab._hdri_render_failed("fixture")
+    app.processEvents()
+    tab.shutdown_preview_queue()
+
+
+def test_multiple_selected_vdbs_offer_bulk_still_and_turntable_previews(
+    app, tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "clouds"
+    library = tmp_path / "library"
+    source.mkdir()
+    library.mkdir()
+    for number in (1, 2):
+        for label in ("Low", "Mid", "High"):
+            (source / (
+                f"cloud_formation_{number:03d}_{label}_Res.vdb"
+            )).write_bytes(f"{number}-{label}".encode())
+    imported = list(
+        LibraryRepository(library).import_vdbs(
+            scan_vdb_folder(source).materials
+        ).imported
+    )
+    first = imported[0]
+    second = replace(
+        imported[1],
+        variants={"Low": imported[1].variants["Low"]},
+    )
+    assets = [first, second]
+    tab = AssetsTab()
+    tab._library_path = str(library)
+    tab._all_assets = assets
+    tab._reindex_all_assets()
+    tab.source_model.replace(assets)
+    started = []
+    monkeypatch.setattr(
+        QThreadPool,
+        "start",
+        lambda _pool, worker, *_args: started.append(worker),
+    )
+    selection = tab.view.selectionModel()
+    flags = (
+        QItemSelectionModel.SelectionFlag.Select
+        | QItemSelectionModel.SelectionFlag.Rows
+    )
+    selection.select(tab.proxy.index(0, 0), flags)
+    selection.select(tab.proxy.index(1, 0), flags)
+    app.processEvents()
+    tab.detail.show_asset(first)
+    tab.detail.vdb_preview_variant.setCurrentText("High")
+    tab.detail.vdb_density_slider.setValue(185)
+
+    assert not tab.bulk_preview_button.isHidden()
+    assert tab.bulk_preview_button.text() == "Generate Previews (2)"
+    assert tab.bulk_preview_button.menu() is tab.bulk_vdb_preview_menu
+    assert [
+        action.text() for action in tab.bulk_vdb_preview_menu.actions()
+    ] == ["Still previews", "Turntable previews"]
+    tab.bulk_preview_button.click()
+    assert not started
+
+    tab.bulk_vdb_turntable_action.trigger()
+
+    assert len(started) == 1
+    jobs = (
+        tab._active_preview_render_job,
+        *tab._preview_render_jobs,
+    )
+    assert {job.asset_id for job in jobs} == {asset.id for asset in assets}
+    assert {job.mode for job in jobs} == {"turntable"}
+    assert {job.density_scale for job in jobs} == {185}
+    variants = {job.asset_id: job.variant for job in jobs}
+    assert variants[first.id] == "High"
+    assert variants[second.id] == "Low"
+    assert started[0].mode == "turntable"
+    assert started[0].density_scale == 185
+    tab.shutdown_preview_queue()
 
 
 def test_assets_category_rail_filters_primary_categories_and_live_counts(app, tmp_path) -> None:
@@ -2042,6 +2214,115 @@ def test_stock_hover_delegate_frame_is_cleared_on_stop(app, tmp_path) -> None:
     assert tab.card_delegate._hover_asset_id == ""
     assert tab.card_delegate._hover_pixmap.isNull()
     tab.close()
+
+
+def test_vdb_turntable_hover_maps_horizontal_position_and_coalesces_seeks(
+    app, tmp_path
+) -> None:
+    asset = vdb_video_asset(
+        tmp_path, "cloud-turntable", generated_turntable=True
+    )
+    tab = AssetsTab()
+    tab.source_model.replace([asset])
+    app.processEvents()
+    controller = tab.stock_hover_previews
+    index = tab.proxy.index(0, 0)
+    preview_rect = QRect(10, 10, 101, 180)
+    sources = []
+    positions = []
+    plays = []
+    pauses = []
+    controller.player.setSource = sources.append
+    controller.player.setPosition = positions.append
+    controller.player.play = lambda: plays.append(True)
+    controller.player.pause = lambda: pauses.append(True)
+    controller.player.stop = lambda: None
+
+    assert controller._turntable_position(asset, 0.0) == 0
+    assert controller._turntable_position(asset, 0.5) == 1042
+    assert controller._turntable_position(asset, 1.0) == 2042
+
+    controller._scrub_at(index, preview_rect.left(), preview_rect)
+    controller._scrub_at(index, preview_rect.center().x(), preview_rect)
+    assert positions == []
+    controller._scrub_decoder_became_ready()
+    assert positions == [1042]
+
+    controller.scrub_timer.stop()
+    controller._scrub_at(index, preview_rect.right(), preview_rect)
+    controller.scrub_timer.stop()
+    controller._apply_pending_scrub()
+
+    assert positions == [1042, 2042]
+    assert len([source for source in sources if not source.isEmpty()]) == 1
+    assert not plays
+    assert pauses
+
+    frame = QImage(160, 90, QImage.Format.Format_RGB32)
+    frame.fill(QColor("#ff0000"))
+    tab.card_delegate.set_hover_frame(asset.id, QPixmap.fromImage(frame))
+    controller.eventFilter(tab.view.viewport(), QEvent(QEvent.Type.Leave))
+    assert controller.active_asset_id == ""
+    assert tab.card_delegate._hover_asset_id == ""
+    tab.close()
+
+
+def test_only_generated_vdb_turntables_scrub_and_stock_still_autoplays(
+    app, tmp_path
+) -> None:
+    generated = vdb_video_asset(
+        tmp_path, "generated", generated_turntable=True
+    )
+    supplied = vdb_video_asset(
+        tmp_path, "supplied", generated_turntable=False
+    )
+    stock = stock_asset(tmp_path, "stock-hover")
+    tab = AssetsTab()
+    controller = tab.stock_hover_previews
+
+    assert controller._is_scrubbable_turntable(generated)
+    assert not controller._is_scrubbable_turntable(supplied)
+    assert not controller._is_scrubbable_turntable(stock)
+
+    tab.source_model.replace([stock])
+    app.processEvents()
+    plays = []
+    controller.player.stop = lambda: None
+    controller.player.setSource = lambda _source: None
+    controller.player.setPosition = lambda _position: None
+    controller.player.play = lambda: plays.append(True)
+    controller.schedule(tab.proxy.index(0, 0))
+
+    assert plays == [True]
+    assert not controller._scrub_active
+    tab.close()
+
+
+def test_vdb_mp4_cards_show_3d_preview_badge_only_for_volume_video(
+    app, tmp_path
+) -> None:
+    vdb = vdb_video_asset(
+        tmp_path, "badged-vdb", generated_turntable=True
+    )
+    stock = stock_asset(tmp_path, "unbadged-stock")
+    mov_preview = vdb.preview_path.with_suffix(".mov")
+    mov_preview.write_bytes(b"video")
+    delegate = TextureCardDelegate()
+
+    assert delegate._has_3d_preview(vdb)
+    assert not delegate._has_3d_preview(stock)
+    assert not delegate._has_3d_preview(
+        replace(vdb, preview_path=mov_preview)
+    )
+    assert not delegate._has_3d_preview(
+        replace(vdb, preview_path=None)
+    )
+
+    preview = QRect(10, 10, 220, 180)
+    badge = delegate._preview_3d_badge_rect(preview)
+    assert preview.contains(badge.toAlignedRect())
+    assert badge.right() == preview.right() - 8
+    assert badge.bottom() == preview.bottom() - 8
 
 
 def test_assets_splitter_is_wide_and_persists_state(app, tmp_path) -> None:
