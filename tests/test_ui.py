@@ -161,7 +161,7 @@ def vdb_video_asset(
                 "status": "ready",
                 "mode": "turntable",
                 "frame_start": 1,
-                "frame_end": 50,
+                "frame_end": 36,
                 "fps": 24.0,
                 "scrub_optimized": True,
             }
@@ -199,6 +199,7 @@ def test_main_window_construction_defers_library_maintenance(
     tab = SettingsTab(store, settings)
 
     assert tab._inspection_worker is None
+    assert tab.vdb_parallel_renders.maximum() == 36
     assert "not been checked" in tab.repair_status.text()
     assert tab.refresh_maintenance_button.isEnabled()
 
@@ -2239,21 +2240,21 @@ def test_vdb_turntable_hover_maps_horizontal_position_and_coalesces_seeks(
     controller.player.stop = lambda: None
 
     assert controller._turntable_position(asset, 0.0) == 0
-    assert controller._turntable_position(asset, 0.5) == 1042
-    assert controller._turntable_position(asset, 1.0) == 2042
+    assert controller._turntable_position(asset, 0.5) == 750
+    assert controller._turntable_position(asset, 1.0) == 1458
 
     controller._scrub_at(index, preview_rect.left(), preview_rect)
     controller._scrub_at(index, preview_rect.center().x(), preview_rect)
     assert positions == []
     controller._scrub_decoder_became_ready()
-    assert positions == [1042]
+    assert positions == [750]
 
     controller.scrub_timer.stop()
     controller._scrub_at(index, preview_rect.right(), preview_rect)
     controller.scrub_timer.stop()
     controller._apply_pending_scrub()
 
-    assert positions == [1042, 2042]
+    assert positions == [750, 1458]
     assert len([source for source in sources if not source.isEmpty()]) == 1
     assert not plays
     assert pauses

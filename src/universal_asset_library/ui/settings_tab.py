@@ -44,6 +44,9 @@ from universal_asset_library.previews import (
     validate_blender_executable,
     validate_houdini_executable,
 )
+from universal_asset_library.previews.vdb_config import (
+    VDB_TURNTABLE_MAX_WORKERS,
+)
 from universal_asset_library.integrations.houdini import HoudiniBridgeClient, HoudiniInstallation, HoudiniPluginInstaller
 from universal_asset_library.integrations.blender import (
     BlenderBridgeClient,
@@ -484,7 +487,7 @@ class SettingsTab(QWidget):
         vdb_parallel_row = QHBoxLayout()
         vdb_parallel_label = QLabel("Parallel VDB turntable renders")
         self.vdb_parallel_renders = QSpinBox()
-        self.vdb_parallel_renders.setRange(1, 4)
+        self.vdb_parallel_renders.setRange(1, VDB_TURNTABLE_MAX_WORKERS)
         self.vdb_parallel_renders.setValue(2)
         self.vdb_parallel_renders.setSuffix(" instances")
         self.vdb_parallel_renders.setToolTip(

@@ -21,6 +21,12 @@ from typing import Callable
 from PyQt6.QtGui import QImage
 
 from .stock_video import resolve_ffmpeg
+from .vdb_config import (
+    VDB_TURNTABLE_FRAME_COUNT,
+    VDB_TURNTABLE_FRAME_END,
+    VDB_TURNTABLE_FRAME_START,
+    normalize_vdb_turntable_workers,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,7 +245,10 @@ def render_vdb_preview(
         if request.mode == "turntable":
             missing = [
                 frame
-                for frame in range(1, 51)
+                for frame in range(
+                    VDB_TURNTABLE_FRAME_START,
+                    VDB_TURNTABLE_FRAME_END + 1,
+                )
                 if not Path(
                     str(output_exr).replace("$F4", f"{frame:04d}")
                 ).is_file()
@@ -275,11 +284,18 @@ def render_vdb_preview(
             video_frames = request.output_dir / "video_frames"
             video_frames.mkdir(parents=True, exist_ok=True)
             video_frame_pattern = video_frames / "vdb-turntable.%04d.png"
-            for frame in range(1, 51):
-                if progress and (frame == 1 or frame % 10 == 0):
+            for frame in range(
+                VDB_TURNTABLE_FRAME_START,
+                VDB_TURNTABLE_FRAME_END + 1,
+            ):
+                if progress and (
+                    frame == VDB_TURNTABLE_FRAME_START
+                    or frame % 10 == 0
+                    or frame == VDB_TURNTABLE_FRAME_END
+                ):
                     progress(
                         f"Applying Houdini preview colour transform "
-                        f"({frame}/50)"
+                        f"({frame}/{VDB_TURNTABLE_FRAME_END})"
                     )
                 frame_exr = Path(
                     str(output_exr).replace("$F4", f"{frame:04d}")
@@ -299,15 +315,18 @@ def render_vdb_preview(
                 )
                 log = (log + "\n" + conversion_log).strip()
             if progress:
-                progress("Encoding 50-frame VDB turntable MP4")
+                progress(
+                    f"Encoding {VDB_TURNTABLE_FRAME_COUNT}-frame "
+                    "VDB turntable MP4"
+                )
             encoding_log = _run_process(
                 [
                     ffmpeg,
                     "-hide_banner", "-loglevel", "error", "-y",
                     "-framerate", f"{fps:g}",
-                    "-start_number", "1",
+                    "-start_number", str(VDB_TURNTABLE_FRAME_START),
                     "-i", str(video_frame_pattern),
-                    "-frames:v", "50",
+                    "-frames:v", str(VDB_TURNTABLE_FRAME_COUNT),
                     "-vf", (
                         "pad=ceil(iw/2)*2:ceil(ih/2)*2,"
                         "scale=iw:ih:in_range=full:out_range=tv:"
@@ -344,8 +363,12 @@ def render_vdb_preview(
             "source": request.source_relative,
             "source_sha256": request.source_sha256,
             "frame": request.frame,
-            "frame_start": 1,
-            "frame_end": 50 if request.mode == "turntable" else 1,
+            "frame_start": VDB_TURNTABLE_FRAME_START,
+            "frame_end": (
+                VDB_TURNTABLE_FRAME_END
+                if request.mode == "turntable"
+                else VDB_TURNTABLE_FRAME_START
+            ),
             "fps": fps,
             "mode": request.mode,
             "scrub_optimized": request.mode == "turntable",
@@ -358,7 +381,7 @@ def render_vdb_preview(
                 "bt709" if request.mode == "turntable" else ""
             ),
             "parallel_processes": (
-                min(max(1, request.parallel_processes), 4)
+                normalize_vdb_turntable_workers(request.parallel_processes)
                 if request.mode == "turntable"
                 else 1
             ),
@@ -403,8 +426,14 @@ def _render_turntable_processes(
     cancel_token,
     progress,
 ) -> tuple[str, dict]:
-    worker_count = min(4, max(1, int(request.parallel_processes)))
-    ranges = _frame_chunks(1, 50, worker_count)
+    worker_count = normalize_vdb_turntable_workers(
+        request.parallel_processes
+    )
+    ranges = _frame_chunks(
+        VDB_TURNTABLE_FRAME_START,
+        VDB_TURNTABLE_FRAME_END,
+        worker_count,
+    )
     stopped = Event()
     combined_token = _ParallelCancelToken(cancel_token, stopped)
     workers_root = request.output_dir / "workers"
@@ -620,14 +649,18 @@ def _failure(status: str, request: VdbPreviewRequest, diagnostic: str, *, log: s
         "status": status, "variant": request.variant,
         "source": request.source_relative, "source_sha256": request.source_sha256,
         "frame": request.frame, "generated_at": datetime.now(timezone.utc).isoformat(),
-        "frame_start": 1,
-        "frame_end": 50 if request.mode == "turntable" else 1,
+        "frame_start": VDB_TURNTABLE_FRAME_START,
+        "frame_end": (
+            VDB_TURNTABLE_FRAME_END
+            if request.mode == "turntable"
+            else VDB_TURNTABLE_FRAME_START
+        ),
         "mode": request.mode,
         "scrub_optimized": False,
         "color_transform": "",
         "video_color_space": "",
         "parallel_processes": (
-            min(max(1, request.parallel_processes), 4)
+            normalize_vdb_turntable_workers(request.parallel_processes)
             if request.mode == "turntable"
             else 1
         ),

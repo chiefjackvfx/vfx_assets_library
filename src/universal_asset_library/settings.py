@@ -8,6 +8,7 @@ from PyQt6.QtCore import QSettings
 
 from .domain import MODEL_CATEGORIES, TEXTURE_CATEGORIES
 from .categories import CategoryConfigStore
+from .previews.vdb_config import normalize_vdb_turntable_workers
 
 
 THUMBNAIL_SIZES = ("small", "medium", "large")
@@ -84,8 +85,8 @@ class AppSettings:
             ),
             ffmpeg_path=normalize_executable_path(self.ffmpeg_path),
             stock_hover_previews=bool(self.stock_hover_previews),
-            vdb_parallel_renders=max(
-                1, min(4, _setting_int(self.vdb_parallel_renders, 2))
+            vdb_parallel_renders=normalize_vdb_turntable_workers(
+                _setting_int(self.vdb_parallel_renders, 2)
             ),
         )
 

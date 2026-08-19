@@ -103,6 +103,9 @@ from universal_asset_library.integrations import (
     validate_model_conversion_blender,
 )
 from universal_asset_library.previews import BlenderPreviewSession
+from universal_asset_library.previews.vdb_config import (
+    normalize_vdb_turntable_workers,
+)
 from .asset_type_tabs import AssetTypeTabs
 from .category_rail import CategoryRail
 from .ai_classification import (
@@ -2467,11 +2470,17 @@ class DetailPanel(QFrame):
             self.hdri_render_button.setMenu(self.vdb_preview_menu)
             self.hdri_render_button.setEnabled(bool(labels))
             self.hdri_render_button.show()
+            frame_status = (
+                f"frames {render.get('frame_start', 1)}–"
+                f"{render.get('frame_end', 1)}"
+                if render.get("mode") == "turntable"
+                else "frame 1"
+            )
             self.hdri_render_status.setText(
                 (
                     f"Houdini {'turntable' if render.get('mode') == 'turntable' else 'still'} ready · "
                     f"{rendered_variant} · "
-                    f"{'frames 1–50' if render.get('mode') == 'turntable' else 'frame 1'}"
+                    f"{frame_status}"
                     if status == "ready" and rendered_variant
                     else "Houdini preview ready"
                     if status == "ready"
@@ -5473,7 +5482,7 @@ class AssetsTab(QWidget):
         ffmpeg_path: str = "",
         parallel_renders: int = 2,
     ) -> None:
-        parallel_renders = max(1, min(4, int(parallel_renders)))
+        parallel_renders = normalize_vdb_turntable_workers(parallel_renders)
         if (
             houdini_path == self._houdini_path
             and ffmpeg_path == self._ffmpeg_path

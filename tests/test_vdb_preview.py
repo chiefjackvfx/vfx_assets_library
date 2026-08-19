@@ -263,25 +263,25 @@ def test_houdini_driver_renders_complete_turntable_range(tmp_path: Path) -> None
         "output_exr": str(output),
         "frame": 1,
         "frame_start": 1,
-        "frame_end": 50,
+        "frame_end": 36,
         "mode": "turntable",
         "density_scale": 100,
     })
 
     assert result["mode"] == "turntable"
-    assert (result["frame_start"], result["frame_end"]) == (1, 50)
+    assert (result["frame_start"], result["frame_end"]) == (1, 36)
     assert result["fps"] == 24.0
     assert hou.render_node.parms["trange"].value == 1
     assert hou.render_node.parms["f1"].value == 1
-    assert hou.render_node.parms["f2"].value == 50
+    assert hou.render_node.parms["f2"].value == 36
     assert hou.render_node.parms["f3"].value == 1
     assert hou.render_node.render_calls == [{
-        "frame_range": (1, 50, 1),
+        "frame_range": (1, 36, 1),
         "verbose": True,
         "output_progress": True,
     }]
     assert Path(str(output).replace("$F4", "0001")).is_file()
-    assert Path(str(output).replace("$F4", "0050")).is_file()
+    assert Path(str(output).replace("$F4", "0036")).is_file()
 
 
 def test_renderer_converts_exr_and_reports_metadata(tmp_path: Path, monkeypatch) -> None:
@@ -354,7 +354,7 @@ def test_renderer_converts_exr_and_reports_metadata(tmp_path: Path, monkeypatch)
     assert "Rendering Karma still at frame 1" in updates
 
 
-def test_turntable_renders_50_frames_and_encodes_mp4(
+def test_turntable_renders_36_frames_and_encodes_mp4(
     tmp_path: Path, monkeypatch
 ) -> None:
     tool_dir = tmp_path / "hfs" / "bin"
@@ -407,7 +407,7 @@ def test_turntable_renders_50_frames_and_encodes_mp4(
             assert command[command.index("-i") + 1].endswith(
                 "video_frames/vdb-turntable.%04d.png"
             )
-            assert command[command.index("-frames:v") + 1] == "50"
+            assert command[command.index("-frames:v") + 1] == "36"
             assert command[command.index("-vf") + 1] == (
                 "pad=ceil(iw/2)*2:ceil(ih/2)*2,"
                 "scale=iw:ih:in_range=full:out_range=tv:"
@@ -440,7 +440,7 @@ def test_turntable_renders_50_frames_and_encodes_mp4(
         ffmpeg_path=str(ffmpeg),
         houdini_path=str(hython),
         template_path=template,
-        parallel_processes=2,
+        parallel_processes=6,
     ))
 
     assert result.status == "ready"
@@ -448,16 +448,18 @@ def test_turntable_renders_50_frames_and_encodes_mp4(
     assert result.video_path is not None
     assert result.video_path.read_bytes() == b"mp4"
     assert result.metadata["frame_start"] == 1
-    assert result.metadata["frame_end"] == 50
+    assert result.metadata["frame_end"] == 36
     assert result.metadata["fps"] == 24.0
     assert result.metadata["scrub_optimized"] is True
     assert result.metadata["color_transform"] == "houdini_iconvert_auto"
     assert result.metadata["video_color_space"] == "bt709"
     assert (result.metadata["width"], result.metadata["height"]) == (854, 480)
-    assert result.metadata["parallel_processes"] == 2
-    assert sorted(worker_ranges) == [(1, 25), (26, 50)]
-    assert [command[0] for command in calls].count(str(hython)) == 2
-    assert [command[0] for command in calls].count(str(iconvert)) == 51
+    assert result.metadata["parallel_processes"] == 6
+    assert sorted(worker_ranges) == [
+        (1, 6), (7, 12), (13, 18), (19, 24), (25, 30), (31, 36)
+    ]
+    assert [command[0] for command in calls].count(str(hython)) == 6
+    assert [command[0] for command in calls].count(str(iconvert)) == 37
     assert [command[0] for command in calls][-2:] == [
         str(iconvert), str(ffmpeg)
     ]

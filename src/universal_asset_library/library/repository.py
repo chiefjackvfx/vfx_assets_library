@@ -79,6 +79,9 @@ from universal_asset_library.previews import (
     resolve_ffmpeg,
 )
 from universal_asset_library.previews.hdri_renderer import select_hdri_file
+from universal_asset_library.previews.vdb_config import (
+    normalize_vdb_turntable_workers,
+)
 from universal_asset_library.integrations.model_conversion import (
     ModelConversionError,
     ModelConversionResult,
@@ -290,7 +293,9 @@ class LibraryRepository:
         self.ffmpeg_path = ffmpeg_path
         self.houdini_path = houdini_path
         self.vdb_template_path = Path(vdb_template_path) if vdb_template_path else None
-        self.vdb_parallel_renders = max(1, min(4, int(vdb_parallel_renders)))
+        self.vdb_parallel_renders = normalize_vdb_turntable_workers(
+            vdb_parallel_renders
+        )
 
     def initialize(self) -> None:
         if not self.root.exists() or not self.root.is_dir():

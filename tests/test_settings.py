@@ -53,11 +53,11 @@ def test_houdini_preview_path_round_trip(tmp_path) -> None:
 
     saved = store.save(AppSettings(
         houdini_path=str(executable),
-        vdb_parallel_renders=4,
+        vdb_parallel_renders=12,
     ))
 
     assert saved.houdini_path == str(executable)
-    assert saved.vdb_parallel_renders == 4
+    assert saved.vdb_parallel_renders == 12
     assert store.load() == saved
 
 
