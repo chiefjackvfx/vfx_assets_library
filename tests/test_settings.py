@@ -5,6 +5,8 @@ from PyQt6.QtCore import QCoreApplication, QSettings
 
 from universal_asset_library.settings import (
     AppSettings,
+    DEFAULT_DEADLINE_COMMAND,
+    DEFAULT_HUSK_SUBMITTER,
     SettingsStore,
     normalize_library_path,
     validate_library_path,
@@ -27,6 +29,25 @@ def test_defaults_and_round_trip(tmp_path) -> None:
     assert saved.library_path == normalize_library_path(str(library))
     assert store.load() == saved
     assert store.load().default_model_category == "Furniture"
+    assert saved.deadline_command_path == DEFAULT_DEADLINE_COMMAND
+    assert saved.husk_submitter_path == DEFAULT_HUSK_SUBMITTER
+
+
+def test_deadline_husk_paths_round_trip(tmp_path) -> None:
+    store = make_store(tmp_path)
+    command = tmp_path / "deadlinecommand"
+    submitter = tmp_path / "HuskStandaloneSubmission.py"
+    command.write_bytes(b"command")
+    submitter.write_bytes(b"script")
+
+    saved = store.save(AppSettings(
+        deadline_command_path=str(command),
+        husk_submitter_path=str(submitter),
+    ))
+
+    assert saved.deadline_command_path == str(command)
+    assert saved.husk_submitter_path == str(submitter)
+    assert store.load() == saved
 
 
 def test_blender_and_hdri_render_preferences_round_trip(tmp_path) -> None:

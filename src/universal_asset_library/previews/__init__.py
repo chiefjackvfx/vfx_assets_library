@@ -35,6 +35,20 @@ from .blender_preview_session import (
     BlenderPreviewSession,
     BlenderPreviewSessionError,
 )
+from .vdb_deadline import (
+    DEADLINE_BACKEND,
+    VdbDeadlineExportItem,
+    VdbDeadlineExportResult,
+    VdbDeadlineFinalizationResult,
+    deadline_debug,
+    deadline_frame_count,
+    deadline_frame_paths,
+    deadline_frame_signature,
+    export_deadline_usds,
+    finalize_deadline_turntable,
+    launch_husk_submitter,
+    validate_deadline_husk,
+)
 
 __all__ = [
     "HdriPreviewRequest",
@@ -64,4 +78,16 @@ __all__ = [
     "resolve_houdini_executable",
     "resolve_iconvert",
     "validate_houdini_executable",
+    "DEADLINE_BACKEND",
+    "VdbDeadlineExportItem",
+    "VdbDeadlineExportResult",
+    "VdbDeadlineFinalizationResult",
+    "deadline_debug",
+    "deadline_frame_count",
+    "deadline_frame_paths",
+    "deadline_frame_signature",
+    "export_deadline_usds",
+    "finalize_deadline_turntable",
+    "launch_husk_submitter",
+    "validate_deadline_husk",
 ]

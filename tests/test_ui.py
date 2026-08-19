@@ -9,7 +9,6 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PyQt6.QtCore import QEvent, QPoint, QRect, QItemSelectionModel, QSettings, QThreadPool, Qt
 from PyQt6.QtGui import QColor, QCloseEvent, QImage, QPixmap
-from PyQt6.QtMultimedia import QMediaPlayer
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMessageBox
 
@@ -23,6 +22,7 @@ from universal_asset_library.ui.assets_tab import (
     MetadataUpdateWorker,
     ModelAssetRescanDialog,
     ModelConversionDialog,
+    VdbDeadlineBatchDialog,
     TagEditor,
     StarRatingWidget,
     TextureCardDelegate,
@@ -318,11 +318,112 @@ def test_vdb_importer_review_and_catalog_detail_defaults_to_mid(app, tmp_path) -
     assert panel.hdri_render_button.text() == "Generate preview"
     assert panel.hdri_render_button.menu() is panel.vdb_preview_menu
     assert [action.text() for action in panel.vdb_preview_menu.actions()] == [
-        "Still", "Generate turn table"
+        "Still", "Generate turn table", "Generate with Deadline Husk…", "",
+        "Resubmit Deadline USD",
+        "Retry Deadline finalization", "Stop watching Deadline preview",
     ]
     assert panel.houdini_send_button.text() == "Create File SOP in Houdini"
     assert panel.dcc_app.isHidden()
     assert panel.dcc_stack.currentWidget() is panel.houdini_dcc_page
+
+
+def test_vdb_detail_offers_deadline_regeneration_for_missing_preview(
+    app, tmp_path
+) -> None:
+    source = tmp_path / "clouds"
+    library = tmp_path / "library"
+    source.mkdir()
+    library.mkdir()
+    (source / "cloud_Mid_Res.vdb").write_bytes(b"VDB")
+    asset = LibraryRepository(library).import_vdbs(
+        scan_vdb_folder(source).materials
+    ).imported[0]
+    asset = replace(
+        asset,
+        thumbnail_path=asset.asset_dir / "previews" / "missing.jpg",
+        hero_path=asset.asset_dir / "previews" / "missing.jpg",
+        preview_path=asset.asset_dir / "previews" / "missing.mp4",
+        preview_render={
+            "backend": "deadline_husk",
+            "status": "ready",
+            "mode": "turntable",
+            "variant": "Mid",
+            "density_scale": 100,
+            "frame_start": 1,
+            "frame_end": 36,
+        },
+    )
+    panel = DetailPanel()
+    requested = []
+    panel.vdb_deadline_generate_requested.connect(requested.append)
+
+    panel.show_asset(asset)
+
+    assert panel.hdri_render_button.text() == "Regenerate preview"
+    assert panel.vdb_deadline_generate_action.text() == (
+        "Regenerate with Deadline Husk…"
+    )
+    assert panel.vdb_deadline_generate_action.isEnabled()
+    assert "missing" in panel.hdri_render_status.text().casefold()
+    assert panel.hero.text() == "No preview"
+    assert not TextureCardDelegate._has_3d_preview(asset)
+    panel.vdb_deadline_generate_action.trigger()
+    assert requested == [asset]
+
+    cached_preview = asset.asset_dir / "previews" / "cached.jpg"
+    cached_preview.parent.mkdir(parents=True, exist_ok=True)
+    image = QImage(64, 64, QImage.Format.Format_RGB32)
+    image.fill(QColor("#334455"))
+    assert image.save(str(cached_preview), "JPG", 90)
+    cached_asset = replace(asset, thumbnail_path=cached_preview)
+    delegate = TextureCardDelegate()
+    assert not delegate._thumbnail(cached_asset).isNull()
+    cached_preview.unlink()
+    assert delegate._thumbnail(cached_asset) is None
+
+
+def test_deadline_regeneration_discards_stale_local_preview_lock(
+    app, tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "clouds"
+    library = tmp_path / "library"
+    source.mkdir()
+    library.mkdir()
+    (source / "cloud_Mid_Res.vdb").write_bytes(b"VDB")
+    asset = LibraryRepository(library).import_vdbs(
+        scan_vdb_folder(source).materials
+    ).imported[0]
+    tab = AssetsTab()
+    tab._library_path = str(library)
+    tab._preview_render_ids.add(asset.id)
+    opened = []
+    warnings = []
+
+    class RejectedDialog:
+        requested_variant = "Mid"
+        density_scale = 100
+
+        def __init__(self, assets, *_args):
+            opened.extend(assets)
+
+        @staticmethod
+        def exec():
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(
+        assets_tab_module, "VdbDeadlineBatchDialog", RejectedDialog
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *_args, **_kwargs: warnings.append(_args),
+    )
+
+    tab._open_deadline_vdb_batch((asset,))
+
+    assert opened == [asset]
+    assert warnings == []
+    assert asset.id not in tab._preview_render_ids
 
 
 def test_vdb_preview_is_manual_only_and_uses_houdini_serial_queue(
@@ -430,7 +531,9 @@ def test_multiple_selected_vdbs_offer_bulk_still_and_turntable_previews(
     assert tab.bulk_preview_button.menu() is tab.bulk_vdb_preview_menu
     assert [
         action.text() for action in tab.bulk_vdb_preview_menu.actions()
-    ] == ["Still previews", "Turntable previews"]
+    ] == [
+        "Still previews", "Turntable previews", "Deadline Husk turntables…"
+    ]
     tab.bulk_preview_button.click()
     assert not started
 
@@ -450,6 +553,30 @@ def test_multiple_selected_vdbs_offer_bulk_still_and_turntable_previews(
     assert started[0].mode == "turntable"
     assert started[0].density_scale == 185
     tab.shutdown_preview_queue()
+
+
+def test_deadline_vdb_batch_dialog_exposes_shared_batch_settings(
+    app, tmp_path
+) -> None:
+    source = tmp_path / "clouds"
+    library = tmp_path / "library"
+    source.mkdir()
+    library.mkdir()
+    for label in ("Low", "Mid", "High"):
+        (source / f"cloud_{label}_Res.vdb").write_bytes(label.encode())
+    asset = LibraryRepository(library).import_vdbs(
+        scan_vdb_folder(source).materials
+    ).imported[0]
+
+    dialog = VdbDeadlineBatchDialog((asset,), "High", 185)
+
+    assert dialog.requested_variant == "High"
+    assert dialog.density_scale == 185
+    assert dialog.frame_range.text() == "1–36 (template turntable)"
+    assert "previews/deadline" in dialog.output.text()
+    assert dialog.buttons.button(
+        QDialogButtonBox.StandardButton.Ok
+    ).text() == "Export and open Deadline"
 
 
 def test_assets_category_rail_filters_primary_categories_and_live_counts(app, tmp_path) -> None:

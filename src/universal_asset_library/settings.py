@@ -14,6 +14,11 @@ from .previews.vdb_config import normalize_vdb_turntable_workers
 THUMBNAIL_SIZES = ("small", "medium", "large")
 DEFAULT_THUMBNAIL_SIZE = "medium"
 DEFAULT_IMPORT_CATEGORY = "Uncategorized"
+DEFAULT_DEADLINE_COMMAND = "/opt/Thinkbox/Deadline10/bin/deadlinecommand"
+DEFAULT_HUSK_SUBMITTER = (
+    "/mnt/DeadlineRepository10/custom/scripts/Submission/"
+    "HuskStandaloneSubmission.py"
+)
 
 
 def normalize_library_path(value: str) -> str:
@@ -62,6 +67,8 @@ class AppSettings:
     ffmpeg_path: str = ""
     stock_hover_previews: bool = True
     vdb_parallel_renders: int = 2
+    deadline_command_path: str = DEFAULT_DEADLINE_COMMAND
+    husk_submitter_path: str = DEFAULT_HUSK_SUBMITTER
 
     def normalized(self) -> "AppSettings":
         library_path = normalize_library_path(self.library_path)
@@ -87,6 +94,12 @@ class AppSettings:
             stock_hover_previews=bool(self.stock_hover_previews),
             vdb_parallel_renders=normalize_vdb_turntable_workers(
                 _setting_int(self.vdb_parallel_renders, 2)
+            ),
+            deadline_command_path=normalize_executable_path(
+                self.deadline_command_path
+            ),
+            husk_submitter_path=normalize_executable_path(
+                self.husk_submitter_path
             ),
         )
 
@@ -119,6 +132,12 @@ class SettingsStore:
             vdb_parallel_renders=_setting_int(
                 self._settings.value("previews/vdb_parallel_renders", 2), 2
             ),
+            deadline_command_path=str(self._settings.value(
+                "tools/deadline_command_path", DEFAULT_DEADLINE_COMMAND
+            ) or ""),
+            husk_submitter_path=str(self._settings.value(
+                "tools/husk_submitter_path", DEFAULT_HUSK_SUBMITTER
+            ) or ""),
         ).normalized()
 
     def save(self, settings: AppSettings) -> AppSettings:
@@ -148,6 +167,14 @@ class SettingsStore:
         self._settings.setValue(
             "previews/vdb_parallel_renders",
             normalized.vdb_parallel_renders,
+        )
+        self._settings.setValue(
+            "tools/deadline_command_path",
+            normalized.deadline_command_path,
+        )
+        self._settings.setValue(
+            "tools/husk_submitter_path",
+            normalized.husk_submitter_path,
         )
         self._settings.sync()
         if self._settings.status() != QSettings.Status.NoError:

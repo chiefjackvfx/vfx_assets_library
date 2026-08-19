@@ -12,11 +12,20 @@ import pytest
 from universal_asset_library.importer import scan_vdb_folder
 from universal_asset_library.library import LibraryRepository
 from universal_asset_library.previews import (
+    VdbDeadlineExportResult,
+    VdbDeadlineFinalizationResult,
     VdbPreviewRequest,
     VdbPreviewResult,
     render_vdb_preview,
     resolve_houdini_executable,
     validate_houdini_executable,
+)
+from universal_asset_library.previews.houdini_vdb_deadline_driver import (
+    export_batch as export_deadline_batch,
+)
+from universal_asset_library.previews.vdb_deadline import (
+    finalize_deadline_turntable,
+    launch_husk_submitter,
 )
 from universal_asset_library.previews.houdini_vdb_driver import render as render_driver
 
@@ -282,6 +291,357 @@ def test_houdini_driver_renders_complete_turntable_range(tmp_path: Path) -> None
     }]
     assert Path(str(output).replace("$F4", "0001")).is_file()
     assert Path(str(output).replace("$F4", "0036")).is_file()
+
+
+class _DeadlineNode:
+    def __init__(self, path: str, parm_names: tuple[str, ...]) -> None:
+        self._path = path
+        self.parms = {name: _Parm() for name in parm_names}
+        self.render_calls = []
+        self.cook_calls = []
+
+    def path(self) -> str:
+        return self._path
+
+    def parm(self, name):
+        return self.parms.get(name)
+
+    def cook(self, **kwargs) -> None:
+        self.cook_calls.append(kwargs)
+
+    def errors(self):
+        return ()
+
+    def render(self, **kwargs) -> None:
+        self.render_calls.append(kwargs)
+        output = Path(self.parms["lopoutput"].value)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"USD")
+
+
+class _DeadlineHou:
+    def __init__(self) -> None:
+        self.hipFile = _HipFile()
+        self.file_node = _DeadlineNode("/obj/VDB/file1", ("file",))
+        self.pyro = _DeadlineNode(
+            "/stage/materiallibrary1/karmacloudmaterial1/kma_pyroshader1",
+            ("densityscale",),
+        )
+        self.settings = _DeadlineNode(
+            "/stage/karmarendersettings", ("picture",)
+        )
+        self.camera = _DeadlineNode(
+            "/stage/camera1",
+            (
+                "xn__shutteropen_0ta",
+                "xn__shutterclose_nva",
+                "sample_shutterrange1",
+                "sample_shutterrange2",
+            ),
+        )
+        self.usd_rop = _DeadlineNode(
+            "/stage/usd_rop1",
+            (
+                "lopoutput",
+                "savestyle",
+                "flattenfilelayers",
+                "flattensoplayers",
+                "trange",
+                "f1",
+                "f2",
+                "f3",
+                "fileperframe",
+                "savetimeinfo",
+            ),
+        )
+        self.requested_nodes = []
+
+    def node(self, path):
+        self.requested_nodes.append(path)
+        return {
+            "/obj/VDB/file1": self.file_node,
+            "/stage/materiallibrary1/karmacloudmaterial1/kma_pyroshader1": self.pyro,
+            "/stage/karmarendersettings": self.settings,
+            "/stage/camera1": self.camera,
+            "/stage/usd_rop1": self.usd_rop,
+        }.get(path)
+
+    def setFrame(self, _frame) -> None:
+        pass
+
+    @staticmethod
+    def applicationVersionString() -> str:
+        return "22.0.368"
+
+    @staticmethod
+    def fps() -> float:
+        return 25.0
+
+
+def test_deadline_driver_exports_usd_rop_without_rendering_karma(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "universal_asset_library.previews.houdini_vdb_deadline_driver."
+        "_validate_flattened_usd",
+        lambda *_args: None,
+    )
+    hou = _DeadlineHou()
+    template = tmp_path / "template.hip"
+    template.write_bytes(b"HIP")
+    usd = tmp_path / "shared" / "cloud.usd"
+    exr = tmp_path / "shared" / "cloud.$F4.exr"
+
+    result = export_deadline_batch(hou, {
+        "template_path": str(template),
+        "frame_start": 1,
+        "frame_end": 36,
+        "items": [{
+            "asset_id": "cloud",
+            "asset_name": "Cloud",
+            "vdb_path": "/library/cloud_$F4.vdb",
+            "usd_path": str(usd),
+            "exr_pattern": str(exr),
+            "density_scale": 185,
+        }],
+    })
+
+    assert result["ok"] is True
+    assert result["fps"] == 25.0
+    assert usd.read_bytes() == b"USD"
+    assert hou.settings.parms["picture"].value == str(exr)
+    assert hou.camera.parms["xn__shutteropen_0ta"].value == 0.0
+    assert hou.camera.parms["xn__shutterclose_nva"].value == 0.0
+    assert hou.camera.parms["sample_shutterrange1"].value == 0.0
+    assert hou.camera.parms["sample_shutterrange2"].value == 0.0
+    assert hou.usd_rop.parms["lopoutput"].value == str(usd)
+    assert hou.usd_rop.parms["savestyle"].value == "flattenstage"
+    assert hou.usd_rop.parms["flattenfilelayers"].value == 1
+    assert hou.usd_rop.parms["flattensoplayers"].value == 1
+    assert hou.usd_rop.parms["fileperframe"].value == 0
+    assert hou.usd_rop.render_calls == [{
+        "frame_range": (1, 36, 1),
+        "verbose": True,
+        "output_progress": True,
+    }]
+    assert "/stage/usdrender_rop1" not in hou.requested_nodes
+    terminal = capsys.readouterr().out
+    assert "SHOTBOX_DEBUG:Loading VDB template" in terminal
+    assert "motion blur disabled" in terminal
+    assert "SHOTBOX_PROGRESS:[1/1] Exporting Cloud USD" in terminal
+    assert "1/1 succeeded" in terminal
+
+
+def test_deadline_driver_continues_after_one_asset_export_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "universal_asset_library.previews.houdini_vdb_deadline_driver."
+        "_validate_flattened_usd",
+        lambda *_args: None,
+    )
+    hou = _DeadlineHou()
+    template = tmp_path / "template.hip"
+    template.write_bytes(b"HIP")
+    first = tmp_path / "first.usd"
+
+    result = export_deadline_batch(hou, {
+        "template_path": str(template),
+        "items": [
+            {
+                "asset_id": "first", "asset_name": "First",
+                "vdb_path": "/library/first.vdb", "usd_path": str(first),
+                "exr_pattern": str(tmp_path / "first.$F4.exr"),
+                "density_scale": 100,
+            },
+            {
+                "asset_id": "bad", "asset_name": "Bad",
+                "vdb_path": "/library/bad.vdb",
+                "usd_path": str(tmp_path / "bad.usd"),
+                "exr_pattern": str(tmp_path / "bad.$F4.exr"),
+                "density_scale": 5,
+            },
+        ],
+    })
+
+    assert result["ok"] is True
+    assert first.is_file()
+    assert [item["ok"] for item in result["items"]] == [True, False]
+    assert "between 10 and 500" in result["items"][1]["diagnostic"]
+
+
+def test_deadline_submitter_uses_one_exact_argument_vector(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls = []
+
+    class Process:
+        pass
+
+    monkeypatch.setattr(
+        "universal_asset_library.previews.vdb_deadline.subprocess.Popen",
+        lambda command, **kwargs: calls.append((command, kwargs)) or Process(),
+    )
+    paths = (tmp_path / "one.usd", tmp_path / "two.usd")
+
+    launch_husk_submitter("/deadlinecommand", "/submitter.py", paths)
+
+    assert calls[0][0] == [
+        "/deadlinecommand", "ExecuteScript", "/submitter.py",
+        str(paths[0]), str(paths[1]), "--modal",
+    ]
+    assert calls[0][1]["start_new_session"] is True
+
+
+def test_deadline_finalizer_uses_houdini_auto_color_transform(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    exr_pattern = tmp_path / "farm" / "cloud.$F4.exr"
+    exr_pattern.parent.mkdir(parents=True)
+    for frame in range(1, 37):
+        Path(str(exr_pattern).replace("$F4", f"{frame:04d}")).write_bytes(
+            b"EXR"
+        )
+    calls = []
+
+    monkeypatch.setattr(
+        "universal_asset_library.previews.vdb_deadline.resolve_houdini_executable",
+        lambda _path: "/hython",
+    )
+    monkeypatch.setattr(
+        "universal_asset_library.previews.vdb_deadline.resolve_iconvert",
+        lambda _path: "/iconvert",
+    )
+    monkeypatch.setattr(
+        "universal_asset_library.previews.vdb_deadline.resolve_ffmpeg",
+        lambda _path: "/ffmpeg",
+    )
+
+    def fake_process(command, *_args, **_kwargs):
+        calls.append(command)
+        output = Path(command[-1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if command[0] == "/iconvert":
+            image = QImage(640, 480, QImage.Format.Format_RGB32)
+            image.fill(QColor("#334455"))
+            image_format = "PNG" if output.suffix == ".png" else "JPG"
+            assert image.save(str(output), image_format, 90)
+        else:
+            output.write_bytes(b"MP4")
+        return "ok"
+
+    monkeypatch.setattr(
+        "universal_asset_library.previews.vdb_deadline._run_process",
+        fake_process,
+    )
+
+    result = finalize_deadline_turntable(
+        exr_pattern, tmp_path / "output", "Cloud"
+    )
+
+    iconvert_calls = [command for command in calls if command[0] == "/iconvert"]
+    assert len(iconvert_calls) == 37
+    assert all(
+        command[1:5] == ["-d", "8", "-g", "auto"]
+        for command in iconvert_calls
+    )
+    assert result.jpeg_path.is_file()
+    assert result.video_path.is_file()
+    terminal = capsys.readouterr().out
+    assert "[ShotBox Deadline] Finalizing Cloud: 36 stable EXRs found" in terminal
+    assert "[ShotBox Deadline] Encoding Cloud MP4" in terminal
+    assert "[ShotBox Deadline] Finalization complete for Cloud" in terminal
+
+
+def test_repository_deadline_export_tracks_and_finalizes_shared_frames(
+    tmp_path: Path, monkeypatch
+) -> None:
+    library, asset = _import_static_vdb(tmp_path)
+    template = tmp_path / "template.hip"
+    template.write_bytes(b"template")
+
+    def fake_export(items, **_kwargs):
+        for item in items:
+            item.usd_path.parent.mkdir(parents=True, exist_ok=True)
+            item.usd_path.write_bytes(b"USD")
+        return VdbDeadlineExportResult(
+            successful=items,
+            houdini_version="22.0.368",
+            fps=25.0,
+        )
+
+    monkeypatch.setattr(
+        "universal_asset_library.library.repository.export_deadline_usds",
+        fake_export,
+    )
+    repository = LibraryRepository(
+        library, houdini_path="/hython", vdb_template_path=template
+    )
+    batch = repository.prepare_vdb_deadline_turntables(
+        {asset.id: "Mid"}, density_scale=185
+    )
+    pending = batch.assets[0]
+    render = pending.preview_render
+    farm_dir = pending.asset_dir / render["farm_directory"]
+    exr_pattern = pending.asset_dir / render["exr_pattern"]
+    assert render["backend"] == "deadline_husk"
+    assert render["status"] == "awaiting_deadline"
+    assert render["frame_end"] == 36
+    assert render["fps"] == 25.0
+    assert batch.exports.successful[0].usd_path.is_file()
+
+    for frame in range(1, 37):
+        Path(str(exr_pattern).replace("$F4", f"{frame:04d}")).write_bytes(
+            b"EXR"
+        )
+    assert repository.deadline_vdb_frame_signature(asset.id) is not None
+
+    def fake_finalize(_pattern, output_dir, _name, **_kwargs):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        jpeg = output_dir / "Cloud_Formation_001_VDB_Preview.jpg"
+        image = QImage(640, 480, QImage.Format.Format_RGB32)
+        image.fill(QColor("#334455"))
+        assert image.save(str(jpeg), "JPG", 90)
+        video = output_dir / "Cloud_Formation_001_VDB_Turntable.mp4"
+        video.write_bytes(b"MP4")
+        return VdbDeadlineFinalizationResult(
+            jpeg, video, 640, 480, "2026-08-19T12:00:00+00:00"
+        )
+
+    monkeypatch.setattr(
+        "universal_asset_library.library.repository.finalize_deadline_turntable",
+        fake_finalize,
+    )
+    update = repository.finalize_vdb_deadline_turntable(asset.id)
+
+    assert update.asset.preview_render["status"] == "ready"
+    assert update.asset.preview_render["backend"] == "deadline_husk"
+    assert update.asset.preview_render["farm_files_retained"] is False
+    assert update.asset.hero_path.is_file()
+    assert update.asset.preview_path.read_bytes() == b"MP4"
+    assert not farm_dir.exists()
+
+    update.asset.hero_path.unlink()
+    update.asset.preview_path.unlink()
+    regenerated = repository.prepare_vdb_deadline_turntables(
+        {asset.id: "Mid"}, density_scale=185
+    )
+
+    regenerated_render = regenerated.assets[0].preview_render
+    assert regenerated_render["status"] == "awaiting_deadline"
+    assert regenerated_render["submission_id"] != render["submission_id"]
+    assert regenerated.exports.successful[0].usd_path.is_file()
+
+    monkeypatch.setattr(
+        "universal_asset_library.library.repository._asset_manifest_paths",
+        lambda _root: (_ for _ in ()).throw(
+            AssertionError("direct Deadline actions must not scan the library")
+        ),
+    )
+    abandoned = repository.abandon_vdb_deadline_preview(
+        asset.id, asset_dir=regenerated.assets[0].asset_dir
+    )
+    assert abandoned.preview_render["status"] == "canceled"
 
 
 def test_renderer_converts_exr_and_reports_metadata(tmp_path: Path, monkeypatch) -> None:

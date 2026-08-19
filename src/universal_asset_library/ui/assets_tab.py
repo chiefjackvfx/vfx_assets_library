@@ -8,7 +8,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from PyQt6.QtCore import QAbstractListModel, QEvent, QItemSelectionModel, QModelIndex, QObject, QPoint, QPersistentModelIndex, QProcess, QRect, QRectF, QRunnable, QSettings, QSize, Qt, QSortFilterProxyModel, QThreadPool, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QAbstractListModel, QEvent, QModelIndex, QObject, QPoint, QPersistentModelIndex, QProcess, QRect, QRectF, QRunnable, QSettings, QSize, Qt, QSortFilterProxyModel, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSlider,
+    QSpinBox,
     QSplitter,
     QStackedWidget,
     QStyle,
@@ -102,7 +103,15 @@ from universal_asset_library.integrations import (
     prepare_texture_export,
     validate_model_conversion_blender,
 )
-from universal_asset_library.previews import BlenderPreviewSession
+from universal_asset_library.previews import (
+    BlenderPreviewSession,
+    DEADLINE_BACKEND,
+    deadline_debug,
+    deadline_frame_count,
+    deadline_frame_signature,
+    launch_husk_submitter,
+    validate_deadline_husk,
+)
 from universal_asset_library.previews.vdb_config import (
     normalize_vdb_turntable_workers,
 )
@@ -758,6 +767,85 @@ class ModelConversionDialog(QDialog):
             self.accept()
 
 
+class VdbDeadlineBatchDialog(QDialog):
+    def __init__(
+        self,
+        assets: tuple[LibraryVdbAsset, ...],
+        requested_variant: str = "Mid",
+        density_scale: int = 100,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Deadline Husk VDB turntables")
+        self.setMinimumWidth(520)
+        layout = QVBoxLayout(self)
+        heading = QLabel("Export USD and render on Deadline")
+        heading.setObjectName("pageTitle")
+        layout.addWidget(heading)
+        summary = QLabel(
+            f"{len(assets)} selected VDBs will export through /stage/usd_rop1. "
+            "The Deadline Husk panel opens next for farm settings."
+        )
+        summary.setObjectName("mutedLabel")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+        form = QFormLayout()
+        self.variant = QComboBox()
+        available = {label for asset in assets for label in asset.variants}
+        labels = sorted(
+            available,
+            key=lambda value: (
+                {"low": 0, "mid": 1, "high": 2}.get(value.casefold(), 99),
+                value.casefold(),
+            ),
+        )
+        self.variant.addItems(labels)
+        match = next(
+            (label for label in labels if label.casefold() == requested_variant.casefold()),
+            labels[0] if labels else "",
+        )
+        self.variant.setCurrentText(match)
+        self.density = QSpinBox()
+        self.density.setRange(10, 500)
+        self.density.setValue(max(10, min(500, density_scale)))
+        self.frame_range = QLabel("1–36 (template turntable)")
+        self.output = QLabel("Each asset's previews/deadline/<submission-id>/ folder")
+        self.output.setWordWrap(True)
+        form.addRow("Requested variant", self.variant)
+        form.addRow("Pyro density", self.density)
+        form.addRow("Frame range", self.frame_range)
+        form.addRow("Shared farm output", self.output)
+        layout.addLayout(form)
+        fallback = QLabel(
+            "If an asset does not have the requested variant, ShotBox uses its "
+            "normal Mid, Low, then High fallback."
+        )
+        fallback.setObjectName("mutedLabel")
+        fallback.setWordWrap(True)
+        layout.addWidget(fallback)
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Export and open Deadline"
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
+            bool(labels)
+        )
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    @property
+    def requested_variant(self) -> str:
+        return self.variant.currentText()
+
+    @property
+    def density_scale(self) -> int:
+        return self.density.value()
+
+
 class TextureListModel(QAbstractListModel):
     def __init__(self, assets: list[AssetRecord] | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1146,6 +1234,7 @@ class TextureCardDelegate(QStyledItemDelegate):
             isinstance(asset, LibraryVdbAsset)
             and asset.preview_path is not None
             and asset.preview_path.suffix.casefold() == ".mp4"
+            and asset.preview_path.is_file()
         )
 
     @staticmethod
@@ -1284,6 +1373,12 @@ class TextureCardDelegate(QStyledItemDelegate):
         if not asset.thumbnail_path:
             return None
         path = str(asset.thumbnail_path)
+        if not asset.thumbnail_path.is_file():
+            prefix = f"{path}|"
+            for key in tuple(self._pixmaps):
+                if key.startswith(prefix):
+                    del self._pixmaps[key]
+            return None
         target_width = max(1, self.card_size.width() - 10)
         aspect_mode = (
             Qt.AspectRatioMode.KeepAspectRatio
@@ -1714,6 +1809,10 @@ class DetailPanel(QFrame):
     hdri_render_canceled = pyqtSignal()
     vdb_render_requested = pyqtSignal(object, str, int, str)
     vdb_render_canceled = pyqtSignal()
+    vdb_deadline_generate_requested = pyqtSignal(object)
+    vdb_deadline_resubmit_requested = pyqtSignal(object)
+    vdb_deadline_retry_requested = pyqtSignal(object)
+    vdb_deadline_abandon_requested = pyqtSignal(object)
     houdini_send_requested = pyqtSignal(object, str, str, object)
     houdini_refresh_requested = pyqtSignal()
     blender_send_requested = pyqtSignal(object, str, str, object)
@@ -1895,13 +1994,46 @@ class DetailPanel(QFrame):
         self.vdb_turntable_action = QAction(
             "Generate turn table", self.vdb_preview_menu
         )
+        self.vdb_deadline_generate_action = QAction(
+            "Generate with Deadline Husk…", self.vdb_preview_menu
+        )
         self.vdb_preview_menu.addAction(self.vdb_still_action)
         self.vdb_preview_menu.addAction(self.vdb_turntable_action)
+        self.vdb_preview_menu.addAction(self.vdb_deadline_generate_action)
+        self.vdb_preview_menu.addSeparator()
+        self.vdb_deadline_resubmit_action = QAction(
+            "Resubmit Deadline USD", self.vdb_preview_menu
+        )
+        self.vdb_deadline_retry_action = QAction(
+            "Retry Deadline finalization", self.vdb_preview_menu
+        )
+        self.vdb_deadline_abandon_action = QAction(
+            "Stop watching Deadline preview", self.vdb_preview_menu
+        )
+        self.vdb_preview_menu.addAction(self.vdb_deadline_resubmit_action)
+        self.vdb_preview_menu.addAction(self.vdb_deadline_retry_action)
+        self.vdb_preview_menu.addAction(self.vdb_deadline_abandon_action)
         self.vdb_still_action.triggered.connect(
             lambda _checked=False: self._request_preview_render("still")
         )
         self.vdb_turntable_action.triggered.connect(
             lambda _checked=False: self._request_preview_render("turntable")
+        )
+        self.vdb_deadline_generate_action.triggered.connect(
+            lambda _checked=False: self._asset
+            and self.vdb_deadline_generate_requested.emit(self._asset)
+        )
+        self.vdb_deadline_resubmit_action.triggered.connect(
+            lambda _checked=False: self._asset
+            and self.vdb_deadline_resubmit_requested.emit(self._asset)
+        )
+        self.vdb_deadline_retry_action.triggered.connect(
+            lambda _checked=False: self._asset
+            and self.vdb_deadline_retry_requested.emit(self._asset)
+        )
+        self.vdb_deadline_abandon_action.triggered.connect(
+            lambda _checked=False: self._asset
+            and self.vdb_deadline_abandon_requested.emit(self._asset)
         )
         self.hdri_cancel_button = QPushButton("Cancel render")
         self.hdri_cancel_button.clicked.connect(self._cancel_preview_render)
@@ -2184,6 +2316,9 @@ class DetailPanel(QFrame):
         self.vdb_density_label.hide()
         self.vdb_density_slider.hide()
         self.vdb_density_value.hide()
+        self.vdb_deadline_resubmit_action.setVisible(False)
+        self.vdb_deadline_retry_action.setVisible(False)
+        self.vdb_deadline_abandon_action.setVisible(False)
         self.model_convert_cancel.hide()
         self.model_convert_status.hide()
         for widget in (
@@ -2240,7 +2375,7 @@ class DetailPanel(QFrame):
         elif has_video_preview:
             self.stock_seek.setRange(0, 0)
             self.stock_time.setText("0:00 / 0:00")
-        preview = asset.hero_path or asset.thumbnail_path
+        preview = _classification_preview(asset)
         pixmap = QPixmap(str(preview)) if preview else QPixmap()
         if pixmap.isNull():
             self.hero.setPixmap(QPixmap())
@@ -2464,6 +2599,37 @@ class DetailPanel(QFrame):
             render = asset.preview_render
             status = str(render.get("status", "pending"))
             diagnostic = str(render.get("diagnostic", ""))
+            deadline_render = render.get("backend") == DEADLINE_BACKEND
+            deadline_active = deadline_render and status in {
+                "preparing", "awaiting_deadline", "finalizing"
+            }
+            self.vdb_still_action.setEnabled(not deadline_active)
+            self.vdb_turntable_action.setEnabled(not deadline_active)
+            self.vdb_deadline_generate_action.setEnabled(not deadline_active)
+            self.vdb_deadline_generate_action.setText(
+                "Regenerate with Deadline Husk…"
+                if status == "ready" or deadline_render
+                else "Generate with Deadline Husk…"
+            )
+            self.vdb_deadline_resubmit_action.setVisible(
+                deadline_render and bool(render.get("usd_path"))
+            )
+            self.vdb_deadline_retry_action.setVisible(
+                deadline_render
+                and status in {"awaiting_deadline", "finalizing", "failed"}
+            )
+            self.vdb_deadline_abandon_action.setVisible(
+                deadline_render
+                and status in {"preparing", "awaiting_deadline", "failed"}
+            )
+            hero_missing = not asset.hero_path or not asset.hero_path.is_file()
+            video_missing = (
+                render.get("mode") == "turntable"
+                and (not asset.preview_path or not asset.preview_path.is_file())
+            )
+            preview_missing = status == "ready" and (
+                hero_missing or video_missing
+            )
             self.hdri_render_button.setText(
                 "Regenerate preview" if status == "ready" else "Generate preview"
             )
@@ -2476,19 +2642,23 @@ class DetailPanel(QFrame):
                 if render.get("mode") == "turntable"
                 else "frame 1"
             )
-            self.hdri_render_status.setText(
-                (
+            if preview_missing:
+                preview_status = "Managed preview file is missing; regenerate it."
+            elif status == "ready" and rendered_variant:
+                preview_status = (
                     f"Houdini {'turntable' if render.get('mode') == 'turntable' else 'still'} ready · "
                     f"{rendered_variant} · "
                     f"{frame_status}"
-                    if status == "ready" and rendered_variant
-                    else "Houdini preview ready"
-                    if status == "ready"
-                    else diagnostic or f"Preview render: {status}"
                 )
-            )
+            elif status == "ready":
+                preview_status = "Houdini preview ready"
+            else:
+                preview_status = diagnostic or f"Preview render: {status}"
+            self.hdri_render_status.setText(preview_status)
             self.hdri_render_status.setStyleSheet(
-                "color:#78c995;" if status == "ready" else "color:#e6b566;"
+                "color:#78c995;"
+                if status == "ready" and not preview_missing
+                else "color:#e6b566;"
             )
             self.hdri_render_status.show()
             self._configure_vdb_dcc(asset)
@@ -3260,6 +3430,85 @@ class HdriRenderWorker(QRunnable):
                 raise
 
 
+class DeadlineVdbExportWorker(QRunnable):
+    def __init__(
+        self,
+        library_path: str,
+        variants: dict[str, str],
+        density_scale: int,
+        houdini_path: str,
+        deadline_command: str,
+        submitter_path: str,
+        token: CancelToken,
+    ) -> None:
+        super().__init__()
+        self.library_path = library_path
+        self.variants = variants
+        self.density_scale = density_scale
+        self.houdini_path = houdini_path
+        self.deadline_command = deadline_command
+        self.submitter_path = submitter_path
+        self.token = token
+        self.signals = HdriRenderSignals()
+
+    def run(self) -> None:
+        try:
+            valid, diagnostic = validate_deadline_husk(
+                self.deadline_command,
+                self.submitter_path,
+                self.houdini_path,
+                self.library_path,
+            )
+            if not valid:
+                raise RuntimeError(diagnostic)
+            result = LibraryRepository(
+                self.library_path,
+                houdini_path=self.houdini_path,
+            ).prepare_vdb_deadline_turntables(
+                self.variants,
+                density_scale=self.density_scale,
+                progress=self.signals.progress.emit,
+                cancel_token=self.token,
+            )
+        except Exception:
+            self.signals.failed.emit(traceback.format_exc(limit=6))
+        else:
+            self.signals.finished.emit(result)
+
+
+class DeadlineVdbFinalizeWorker(QRunnable):
+    def __init__(
+        self,
+        library_path: str,
+        asset_id: str,
+        houdini_path: str,
+        ffmpeg_path: str,
+    ) -> None:
+        super().__init__()
+        self.library_path = library_path
+        self.asset_id = asset_id
+        self.houdini_path = houdini_path
+        self.ffmpeg_path = ffmpeg_path
+        self.token = CancelToken()
+        self.signals = HdriRenderSignals()
+
+    def run(self) -> None:
+        try:
+            result = LibraryRepository(
+                self.library_path,
+                houdini_path=self.houdini_path,
+                ffmpeg_path=self.ffmpeg_path,
+            ).finalize_vdb_deadline_turntable(
+                self.asset_id,
+                progress=self.signals.progress.emit,
+                cancel_token=self.token,
+            )
+        except Exception:
+            self.signals.failed.emit(traceback.format_exc(limit=6))
+        else:
+            self.signals.finished.emit(result)
+
+
 class PreviewSessionCloseWorker(QRunnable):
     def __init__(self, session: BlenderPreviewSession) -> None:
         super().__init__()
@@ -3708,6 +3957,21 @@ class AssetsTab(QWidget):
         self._houdini_path = ""
         self._ffmpeg_path = ""
         self._vdb_parallel_renders = 2
+        self._deadline_command_path = ""
+        self._husk_submitter_path = ""
+        self._deadline_export_worker: DeadlineVdbExportWorker | None = None
+        self._deadline_export_token: CancelToken | None = None
+        self._deadline_export_asset_ids: set[str] = set()
+        self._deadline_finalize_worker: DeadlineVdbFinalizeWorker | None = None
+        self._deadline_finalize_asset_id = ""
+        self._deadline_frame_signatures: dict[
+            str, tuple[tuple[int, int], ...]
+        ] = {}
+        self._deadline_frame_counts: dict[str, int] = {}
+        self._deadline_submitter_processes: list[object] = []
+        self._deadline_monitor = QTimer(self)
+        self._deadline_monitor.setInterval(10_000)
+        self._deadline_monitor.timeout.connect(self._poll_deadline_previews)
         self._save_texture_preview_blend = False
         self._render_hdri_previews_on_import = True
         self._render_texture_previews_on_import = True
@@ -3879,6 +4143,18 @@ class AssetsTab(QWidget):
         self.detail.hdri_render_requested.connect(self._render_hdri_preview)
         self.detail.hdri_render_canceled.connect(self._cancel_hdri_render)
         self.detail.vdb_render_requested.connect(self._render_vdb_preview)
+        self.detail.vdb_deadline_generate_requested.connect(
+            lambda asset: self._open_deadline_vdb_batch((asset,))
+        )
+        self.detail.vdb_deadline_resubmit_requested.connect(
+            self._resubmit_vdb_deadline
+        )
+        self.detail.vdb_deadline_retry_requested.connect(
+            lambda asset: self._start_deadline_finalization(asset.id, force=True)
+        )
+        self.detail.vdb_deadline_abandon_requested.connect(
+            self._abandon_vdb_deadline
+        )
         self.detail.vdb_render_canceled.connect(self._cancel_hdri_render)
         self.detail.houdini_refresh_requested.connect(self.refresh_houdini_sessions)
         self.detail.houdini_send_requested.connect(self._send_hdri_to_houdini)
@@ -3972,15 +4248,24 @@ class AssetsTab(QWidget):
         self.bulk_vdb_turntable_action = QAction(
             "Turntable previews", self.bulk_vdb_preview_menu
         )
+        self.bulk_vdb_deadline_action = QAction(
+            "Deadline Husk turntables…", self.bulk_vdb_preview_menu
+        )
         self.bulk_vdb_preview_menu.addAction(self.bulk_vdb_still_action)
         self.bulk_vdb_preview_menu.addAction(
             self.bulk_vdb_turntable_action
+        )
+        self.bulk_vdb_preview_menu.addAction(
+            self.bulk_vdb_deadline_action
         )
         self.bulk_vdb_still_action.triggered.connect(
             lambda _checked=False: self._queue_selected_previews("still")
         )
         self.bulk_vdb_turntable_action.triggered.connect(
             lambda _checked=False: self._queue_selected_previews("turntable")
+        )
+        self.bulk_vdb_deadline_action.triggered.connect(
+            lambda _checked=False: self._open_deadline_vdb_batch()
         )
         self.bulk_preview_button.clicked.connect(
             self._bulk_preview_clicked
@@ -4119,6 +4404,8 @@ class AssetsTab(QWidget):
         previous_path = self._library_path
         if path != previous_path:
             self._clear_preview_render_queue(cancel_active=True)
+            self._deadline_monitor.stop()
+            self._deadline_frame_signatures.clear()
         self._cancel_catalog_refresh()
         self._library_path = path
         self._catalog_index = None
@@ -4142,6 +4429,7 @@ class AssetsTab(QWidget):
                     for asset in sections.get(asset_type, ())
                 ]
                 self._reindex_all_assets()
+                self._restore_deadline_preview_states()
             except Exception as error:
                 self._show_catalog_error(str(error))
                 return
@@ -4152,6 +4440,31 @@ class AssetsTab(QWidget):
                 self._section_selections[self._section_type()] = selected_id
             self._display_section()
             self._schedule_catalog_refresh()
+
+    def _restore_deadline_preview_states(self) -> None:
+        pending = False
+        for asset in self._all_assets:
+            if not isinstance(asset, LibraryVdbAsset):
+                continue
+            render = asset.preview_render
+            if render.get("backend") != DEADLINE_BACKEND:
+                continue
+            status = str(render.get("status", ""))
+            if status == "preparing":
+                message = "Deadline USD export interrupted"
+            elif status == "awaiting_deadline":
+                message = "Awaiting Deadline Husk frames"
+                pending = True
+            elif status == "finalizing":
+                message = "Deadline finalization interrupted; retry available"
+            else:
+                continue
+            self.card_delegate.set_task_state(
+                asset.id, "preview_queued", message
+            )
+        if pending:
+            self._deadline_monitor.start()
+            QTimer.singleShot(0, self._poll_deadline_previews)
 
     def reload_library(self) -> None:
         self.refresh_catalog()
@@ -5359,6 +5672,354 @@ class AssetsTab(QWidget):
             message += f"; {skipped} already queued or active"
         self.preview_queue_status.setToolTip(message + ".")
 
+    def _open_deadline_vdb_batch(
+        self,
+        requested_assets: tuple[LibraryVdbAsset, ...] | None = None,
+    ) -> None:
+        assets = requested_assets or tuple(
+            asset
+            for asset in self._selected_assets()
+            if isinstance(asset, LibraryVdbAsset)
+        )
+        if not assets or not self._library_path:
+            return
+        if self._deadline_export_worker is not None:
+            QMessageBox.information(
+                self, "Deadline export active",
+                "Wait for the current Deadline USD export to finish.",
+            )
+            return
+        active_ids = {
+            job.asset_id for job in self._preview_render_jobs
+        }
+        if (
+            self._hdri_render_worker is not None
+            and self._active_preview_render_job is not None
+        ):
+            active_ids.add(self._active_preview_render_job.asset_id)
+        if self._deadline_export_worker is not None:
+            active_ids.update(self._deadline_export_asset_ids)
+        if (
+            self._deadline_finalize_worker is not None
+            and self._deadline_finalize_asset_id
+        ):
+            active_ids.add(self._deadline_finalize_asset_id)
+        stale_preview_ids = self._preview_render_ids - active_ids
+        if stale_preview_ids:
+            self._preview_render_ids.difference_update(stale_preview_ids)
+            self.card_delegate.clear_task_states(stale_preview_ids)
+        conflicts = [asset.name for asset in assets if asset.id in active_ids]
+        conflicts.extend(
+            asset.name for asset in assets
+            if asset.preview_render.get("backend") == DEADLINE_BACKEND
+            and asset.preview_render.get("status")
+            in {"preparing", "awaiting_deadline", "finalizing"}
+        )
+        if conflicts:
+            QMessageBox.warning(
+                self, "Preview already active",
+                "These VDBs already have an active preview:\n"
+                + "\n".join(sorted(set(conflicts), key=str.casefold)),
+            )
+            return
+        requested = (
+            self.detail.vdb_preview_variant.currentText()
+            if isinstance(self.detail._asset, LibraryVdbAsset) else "Mid"
+        )
+        dialog = VdbDeadlineBatchDialog(
+            assets, requested, self.detail.vdb_density_slider.value(), self
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        variants = {
+            asset.id: self._vdb_preview_variant(
+                asset, dialog.requested_variant
+            )
+            for asset in assets
+        }
+        token = CancelToken()
+        worker = DeadlineVdbExportWorker(
+            self._library_path,
+            variants,
+            dialog.density_scale,
+            self._houdini_path,
+            self._deadline_command_path,
+            self._husk_submitter_path,
+            token,
+        )
+        self._deadline_export_worker = worker
+        self._deadline_export_token = token
+        self._deadline_export_asset_ids = set(variants)
+        for asset in assets:
+            self.card_delegate.set_task_state(
+                asset.id, "preview_rendering", "Exporting Deadline USD"
+            )
+        worker.signals.progress.connect(self._deadline_export_progressed)
+        worker.signals.finished.connect(self._deadline_export_finished)
+        worker.signals.failed.connect(self._deadline_export_failed)
+        QThreadPool.globalInstance().start(worker)
+
+    def _deadline_export_progressed(self, message: str) -> None:
+        for asset_id in self._deadline_export_asset_ids:
+            self.card_delegate.set_task_state(
+                asset_id, "preview_rendering", message
+            )
+        if (
+            self.detail._asset
+            and self.detail._asset.id in self._deadline_export_asset_ids
+        ):
+            self.detail.set_hdri_rendering(True, message)
+
+    def _deadline_export_finished(self, batch) -> None:
+        self._deadline_export_worker = None
+        self._deadline_export_token = None
+        ids = set(self._deadline_export_asset_ids)
+        self._deadline_export_asset_ids.clear()
+        self.apply_asset_updates(batch.assets)
+        successful = tuple(batch.exports.successful)
+        deadline_debug(
+            f"ShotBox received USD export result: {len(successful)} succeeded, "
+            f"{len(batch.exports.failed)} failed"
+        )
+        if successful:
+            try:
+                process = launch_husk_submitter(
+                    self._deadline_command_path,
+                    self._husk_submitter_path,
+                    tuple(item.usd_path for item in successful),
+                )
+                self._deadline_submitter_processes.append(process)
+            except Exception as error:
+                updated = LibraryRepository(
+                    self._library_path
+                ).mark_vdb_deadline_submission_failed(
+                    (item.asset_id for item in successful), str(error)
+                )
+                self.apply_asset_updates(updated)
+                QMessageBox.warning(
+                    self, "Could not open Deadline", str(error)
+                )
+            else:
+                self._deadline_monitor.start()
+                for item in successful:
+                    self.card_delegate.set_task_state(
+                        item.asset_id,
+                        "preview_queued",
+                        "Awaiting Deadline Husk frames",
+                    )
+        failed_ids = ids - {item.asset_id for item in successful}
+        self.card_delegate.clear_task_states(failed_ids)
+        if batch.exports.failed:
+            self.preview_queue_status.setToolTip(
+                "Deadline USD export failures: "
+                + "; ".join(batch.exports.failed.values())
+            )
+        self._poll_deadline_previews()
+
+    def _deadline_export_failed(self, details: str) -> None:
+        self._deadline_export_worker = None
+        self._deadline_export_token = None
+        ids = set(self._deadline_export_asset_ids)
+        self._deadline_export_asset_ids.clear()
+        self.card_delegate.clear_task_states(ids)
+        deadline_debug(
+            "Deadline USD export worker failed: "
+            + (
+                details.strip().splitlines()[-1]
+                if details.strip() else "unknown error"
+            )
+        )
+        QMessageBox.warning(
+            self,
+            "Deadline VDB export failed",
+            details.strip().splitlines()[-1]
+            if details.strip() else "Deadline VDB export failed.",
+        )
+
+    def _poll_deadline_previews(self) -> None:
+        self._deadline_submitter_processes = [
+            process for process in self._deadline_submitter_processes
+            if not hasattr(process, "poll") or process.poll() is None
+        ]
+        if (
+            not self._library_path
+            or self._deadline_finalize_worker is not None
+        ):
+            return
+        waiting_ids = set()
+        for asset in self._all_assets:
+            if not isinstance(asset, LibraryVdbAsset):
+                continue
+            render = asset.preview_render
+            if (
+                render.get("backend") != DEADLINE_BACKEND
+                or render.get("status") != "awaiting_deadline"
+            ):
+                continue
+            waiting_ids.add(asset.id)
+            exr_pattern = asset.asset_dir / str(render.get("exr_pattern", ""))
+            try:
+                frame_count = deadline_frame_count(exr_pattern)
+            except OSError as error:
+                deadline_debug(
+                    f"{asset.name}: could not inspect Deadline frames: {error}"
+                )
+                frame_count = 0
+            if self._deadline_frame_counts.get(asset.id) != frame_count:
+                self._deadline_frame_counts[asset.id] = frame_count
+                deadline_debug(
+                    f"{asset.name}: {frame_count}/36 non-empty EXRs available"
+                )
+            try:
+                signature = deadline_frame_signature(exr_pattern)
+            except Exception as error:
+                deadline_debug(
+                    f"{asset.name}: frame validation failed: {error}"
+                )
+                continue
+            if signature is None:
+                self._deadline_frame_signatures.pop(asset.id, None)
+                continue
+            if self._deadline_frame_signatures.get(asset.id) == signature:
+                deadline_debug(
+                    f"{asset.name}: all 36 EXRs are stable; starting finalization"
+                )
+                self._start_deadline_finalization(asset.id)
+                return
+            self._deadline_frame_signatures[asset.id] = signature
+            deadline_debug(
+                f"{asset.name}: all EXRs found; waiting for the next stable check"
+            )
+            self.card_delegate.set_task_state(
+                asset.id, "preview_queued", "Deadline frames complete; verifying"
+            )
+        for asset_id in set(self._deadline_frame_signatures) - waiting_ids:
+            self._deadline_frame_signatures.pop(asset_id, None)
+        for asset_id in set(self._deadline_frame_counts) - waiting_ids:
+            self._deadline_frame_counts.pop(asset_id, None)
+        if not waiting_ids and self._deadline_finalize_worker is None:
+            if self._deadline_monitor.isActive():
+                deadline_debug("No pending Deadline VDB previews; monitor stopped")
+            self._deadline_monitor.stop()
+
+    def _start_deadline_finalization(
+        self, asset_id: str, *, force: bool = False
+    ) -> None:
+        if self._deadline_finalize_worker is not None or not self._library_path:
+            return
+        asset = self._asset_by_id(asset_id)
+        if not isinstance(asset, LibraryVdbAsset):
+            return
+        if not force and asset.id not in self._deadline_frame_signatures:
+            return
+        worker = DeadlineVdbFinalizeWorker(
+            self._library_path, asset_id, self._houdini_path, self._ffmpeg_path
+        )
+        self._deadline_finalize_worker = worker
+        self._deadline_finalize_asset_id = asset_id
+        self.card_delegate.set_task_state(
+            asset_id, "preview_rendering", "Finalizing Deadline turntable"
+        )
+        worker.signals.progress.connect(
+            lambda message: self.card_delegate.set_task_state(
+                asset_id, "preview_rendering", message
+            )
+        )
+        worker.signals.finished.connect(self._deadline_finalization_finished)
+        worker.signals.failed.connect(self._deadline_finalization_failed)
+        QThreadPool.globalInstance().start(worker)
+
+    def _deadline_finalization_finished(self, update) -> None:
+        asset_id = self._deadline_finalize_asset_id
+        self._deadline_finalize_worker = None
+        self._deadline_finalize_asset_id = ""
+        self._deadline_frame_signatures.pop(asset_id, None)
+        self._deadline_frame_counts.pop(asset_id, None)
+        deadline_debug(
+            f"Published Deadline preview for {update.asset.name}; "
+            "farm intermediates cleaned up"
+        )
+        self.card_delegate.clear_task_state(asset_id)
+        self.apply_asset_updates((update.asset,))
+        QTimer.singleShot(0, self._poll_deadline_previews)
+
+    def _deadline_finalization_failed(self, details: str) -> None:
+        asset_id = self._deadline_finalize_asset_id
+        self._deadline_finalize_worker = None
+        self._deadline_finalize_asset_id = ""
+        self._deadline_frame_signatures.pop(asset_id, None)
+        self._deadline_frame_counts.pop(asset_id, None)
+        deadline_debug(
+            "Deadline finalization failed: "
+            + (
+                details.strip().splitlines()[-1]
+                if details.strip() else "unknown error"
+            )
+        )
+        self.card_delegate.clear_task_state(asset_id)
+        self.preview_queue_status.setToolTip(
+            details.strip().splitlines()[-1]
+            if details.strip() else "Deadline finalization failed."
+        )
+        self.refresh_catalog()
+
+    def _resubmit_vdb_deadline(self, asset: AssetRecord) -> None:
+        if not isinstance(asset, LibraryVdbAsset):
+            return
+        relative = str(asset.preview_render.get("usd_path", ""))
+        usd_path = asset.asset_dir / relative
+        if not relative or not usd_path.is_file():
+            QMessageBox.warning(
+                self, "USD unavailable",
+                "The exported USD is missing. Start a new Deadline batch export.",
+            )
+            return
+        try:
+            process = launch_husk_submitter(
+                self._deadline_command_path,
+                self._husk_submitter_path,
+                (usd_path,),
+            )
+            self._deadline_submitter_processes.append(process)
+            updated = LibraryRepository(
+                self._library_path
+            ).resume_vdb_deadline_preview(
+                asset.id, asset_dir=asset.asset_dir
+            )
+            self.apply_asset_updates((updated,))
+            self.card_delegate.set_task_state(
+                asset.id, "preview_queued", "Awaiting Deadline Husk frames"
+            )
+            self._deadline_monitor.start()
+        except Exception as error:
+            QMessageBox.warning(self, "Could not open Deadline", str(error))
+
+    def _abandon_vdb_deadline(self, asset: AssetRecord) -> None:
+        if not isinstance(asset, LibraryVdbAsset):
+            return
+        answer = QMessageBox.warning(
+            self,
+            "Stop watching Deadline preview",
+            "ShotBox cannot cancel the Deadline job. Stop watching while leaving "
+            "the shared USD and EXRs untouched?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            updated = LibraryRepository(
+                self._library_path
+            ).abandon_vdb_deadline_preview(
+                asset.id, asset_dir=asset.asset_dir
+            )
+        except Exception as error:
+            QMessageBox.warning(self, "Could not stop watching", str(error))
+            return
+        self._deadline_frame_signatures.pop(asset.id, None)
+        self.card_delegate.clear_task_state(asset.id)
+        self.apply_asset_updates((updated,))
+
     def _change_selected_category(self) -> None:
         assets = self._selected_assets()
         if len(assets) < 2 or self.metadata_update_active:
@@ -5481,17 +6142,23 @@ class AssetsTab(QWidget):
         houdini_path: str,
         ffmpeg_path: str = "",
         parallel_renders: int = 2,
+        deadline_command_path: str = "",
+        husk_submitter_path: str = "",
     ) -> None:
         parallel_renders = normalize_vdb_turntable_workers(parallel_renders)
         if (
             houdini_path == self._houdini_path
             and ffmpeg_path == self._ffmpeg_path
             and parallel_renders == self._vdb_parallel_renders
+            and deadline_command_path == self._deadline_command_path
+            and husk_submitter_path == self._husk_submitter_path
         ):
             return
         self._houdini_path = houdini_path
         self._ffmpeg_path = ffmpeg_path
         self._vdb_parallel_renders = parallel_renders
+        self._deadline_command_path = deadline_command_path
+        self._husk_submitter_path = husk_submitter_path
         pending_ids = {
             job.asset_id
             for job in self._preview_render_jobs
@@ -5788,6 +6455,12 @@ class AssetsTab(QWidget):
                 not renderable
                 or not self._library_path
                 or asset.id in self._preview_render_ids
+                or (
+                    isinstance(asset, LibraryVdbAsset)
+                    and asset.preview_render.get("backend") == DEADLINE_BACKEND
+                    and asset.preview_render.get("status")
+                    in {"preparing", "awaiting_deadline", "finalizing"}
+                )
             ):
                 continue
             new_jobs.append(
@@ -6070,6 +6743,11 @@ class AssetsTab(QWidget):
         self.preview_queue_clear.setVisible(pending > 0)
 
     def shutdown_preview_queue(self) -> None:
+        self._deadline_monitor.stop()
+        if self._deadline_export_token is not None:
+            self._deadline_export_token.cancel()
+        if self._deadline_finalize_worker is not None:
+            self._deadline_finalize_worker.token.cancel()
         self._clear_preview_render_queue(cancel_active=True)
         if self._hdri_render_worker is None:
             self._retire_preview_session(asynchronous=False)

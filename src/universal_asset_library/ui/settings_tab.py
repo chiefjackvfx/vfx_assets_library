@@ -9,6 +9,7 @@ from PyQt6.QtCore import QObject, QRunnable, QThreadPool, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -43,6 +44,7 @@ from universal_asset_library.previews import (
     resolve_houdini_executable,
     validate_blender_executable,
     validate_houdini_executable,
+    validate_deadline_husk,
 )
 from universal_asset_library.previews.vdb_config import (
     VDB_TURNTABLE_MAX_WORKERS,
@@ -497,6 +499,32 @@ class SettingsTab(QWidget):
         vdb_parallel_row.addWidget(vdb_parallel_label)
         vdb_parallel_row.addWidget(self.vdb_parallel_renders)
         vdb_parallel_row.addStretch()
+        deadline_row = QHBoxLayout()
+        self.deadline_command_path = QLineEdit()
+        self.deadline_command_path.setPlaceholderText(
+            "Deadline deadlinecommand executable"
+        )
+        self.deadline_browse = QPushButton("Browse Deadline…")
+        self.deadline_browse.clicked.connect(self._browse_deadline)
+        deadline_row.addWidget(self.deadline_command_path, 1)
+        deadline_row.addWidget(self.deadline_browse)
+        submitter_row = QHBoxLayout()
+        self.husk_submitter_path = QLineEdit()
+        self.husk_submitter_path.setPlaceholderText(
+            "HuskStandaloneSubmission.py"
+        )
+        self.husk_submitter_browse = QPushButton("Browse submitter…")
+        self.husk_submitter_browse.clicked.connect(
+            self._browse_husk_submitter
+        )
+        self.deadline_check = QPushButton("Check Deadline Husk")
+        self.deadline_check.clicked.connect(self._check_deadline_husk)
+        submitter_row.addWidget(self.husk_submitter_path, 1)
+        submitter_row.addWidget(self.husk_submitter_browse)
+        submitter_row.addWidget(self.deadline_check)
+        self.deadline_status = QLabel()
+        self.deadline_status.setObjectName("mutedLabel")
+        self.deadline_status.setWordWrap(True)
         self.render_hdri_on_import = QCheckBox("Render composite previews automatically during HDRI import")
         self.render_texture_on_import = QCheckBox(
             "Render missing shader previews automatically during texture import"
@@ -527,6 +555,9 @@ class SettingsTab(QWidget):
         tools_layout.addLayout(houdini_preview_row)
         tools_layout.addWidget(self.houdini_preview_status)
         tools_layout.addLayout(vdb_parallel_row)
+        tools_layout.addLayout(deadline_row)
+        tools_layout.addLayout(submitter_row)
+        tools_layout.addWidget(self.deadline_status)
         tools_layout.addWidget(self.render_texture_on_import)
         tools_layout.addWidget(self.save_texture_preview_blend)
         tools_layout.addWidget(self.render_hdri_on_import)
@@ -643,6 +674,8 @@ class SettingsTab(QWidget):
         self.blender_path.textChanged.connect(self._changed)
         self.houdini_path.textChanged.connect(self._changed)
         self.vdb_parallel_renders.valueChanged.connect(self._changed)
+        self.deadline_command_path.textChanged.connect(self._changed)
+        self.husk_submitter_path.textChanged.connect(self._changed)
         self.ffmpeg_path.textChanged.connect(self._changed)
         self.render_hdri_on_import.toggled.connect(self._changed)
         self.render_texture_on_import.toggled.connect(self._changed)
@@ -674,6 +707,27 @@ class SettingsTab(QWidget):
         if filename:
             self.houdini_path.setText(filename)
             self._check_houdini()
+
+    def _browse_deadline(self) -> None:
+        current = self.deadline_command_path.text().strip()
+        start = current if current and os.path.isfile(current) else ""
+        filename, _filter = QFileDialog.getOpenFileName(
+            self, "Choose deadlinecommand executable", start
+        )
+        if filename:
+            self.deadline_command_path.setText(filename)
+
+    def _browse_husk_submitter(self) -> None:
+        current = self.husk_submitter_path.text().strip()
+        start = current if current and os.path.isfile(current) else ""
+        filename, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Choose Husk Standalone submitter",
+            start,
+            "Python files (*.py);;All files (*)",
+        )
+        if filename:
+            self.husk_submitter_path.setText(filename)
 
     def _taxonomy_store(self) -> StockTaxonomyStore | None:
         path = self._saved.library_path
@@ -761,6 +815,21 @@ class SettingsTab(QWidget):
             f"color: {'#78c995' if valid else '#e6b566'};"
         )
         self.houdini_check.setEnabled(True)
+
+    def _check_deadline_husk(self) -> None:
+        self.deadline_check.setEnabled(False)
+        QApplication.processEvents()
+        valid, message = validate_deadline_husk(
+            self.deadline_command_path.text(),
+            self.husk_submitter_path.text(),
+            self.houdini_path.text(),
+            self.library_path.text(),
+        )
+        self.deadline_status.setText(message)
+        self.deadline_status.setStyleSheet(
+            f"color: {'#78c995' if valid else '#e6b566'};"
+        )
+        self.deadline_check.setEnabled(True)
 
     def _refresh_houdini_installations(self) -> None:
         selected = {
@@ -952,6 +1021,8 @@ class SettingsTab(QWidget):
             ffmpeg_path=self.ffmpeg_path.text(),
             stock_hover_previews=self.stock_hover_previews.isChecked(),
             vdb_parallel_renders=self.vdb_parallel_renders.value(),
+            deadline_command_path=self.deadline_command_path.text(),
+            husk_submitter_path=self.husk_submitter_path.text(),
         ).normalized()
 
     def _show(self, settings: AppSettings) -> None:
@@ -966,6 +1037,8 @@ class SettingsTab(QWidget):
         self.blender_path.setText(settings.blender_path)
         self.houdini_path.setText(settings.houdini_path)
         self.vdb_parallel_renders.setValue(settings.vdb_parallel_renders)
+        self.deadline_command_path.setText(settings.deadline_command_path)
+        self.husk_submitter_path.setText(settings.husk_submitter_path)
         self.ffmpeg_path.setText(settings.ffmpeg_path)
         self.render_hdri_on_import.setChecked(settings.render_hdri_on_import)
         self.render_texture_on_import.setChecked(
@@ -990,6 +1063,18 @@ class SettingsTab(QWidget):
         )
         self.houdini_preview_status.setStyleSheet(
             "color: #8792a1;" if detected_houdini else "color: #e6b566;"
+        )
+        deadline_ready = (
+            os.path.isfile(settings.deadline_command_path)
+            and os.path.isfile(settings.husk_submitter_path)
+        )
+        self.deadline_status.setText(
+            "Deadline Husk paths are configured. Use Check Deadline Husk to verify connectivity."
+            if deadline_ready else
+            "Configure deadlinecommand and the Husk Standalone submitter to enable farm turntables."
+        )
+        self.deadline_status.setStyleSheet(
+            "color: #8792a1;" if deadline_ready else "color: #e6b566;"
         )
         from universal_asset_library.previews import resolve_ffmpeg
         detected_ffmpeg = resolve_ffmpeg(settings.ffmpeg_path)

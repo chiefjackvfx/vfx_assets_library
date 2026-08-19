@@ -24,6 +24,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.assets_tab, "Assets")
         self.tabs.addTab(self.importer_tab, "Importer")
         self.tabs.addTab(self.settings_tab, "Settings")
+        self.tabs.currentChanged.connect(self._tab_changed)
         self.setCentralWidget(self.tabs)
         self.settings_tab.settings_saved.connect(self._apply_settings)
         self.settings_tab.library_repaired.connect(self._library_repaired)
@@ -46,10 +47,15 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        if not self._maintenance_inspection_scheduled:
+
+    def _tab_changed(self, index: int) -> None:
+        if (
+            self.tabs.widget(index) is self.settings_tab
+            and not self._maintenance_inspection_scheduled
+        ):
             self._maintenance_inspection_scheduled = True
             QTimer.singleShot(
-                1000, self.settings_tab.start_initial_maintenance_inspection
+                0, self.settings_tab.start_initial_maintenance_inspection
             )
 
     def closeEvent(self, event) -> None:
@@ -92,6 +98,8 @@ class MainWindow(QMainWindow):
             settings.houdini_path,
             settings.ffmpeg_path,
             settings.vdb_parallel_renders,
+            settings.deadline_command_path,
+            settings.husk_submitter_path,
         )
         library = settings.library_path or "not configured"
         self.statusBar().showMessage(f"Texture, Atlas, HDRI, model, VDB, and Stock library · Library: {library}")

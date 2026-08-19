@@ -68,6 +68,12 @@ from universal_asset_library.previews import (
     TexturePreviewResult,
     VdbPreviewRequest,
     VdbPreviewResult,
+    DEADLINE_BACKEND,
+    VdbDeadlineExportItem,
+    VdbDeadlineExportResult,
+    deadline_frame_signature,
+    export_deadline_usds,
+    finalize_deadline_turntable,
     render_hdri_preview,
     render_texture_preview,
     render_vdb_preview,
@@ -82,6 +88,7 @@ from universal_asset_library.previews.hdri_renderer import select_hdri_file
 from universal_asset_library.previews.vdb_config import (
     normalize_vdb_turntable_workers,
 )
+from universal_asset_library.previews.vdb_renderer import default_template_path
 from universal_asset_library.integrations.model_conversion import (
     ModelConversionError,
     ModelConversionResult,
@@ -173,6 +180,13 @@ class TexturePreviewUpdate:
 class VdbPreviewUpdate:
     asset: LibraryVdbAsset
     render: VdbPreviewResult
+
+
+@dataclass(frozen=True, slots=True)
+class VdbDeadlineBatchUpdate:
+    submission_id: str
+    assets: tuple[LibraryVdbAsset, ...]
+    exports: VdbDeadlineExportResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,6 +515,21 @@ class LibraryRepository:
                 f"Category {category!r} is not defined in {catalog.asset_type} categories."
             )
         category = canonical_category
+        current_render = document.get("previews", {}).get("render", {})
+        if (
+            isinstance(current_render, dict)
+            and current_render.get("backend") == DEADLINE_BACKEND
+            and current_render.get("status")
+            in {"preparing", "awaiting_deadline", "finalizing"}
+            and (
+                name != str(document.get("name", "")).strip()
+                or category != str(document.get("category", "")).strip()
+            )
+        ):
+            raise LibraryError(
+                "Rename or move this VDB after its active Deadline preview finishes "
+                "or is abandoned."
+            )
         original_document = json.loads(json.dumps(document))
         source_dir = manifest_path.parent
         document["name"] = name
@@ -1064,6 +1093,14 @@ class LibraryRepository:
         asset = _asset_from_manifest(original, manifest_path.parent)
         if not isinstance(asset, LibraryVdbAsset):
             raise LibraryError("VDB preview rendering is only available for VDB assets.")
+        if (
+            asset.preview_render.get("backend") == DEADLINE_BACKEND
+            and asset.preview_render.get("status")
+            in {"preparing", "awaiting_deadline", "finalizing"}
+        ):
+            raise LibraryError(
+                "This VDB already has an active Deadline Husk preview."
+            )
         if mode not in {"still", "turntable"}:
             raise LibraryError(f"Unknown VDB preview mode: {mode}")
         label = _selected_vdb_variant_label(asset, variant_label)
@@ -1210,6 +1247,363 @@ class LibraryRepository:
         finally:
             if render_stage.exists():
                 shutil.rmtree(render_stage, ignore_errors=True)
+
+    def prepare_vdb_deadline_turntables(
+        self,
+        variants: Mapping[str, str],
+        *,
+        density_scale: int = 100,
+        progress: Callable[[str], None] | None = None,
+        cancel_token: CancelToken | None = None,
+    ) -> VdbDeadlineBatchUpdate:
+        """Export shared USDs for a VDB batch without rendering Karma locally."""
+        self.initialize()
+        if not variants:
+            raise LibraryError("Select at least one VDB for Deadline export.")
+        if not 10 <= density_scale <= 500:
+            raise LibraryError("VDB preview density must be between 10 and 500.")
+        token = cancel_token or CancelToken()
+        submission_id = uuid4().hex
+        template = self.vdb_template_path or default_template_path()
+        if not template.is_file():
+            raise LibraryError(f"VDB preview template is missing: {template}")
+        template_hash = _sha256_file(template)
+        items: list[VdbDeadlineExportItem] = []
+        metadata_by_id: dict[str, dict] = {}
+        prepared_assets: list[LibraryVdbAsset] = []
+        for asset_id, requested_variant in variants.items():
+            token.check()
+            manifest_path, document = self._manifest_by_id(asset_id)
+            asset = _asset_from_manifest(document, manifest_path.parent)
+            if not isinstance(asset, LibraryVdbAsset):
+                raise LibraryError(f"Asset {asset_id} is not a VDB.")
+            current_render = asset.preview_render
+            if (
+                current_render.get("backend") == DEADLINE_BACKEND
+                and current_render.get("status")
+                in {"preparing", "awaiting_deadline", "finalizing"}
+            ):
+                raise LibraryError(
+                    f"{asset.name} already has an active Deadline preview."
+                )
+            try:
+                label = _selected_vdb_variant_label(asset, requested_variant)
+            except LibraryError:
+                label = _selected_vdb_variant_label(asset)
+            variant = asset.variants[label]
+            source_record, path_expression = _vdb_frame_one_source(asset, variant)
+            source_path = asset.asset_dir / source_record.path
+            if (
+                not source_record.sha256
+                or _sha256_path(source_path) != source_record.sha256
+            ):
+                raise StaleSourceError(
+                    f"{asset.name}'s selected VDB no longer matches its manifest."
+                )
+            farm_dir = asset.asset_dir / "previews" / "deadline" / submission_id
+            asset_token = _filename_token(asset.name)
+            usd_path = farm_dir / f"{asset_token}_VDB_Turntable.usd"
+            exr_pattern = farm_dir / f"{asset_token}_VDB_Turntable.$F4.exr"
+            metadata = {
+                "type": "vdb_turntable",
+                "backend": DEADLINE_BACKEND,
+                "status": "preparing",
+                "mode": "turntable",
+                "submission_id": submission_id,
+                "variant": label,
+                "density_scale": density_scale,
+                "source": source_record.path,
+                "source_sha256": source_record.sha256,
+                "template_sha256": template_hash,
+                "frame": 1,
+                "frame_start": 1,
+                "frame_end": 36,
+                "usd_path": usd_path.relative_to(asset.asset_dir).as_posix(),
+                "exr_pattern": exr_pattern.relative_to(asset.asset_dir).as_posix(),
+                "farm_directory": farm_dir.relative_to(asset.asset_dir).as_posix(),
+                "farm_files_retained": True,
+                "prepared_at": _utc_now(),
+                "diagnostic": "",
+            }
+            prepared = self._record_vdb_render_status(asset_id, metadata)
+            prepared_assets.append(prepared)
+            metadata_by_id[asset_id] = metadata
+            items.append(VdbDeadlineExportItem(
+                asset_id, asset.name, path_expression, usd_path, exr_pattern,
+                label, density_scale,
+            ))
+        VDB_PREVIEW_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        work_dir = VDB_PREVIEW_CACHE_ROOT / f"vdb-deadline-export-{submission_id}"
+        try:
+            exported = export_deadline_usds(
+                tuple(items),
+                houdini_path=self.houdini_path,
+                template_path=template,
+                work_dir=work_dir,
+                progress=progress,
+                cancel_token=token,
+            )
+            updated_assets = []
+            successful_ids = {item.asset_id for item in exported.successful}
+            for item in items:
+                metadata = dict(metadata_by_id[item.asset_id])
+                if item.asset_id in successful_ids:
+                    metadata.update({
+                        "status": "awaiting_deadline",
+                        "houdini_version": exported.houdini_version,
+                        "fps": exported.fps,
+                        "exported_at": _utc_now(),
+                    })
+                else:
+                    metadata.update({
+                        "status": "failed",
+                        "diagnostic": exported.failed.get(
+                            item.asset_id, "USD export failed."
+                        ),
+                    })
+                updated_assets.append(
+                    self._record_vdb_render_status(item.asset_id, metadata)
+                )
+            return VdbDeadlineBatchUpdate(
+                submission_id, tuple(updated_assets), exported
+            )
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    def deadline_vdb_frame_signature(
+        self, asset_id: str
+    ) -> tuple[tuple[int, int], ...] | None:
+        _manifest_path, document = self._manifest_by_id(asset_id)
+        asset = _asset_from_manifest(document, _manifest_path.parent)
+        if not isinstance(asset, LibraryVdbAsset):
+            return None
+        render = asset.preview_render
+        if (
+            render.get("backend") != DEADLINE_BACKEND
+            or render.get("status") not in {"awaiting_deadline", "failed"}
+        ):
+            return None
+        pattern = _deadline_managed_path(
+            asset.asset_dir, str(render.get("exr_pattern", ""))
+        )
+        return deadline_frame_signature(pattern)
+
+    def mark_vdb_deadline_submission_failed(
+        self, asset_ids: Iterable[str], diagnostic: str
+    ) -> tuple[LibraryVdbAsset, ...]:
+        updated = []
+        for asset_id in asset_ids:
+            _path, document = self._manifest_by_id(asset_id)
+            asset = _asset_from_manifest(document, _path.parent)
+            if not isinstance(asset, LibraryVdbAsset):
+                continue
+            render = dict(asset.preview_render)
+            if render.get("backend") != DEADLINE_BACKEND:
+                continue
+            render.update({"status": "failed", "diagnostic": diagnostic})
+            updated.append(self._record_vdb_render_status(asset_id, render))
+        return tuple(updated)
+
+    def abandon_vdb_deadline_preview(
+        self,
+        asset_id: str,
+        *,
+        asset_dir: Path | None = None,
+    ) -> LibraryVdbAsset:
+        _path, document = self._manifest_by_id(asset_id, asset_dir=asset_dir)
+        asset = _asset_from_manifest(document, _path.parent)
+        if not isinstance(asset, LibraryVdbAsset):
+            raise LibraryError("Deadline preview abandonment is available only for VDBs.")
+        render = dict(asset.preview_render)
+        if render.get("backend") != DEADLINE_BACKEND:
+            raise LibraryError("This VDB has no Deadline preview to abandon.")
+        render.update({
+            "status": "canceled",
+            "diagnostic": (
+                "ShotBox stopped watching this preview. The Deadline job and "
+                "shared farm files were not removed."
+            ),
+        })
+        return self._record_vdb_render_status(
+            asset_id, render, asset_dir=_path.parent
+        )
+
+    def resume_vdb_deadline_preview(
+        self,
+        asset_id: str,
+        *,
+        asset_dir: Path | None = None,
+    ) -> LibraryVdbAsset:
+        _path, document = self._manifest_by_id(asset_id, asset_dir=asset_dir)
+        asset = _asset_from_manifest(document, _path.parent)
+        if not isinstance(asset, LibraryVdbAsset):
+            raise LibraryError("Deadline preview resubmission is available only for VDBs.")
+        render = dict(asset.preview_render)
+        if render.get("backend") != DEADLINE_BACKEND:
+            raise LibraryError("This VDB has no Deadline preview to resubmit.")
+        usd_path = _deadline_managed_path(
+            asset.asset_dir, str(render.get("usd_path", ""))
+        )
+        if not usd_path.is_file():
+            raise LibraryError("The exported Deadline USD is missing.")
+        render.update({
+            "status": "awaiting_deadline",
+            "resubmitted_at": _utc_now(),
+            "diagnostic": "",
+        })
+        return self._record_vdb_render_status(
+            asset_id, render, asset_dir=_path.parent
+        )
+
+    def finalize_vdb_deadline_turntable(
+        self,
+        asset_id: str,
+        *,
+        progress: Callable[[str], None] | None = None,
+        cancel_token: CancelToken | None = None,
+    ) -> VdbPreviewUpdate:
+        """Publish a completed farm sequence while preserving stale results."""
+        token = cancel_token or CancelToken()
+        manifest_path, original = self._manifest_by_id(asset_id)
+        asset = _asset_from_manifest(original, manifest_path.parent)
+        if not isinstance(asset, LibraryVdbAsset):
+            raise LibraryError("Deadline finalization is available only for VDBs.")
+        render = dict(asset.preview_render)
+        if render.get("backend") != DEADLINE_BACKEND:
+            raise LibraryError("This VDB has no Deadline Husk preview to finalize.")
+        submission_id = str(render.get("submission_id", ""))
+        if not submission_id:
+            raise LibraryError("The Deadline preview has no submission identifier.")
+        render.update({"status": "finalizing", "diagnostic": ""})
+        asset = self._record_vdb_render_status(asset_id, render)
+        exr_pattern = _deadline_managed_path(
+            asset.asset_dir, str(render.get("exr_pattern", ""))
+        )
+        farm_dir = _deadline_managed_path(
+            asset.asset_dir, str(render.get("farm_directory", ""))
+        )
+        source_relative = str(render.get("source", ""))
+        source_path = _safe_asset_file(asset.asset_dir, source_relative)
+        if _sha256_path(source_path) != str(render.get("source_sha256", "")):
+            stale = dict(render, status="stale", diagnostic=(
+                "The selected VDB changed before Deadline finalization."
+            ))
+            self._record_vdb_render_status(asset_id, stale)
+            raise StaleSourceError(stale["diagnostic"])
+        template = self.vdb_template_path or default_template_path()
+        if (
+            not template.is_file()
+            or _sha256_file(template) != str(render.get("template_sha256", ""))
+        ):
+            stale = dict(render, status="stale", diagnostic=(
+                "The authoritative VDB preview template changed before finalization."
+            ))
+            self._record_vdb_render_status(asset_id, stale)
+            raise StaleSourceError(stale["diagnostic"])
+        VDB_PREVIEW_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        stage = VDB_PREVIEW_CACHE_ROOT / f"vdb-deadline-finalize-{submission_id}"
+        try:
+            result = finalize_deadline_turntable(
+                exr_pattern, stage, asset.name,
+                houdini_path=self.houdini_path,
+                ffmpeg_path=self.ffmpeg_path,
+                progress=progress,
+                cancel_token=token,
+                fps=float(render.get("fps", 24.0) or 24.0),
+            )
+            token.check()
+            with _ImportLock(self.root / ".ual" / "import.lock"):
+                current_path, current = self._manifest_by_id(asset_id)
+                current_asset = _asset_from_manifest(current, current_path.parent)
+                current_render = dict(current_asset.preview_render)
+                if (
+                    current_path != manifest_path
+                    or current_render.get("submission_id") != submission_id
+                    or current_render.get("source_sha256")
+                    != render.get("source_sha256")
+                    or current_render.get("template_sha256")
+                    != render.get("template_sha256")
+                ):
+                    raise StaleSourceError(
+                        "The VDB or Deadline generation changed before publication."
+                    )
+                preview_dir = current_asset.asset_dir / "previews"
+                preview_dir.mkdir(parents=True, exist_ok=True)
+                hero_target = preview_dir / result.jpeg_path.name
+                video_target = preview_dir / result.video_path.name
+                rollback: dict[Path, Path | None] = {}
+                for index, target in enumerate((hero_target, video_target)):
+                    backup = None
+                    if target.exists():
+                        backup = stage / f"published-backup-{index}{target.suffix}"
+                        shutil.copyfile(target, backup)
+                    rollback[target] = backup
+                try:
+                    _publish_preview_files(
+                        result.jpeg_path, hero_target,
+                        result.video_path, video_target,
+                    )
+                    ready = dict(current_render)
+                    ready.update({
+                        "status": "ready",
+                        "generated_at": result.generated_at,
+                        "width": result.width,
+                        "height": result.height,
+                        "scrub_optimized": True,
+                        "video_color_space": "bt709",
+                        "farm_files_retained": False,
+                        "diagnostic": "",
+                    })
+                    ready.pop("usd_path", None)
+                    ready.pop("exr_pattern", None)
+                    ready.pop("farm_directory", None)
+                    previews = current.setdefault("previews", {})
+                    relative_hero = hero_target.relative_to(
+                        current_asset.asset_dir
+                    ).as_posix()
+                    previews["hero"] = relative_hero
+                    previews["thumbnail"] = relative_hero
+                    previews["video"] = video_target.relative_to(
+                        current_asset.asset_dir
+                    ).as_posix()
+                    previews["render"] = ready
+                    current["updated_at"] = _utc_now()
+                    _asset_from_manifest(current, current_asset.asset_dir)
+                    _atomic_json(current_path, current)
+                    updated = _asset_from_manifest(
+                        current, current_asset.asset_dir
+                    )
+                except Exception:
+                    for target, backup in rollback.items():
+                        if backup is None:
+                            target.unlink(missing_ok=True)
+                        else:
+                            os.replace(backup, target)
+                    _sync_directory(preview_dir)
+                    raise
+            shutil.rmtree(farm_dir, ignore_errors=True)
+            deadline_parent = farm_dir.parent
+            try:
+                deadline_parent.rmdir()
+            except OSError:
+                pass
+            preview_result = VdbPreviewResult(
+                "ready", hero_target, hero_target,
+                str(ready.get("variant", "")), source_relative, 1,
+                str(ready.get("houdini_version", "")),
+                str(ready.get("template_sha256", "")),
+                metadata=ready, log=result.log,
+                video_path=video_target, mode="turntable",
+            )
+            return VdbPreviewUpdate(updated, preview_result)
+        except StaleSourceError:
+            raise
+        except Exception as error:
+            failed = dict(render, status="failed", diagnostic=str(error))
+            self._record_vdb_render_status(asset_id, failed)
+            raise
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
 
     def render_hdri_preview(
         self,
@@ -1756,10 +2150,16 @@ class LibraryRepository:
             return updated
 
     def _record_vdb_render_status(
-        self, asset_id: str, metadata: dict
+        self,
+        asset_id: str,
+        metadata: dict,
+        *,
+        asset_dir: Path | None = None,
     ) -> LibraryVdbAsset:
         with _ImportLock(self.root / ".ual" / "import.lock"):
-            manifest_path, document = self._manifest_by_id(asset_id)
+            manifest_path, document = self._manifest_by_id(
+                asset_id, asset_dir=asset_dir
+            )
             asset = _asset_from_manifest(document, manifest_path.parent)
             if not isinstance(asset, LibraryVdbAsset):
                 raise LibraryError("The asset is no longer a VDB.")
@@ -1771,7 +2171,29 @@ class LibraryRepository:
                 raise LibraryError("The updated manifest did not produce a VDB asset.")
             return updated
 
-    def _manifest_by_id(self, asset_id: str) -> tuple[Path, dict]:
+    def _manifest_by_id(
+        self,
+        asset_id: str,
+        *,
+        asset_dir: Path | None = None,
+    ) -> tuple[Path, dict]:
+        if asset_dir is not None:
+            resolved_root = self.root.resolve()
+            resolved_dir = Path(asset_dir).resolve()
+            if not resolved_dir.is_relative_to(resolved_root):
+                raise LibraryError("The asset is outside the configured library.")
+            candidate = resolved_dir / "asset.json"
+            try:
+                document = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeError) as error:
+                raise LibraryError(
+                    f"Could not read the selected asset manifest: {error}"
+                ) from error
+            if str(document.get("id", "")) != asset_id:
+                raise LibraryError(
+                    "The selected asset manifest does not match the requested asset."
+                )
+            return candidate, document
         paths = _asset_manifest_paths(self.root)
         for path in sorted(paths, key=lambda item: str(item).casefold()):
             try:
@@ -2727,10 +3149,9 @@ class LibraryRepository:
         textures = self.root / "textures"
         if not textures.is_dir():
             return candidates
-        for path in sorted(textures.glob("**/asset.json"), key=lambda item: str(item).casefold()):
+        for path in _managed_asset_manifest_paths(textures):
             try:
                 document = json.loads(path.read_text(encoding="utf-8"))
-                _asset_from_manifest(document, path.parent)
             except (OSError, ValueError, TypeError, json.JSONDecodeError, KeyError) as error:
                 if summary is not None:
                     summary.failed[path.parent.name] = str(error)
@@ -6096,6 +6517,24 @@ def _safe_asset_file(asset_dir: Path, relative: str) -> Path:
     return candidate
 
 
+def _deadline_managed_path(asset_dir: Path, relative: str) -> Path:
+    if not relative:
+        raise LibraryError("The Deadline preview record contains an empty path.")
+    base = asset_dir.resolve(strict=True)
+    raw = asset_dir / _safe_manifest_path(relative)
+    try:
+        candidate = raw.parent.resolve(strict=True) / raw.name
+    except OSError as error:
+        raise LibraryError(
+            f"The Deadline preview directory is unavailable: {raw.parent}"
+        ) from error
+    try:
+        candidate.relative_to(base)
+    except ValueError as error:
+        raise LibraryError("The Deadline preview path is outside its asset.") from error
+    return candidate
+
+
 def _model_record_origin(record: dict) -> str:
     value = str(record.get("origin", "")).strip().casefold()
     if value in {"imported", "generated", "manual"}:
@@ -6262,7 +6701,7 @@ def _asset_manifest_paths(library_root: Path) -> list[Path]:
     for name in ("textures", "atlases", "hdris", "models", "vdbs"):
         container = library_root / name
         if container.is_dir():
-            paths.update(container.glob("**/asset.json"))
+            paths.update(_managed_asset_manifest_paths(container))
     return sorted(paths, key=lambda item: str(item).casefold())
 
 
@@ -6273,7 +6712,41 @@ def _asset_manifest_paths_for_type(library_root: Path, asset_type: str) -> list[
     container = library_root / container_name
     if not container.is_dir():
         return []
-    return sorted(container.glob("**/asset.json"), key=lambda item: str(item).casefold())
+    return _managed_asset_manifest_paths(container)
+
+
+def _managed_asset_manifest_paths(container: Path) -> list[Path]:
+    """Find manifests without recursively walking large managed asset payloads."""
+    paths: set[Path] = set()
+    try:
+        first_level = tuple(os.scandir(container))
+    except OSError:
+        return []
+    for category in first_level:
+        try:
+            if not category.is_dir(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        category_path = Path(category.path)
+        direct = category_path / "asset.json"
+        if direct.is_file():
+            paths.add(direct)
+        try:
+            second_level = os.scandir(category.path)
+        except OSError:
+            continue
+        with second_level:
+            for asset in second_level:
+                try:
+                    if not asset.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                manifest = Path(asset.path) / "asset.json"
+                if manifest.is_file():
+                    paths.add(manifest)
+    return sorted(paths, key=lambda item: str(item).casefold())
 
 
 def _asset_container(asset_type: str) -> str:

@@ -125,6 +125,22 @@ def resolve_iconvert(hython_path: str) -> str:
     return shutil.which(_executable_name("iconvert")) or shutil.which("iconvert") or ""
 
 
+def vdb_iconvert_command(
+    iconvert_path: str,
+    source_path: str | Path,
+    output_path: str | Path,
+) -> list[str]:
+    return [
+        iconvert_path,
+        "-d",
+        "8",
+        "-g",
+        "auto",
+        str(source_path),
+        str(output_path),
+    ]
+
+
 def validate_houdini_executable(configured: str = "") -> tuple[bool, str, str]:
     executable = resolve_houdini_executable(configured)
     if not executable:
@@ -270,7 +286,7 @@ def render_vdb_preview(
         if progress:
             progress("Converting Houdini EXR to JPEG")
         conversion_log = _run_process(
-            [iconvert, "-d", "8", "-g", "auto", str(first_exr), str(output_jpg)],
+            vdb_iconvert_command(iconvert, first_exr, output_jpg),
             120,
             cancel_token,
             None,
@@ -302,13 +318,7 @@ def render_vdb_preview(
                 )
                 frame_png = Path(str(video_frame_pattern) % frame)
                 conversion_log = _run_process(
-                    [
-                        iconvert,
-                        "-d", "8",
-                        "-g", "auto",
-                        str(frame_exr),
-                        str(frame_png),
-                    ],
+                    vdb_iconvert_command(iconvert, frame_exr, frame_png),
                     120,
                     cancel_token,
                     None,
