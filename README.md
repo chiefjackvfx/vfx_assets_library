@@ -18,16 +18,15 @@ On Linux, run:
 ./run_vfx_asset_library.sh
 ```
 
-On Windows, install [Git for Windows](https://git-scm.com/download/win), then download `run_vfx_asset_library.bat` into the folder where ShotBox Assets should live and double-click it. The batch file clones `main` into a `vfx_assets_library` folder beside itself, creates `vfx_assets_library\.venv`, installs dependencies, and opens the application. If Python 3.11 or newer is unavailable, it installs an isolated Python 3.13 runtime under `vfx_assets_library\.runtime\python`; administrator access is not required.
+On Windows, install [Git for Windows](https://git-scm.com/download/win) and Python 3.11 or newer, then download `windows_install_shotbox_assets.bat` into the folder where ShotBox Assets should live and double-click it. The installer follows the same install/repair flow as the ShotBox frontend: it clones `main` into a `vfx_assets_library` folder beside itself, or updates a clean existing `main` checkout, creates `vfx_assets_library\venv`, and installs the project. It then offers to launch ShotBox Assets.
 
-To choose a different checkout folder, pass it as the first argument. Any remaining arguments are forwarded to the installed launcher:
+To choose a different checkout folder, pass it as the first argument:
 
 ```bat
-run_vfx_asset_library.bat "D:\Apps\vfx_assets_library"
-run_vfx_asset_library.bat "D:\Apps\vfx_assets_library" --no-update
+windows_install_shotbox_assets.bat "D:\Apps\vfx_assets_library"
 ```
 
-Later launches can use either the original downloaded batch file or the cloned checkout's own `run_vfx_asset_library.bat`. A clean `main` checkout fast-forwards from the approved `origin/main`; tracked local changes, diverged branches, unexpected origins, and other branches are never overwritten. If GitHub or Git is unavailable after installation, the existing checkout still opens. Pass `--no-update` for one launch or set `SHOTBOX_AUTO_UPDATE=0` to skip the update check. Older `%LOCALAPPDATA%\ShotBoxAssets` installations are left untouched and may be removed manually after confirming the adjacent checkout works.
+Later launches use the cloned checkout's `windows_run_shotbox.bat`. Run `windows_install_shotbox_assets.bat` again whenever you want to update or repair the installation. The installer only fast-forwards a clean `main` checkout; local changes, diverged branches, and other branches are never overwritten. The legacy `run_vfx_asset_library.bat` remains as a compatibility handoff to the installer.
 
 To set up and run the app manually instead:
 

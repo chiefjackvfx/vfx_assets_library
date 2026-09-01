@@ -222,50 +222,62 @@ def test_launcher_consumes_no_update_without_dropping_application_arguments() ->
     ]
 
 
-def test_batch_exits_on_the_same_parsed_line_after_updater_handoff() -> None:
-    source = (Path(__file__).parents[1] / "run_vfx_asset_library.bat").read_text(encoding="utf-8")
-    handoff_line = next(line for line in source.splitlines() if '"%UPDATE_SCRIPT%" --project' in line)
-    assert handoff_line.endswith("& if errorlevel 100 exit /b 0")
+def test_windows_installer_matches_the_frontend_install_repair_flow() -> None:
+    source = (Path(__file__).parents[1] / "windows_install_shotbox_assets.bat").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'set "REPO_URL=https://github.com/chiefjackvfx/vfx_assets_library.git"' in source
+    assert 'set "PUBLISHED_BRANCH=main"' in source
+    assert 'set "REPO_DIR=%SCRIPT_DIR%\\vfx_assets_library"' in source
+    assert 'set "REPO_DIR=%~1"' in source
+    assert 'git clone "%REPO_URL%" "!REPO_DIR!"' in source
+    assert "git status --porcelain" in source
+    assert "git pull --ff-only origin %PUBLISHED_BRANCH%" in source
+    assert '!PYTHON_CMD! -m venv "!REPO_DIR!\\venv"' in source
+    assert 'python -m pip install -e "!REPO_DIR!"' in source
+    assert 'call "!REPO_DIR!\\windows_run_shotbox.bat"' in source
 
 
-def test_batch_can_install_its_own_isolated_python_runtime() -> None:
-    source = (Path(__file__).parents[1] / "run_vfx_asset_library.bat").read_text(encoding="utf-8")
-    assert "winget install --id 9NQ7512CXL7T" in source
-    assert "https://www.python.org/ftp/python/pymanager/pymanager.appinstaller" in source
-    assert 'install --target="%BOOTSTRAP_PYTHON_DIRECTORY%" 3.13' in source
-    assert 'set "BOOTSTRAP_PYTHON_DIRECTORY=%SCRIPT_DIR%\\.runtime\\python"' in source
-    assert 'set "BOOTSTRAP_PYTHON=%BOOTSTRAP_PYTHON_DIRECTORY%\\python.exe"' in source
-    assert 'set "VENV_DIRECTORY=%SCRIPT_DIR%\\.venv"' in source
+def test_windows_installer_requires_supported_python_and_git() -> None:
+    source = (Path(__file__).parents[1] / "windows_install_shotbox_assets.bat").read_text(
+        encoding="utf-8"
+    )
+
+    assert "where git >nul 2>&1" in source
+    assert "py -3.11 --version" in source
+    assert "sys.version_info >= (3, 11)" in source
+    assert "Could not find Python 3.11 or newer" in source
 
 
-def test_standalone_batch_clones_beside_itself_and_reuses_the_checkout() -> None:
-    source = (Path(__file__).parents[1] / "run_vfx_asset_library.bat").read_text(encoding="utf-8")
+def test_windows_runner_uses_the_installed_venv() -> None:
+    source = (Path(__file__).parents[1] / "windows_run_shotbox.bat").read_text(
+        encoding="utf-8"
+    )
 
-    assert 'set "INSTALL_TARGET=%SCRIPT_DIR%\\vfx_assets_library"' in source
-    assert 'set "INSTALL_TARGET=%~f1"' in source
-    assert 'if "%FIRST_ARGUMENT:~0,2%"=="--" goto collect_standalone_arguments' in source
-    assert ':collect_standalone_arguments' in source
-    assert 'set FORWARDED_ARGUMENTS=%FORWARDED_ARGUMENTS% "%~1"' in source
-    assert 'git clone --branch main --single-branch "https://github.com/chiefjackvfx/vfx_assets_library.git" "%INSTALL_TARGET%"' in source
-    assert 'if exist "%INSTALL_TARGET%\\.git" goto validate_install_target' in source
-    assert 'call "%INSTALL_TARGET%\\run_vfx_asset_library.bat" %FORWARDED_ARGUMENTS%' in source
+    assert 'if not exist "%CD%\\venv\\Scripts\\python.exe"' in source
+    assert '"%CD%\\venv\\Scripts\\python.exe" "%CD%\\run_vfx_asset_library.py" %*' in source
+    assert "Run windows_install_shotbox_assets.bat first" in source
 
 
-def test_batch_requires_git_only_for_install_and_rejects_unexpected_targets() -> None:
-    source = (Path(__file__).parents[1] / "run_vfx_asset_library.bat").read_text(encoding="utf-8")
+def test_legacy_windows_batch_hands_off_to_the_installer() -> None:
+    source = (Path(__file__).parents[1] / "run_vfx_asset_library.bat").read_text(
+        encoding="utf-8"
+    )
 
-    assert "Git for Windows is required to install ShotBox Assets" in source
-    assert "if errorlevel 1 goto launch_installed_checkout" in source
-    assert "goto install_target_not_empty" in source
-    assert "goto unexpected_install_origin" in source
-    assert "GIT_TERMINAL_PROMPT=0" in source
+    assert 'call "%~dp0windows_install_shotbox_assets.bat" %*' in source
 
 
 def test_windows_install_has_no_legacy_archive_or_local_appdata_install_paths() -> None:
     root = Path(__file__).parents[1]
     sources = "\n".join(
         (root / relative).read_text(encoding="utf-8")
-        for relative in ("run_vfx_asset_library.bat", "scripts/windows_auto_update.py")
+        for relative in (
+            "run_vfx_asset_library.bat",
+            "windows_install_shotbox_assets.bat",
+            "windows_run_shotbox.bat",
+            "scripts/windows_auto_update.py",
+        )
     )
 
     assert "%LOCALAPPDATA%\\ShotBoxAssets" not in sources
@@ -277,17 +289,10 @@ def test_windows_install_has_no_legacy_archive_or_local_appdata_install_paths() 
     assert "state.json" not in sources
 
 
-def test_batch_repairs_an_incomplete_virtual_environment_without_manual_files() -> None:
-    source = (Path(__file__).parents[1] / "run_vfx_asset_library.bat").read_text(encoding="utf-8")
-
-    assert 'if exist "%VENV_DIRECTORY%" set "VENV_NEEDS_REPAIR=1"' in source
-    assert '-m venv --clear "%VENV_DIRECTORY%"' in source
-    assert "Repair or remove .venv" not in source
-    assert "goto venv_version_error" not in source
-
-
-def test_batch_goto_targets_are_defined() -> None:
-    source = (Path(__file__).parents[1] / "run_vfx_asset_library.bat").read_text(encoding="utf-8")
+def test_installer_goto_targets_are_defined() -> None:
+    source = (Path(__file__).parents[1] / "windows_install_shotbox_assets.bat").read_text(
+        encoding="utf-8"
+    )
     labels = {
         line.strip()[1:].lower()
         for line in source.splitlines()
