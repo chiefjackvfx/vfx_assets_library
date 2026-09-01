@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 
 PROTOCOL_VERSION = 1
-BRIDGE_VERSION = "0.6.0"
+BRIDGE_VERSION = "0.7.0"
 MAX_MESSAGE_BYTES = 64 * 1024
 
 
@@ -239,6 +239,37 @@ class HoudiniBridgeClient:
         if not response.ok:
             raise HoudiniBridgeError(response.diagnostic or "Houdini could not import the USD model.")
         return response
+
+    def import_fbx_model(
+        self,
+        session: HoudiniSession,
+        payload: ModelExportPayload,
+        *,
+        target: str = "sop",
+    ) -> BridgeResponse:
+        if target != "sop":
+            raise HoudiniBridgeError("FBX models can only be imported into Houdini SOPs.")
+        if "fbx_model" not in session.capabilities:
+            raise HoudiniBridgeError("Update the Houdini plug-in in Settings and restart Houdini.")
+        if payload.model.file_format.upper() != "FBX":
+            raise HoudiniBridgeError("The selected model is not an FBX file.")
+        document = payload.document()
+        document["target"] = target
+        response = self._request(session, BridgeRequest("import_fbx_model", document))
+        if not response.ok:
+            raise HoudiniBridgeError(response.diagnostic or "Houdini could not import the FBX model.")
+        return response
+
+    def import_model(
+        self,
+        session: HoudiniSession,
+        payload: ModelExportPayload,
+        *,
+        target: str = "lop",
+    ) -> BridgeResponse:
+        if payload.model.file_format.upper() == "FBX":
+            return self.import_fbx_model(session, payload, target=target)
+        return self.import_usd_model(session, payload, target=target)
 
     def import_vdb(
         self,

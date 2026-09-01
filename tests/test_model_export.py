@@ -47,9 +47,11 @@ def test_model_export_uses_preferred_usd_and_selected_variant(tmp_path: Path) ->
     (asset_dir / "usd").mkdir(parents=True)
     (asset_dir / "usd" / "oak_2k.usdc").write_bytes(b"usd")
     (asset_dir / "usd" / "oak_4k.usdc").write_bytes(b"usd")
+    (asset_dir / "models").mkdir()
+    (asset_dir / "models" / "oak.fbx").write_bytes(b"fbx")
     asset = _asset(asset_dir)
     assert [item.path for item in model_export_options(asset)] == [
-        "usd/oak_4k.usdc", "usd/oak_2k.usdc",
+        "usd/oak_4k.usdc", "usd/oak_2k.usdc", "models/oak.fbx",
     ]
     preferred = prepare_model_export(asset, library_root=tmp_path)
     assert preferred.asset_slug == "oak-tree"
@@ -57,6 +59,9 @@ def test_model_export_uses_preferred_usd_and_selected_variant(tmp_path: Path) ->
     selected = prepare_model_export(asset, "usd/oak_2k.usdc", tmp_path)
     assert selected.model.lod == "LOD1"
     assert selected.document()["model_path"].endswith("oak_2k.usdc")
+    fbx = prepare_model_export(asset, "models/oak.fbx", tmp_path)
+    assert fbx.model.file_format == "FBX"
+    assert fbx.document()["model_path"].endswith("oak.fbx")
 
 
 def test_model_export_rejects_unknown_missing_and_outside_paths(tmp_path: Path) -> None:

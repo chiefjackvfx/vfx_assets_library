@@ -27,6 +27,8 @@ def execute(bpy, action, payload, session_id):
         return create_texture_material(bpy, payload, session_id)
     if action == "import_usd_model":
         return import_usd_model(bpy, payload, session_id)
+    if action == "import_fbx_model":
+        return import_fbx_model(bpy, payload, session_id)
     raise ActionError(f"Unsupported bridge action: {action}")
 
 
@@ -98,27 +100,13 @@ def create_texture_material(bpy, payload, session_id):
     if created:
         material = materials.new(f"ShotBox_{_identifier(asset_name)}")
     try:
-        material.use_nodes = True
-        tree = material.node_tree
-        tree.nodes.clear()
-        output = tree.nodes.new("ShaderNodeOutputMaterial")
-        output.name = "ShotBox Material Output"
-        shader = tree.nodes.new("ShaderNodeBsdfPrincipled")
-        shader.name = "ShotBox Principled BSDF"
-        _link(tree, _socket(shader.outputs, "BSDF"), _socket(output.inputs, "Surface"))
-        sources = _texture_sources(tree, bpy.data.images, records)
-        _build_principled_graph(tree, material, shader, output, sources)
-        _layout_texture_material(tree)
         values = {
             OWNER_KEY: OWNER_VALUE,
             "shotbox_asset_id": asset_id,
             "shotbox_asset_name": asset_name,
             "shotbox_resolution": resolution,
         }
-        for key, value in values.items():
-            material[key] = value
-            shader[key] = value
-            output[key] = value
+        _configure_principled_material(bpy, material, records, values)
     except Exception:
         if created:
             try:
@@ -158,6 +146,24 @@ def create_texture_material(bpy, payload, session_id):
     }
 
 
+def _configure_principled_material(bpy, material, records, values):
+    material.use_nodes = True
+    tree = material.node_tree
+    tree.nodes.clear()
+    output = tree.nodes.new("ShaderNodeOutputMaterial")
+    output.name = "ShotBox Material Output"
+    shader = tree.nodes.new("ShaderNodeBsdfPrincipled")
+    shader.name = "ShotBox Principled BSDF"
+    _link(tree, _socket(shader.outputs, "BSDF"), _socket(output.inputs, "Surface"))
+    sources = _texture_sources(tree, bpy.data.images, records)
+    _build_principled_graph(tree, material, shader, output, sources)
+    _layout_texture_material(tree)
+    for key, value in values.items():
+        material[key] = value
+        shader[key] = value
+        output[key] = value
+
+
 def import_usd_model(bpy, payload, session_id):
     model_path, _library = _validated_model_path(payload)
     asset_id = _required_text(payload, "asset_id")
@@ -171,8 +177,6 @@ def import_usd_model(bpy, payload, session_id):
         name: _identity_set(getattr(getattr(bpy, "data", None), name, ()))
         for name in ("objects", "collections", "materials", "images")
     }
-    container = None
-    root = None
     try:
         result = bpy.ops.wm.usd_import(
             filepath=str(model_path),
@@ -192,40 +196,236 @@ def import_usd_model(bpy, payload, session_id):
         if not imported:
             raise ActionError("The USD file did not produce any importable geometry.")
 
-        identifier = f"ShotBox_{_identifier(asset_name)}"
-        container = bpy.data.collections.new(identifier)
-        scene.collection.children.link(container)
-        root = bpy.data.objects.new(identifier, None)
-        container.objects.link(root)
         roots = [item for item in imported if getattr(item, "parent", None) not in imported]
-        for item in roots:
-            world_matrix = _copy_value(getattr(item, "matrix_world", None))
-            item.parent = root
-            if world_matrix is not None:
-                item.matrix_world = world_matrix
-            _link_object(container, item)
-        root.location = _cursor_location(scene)
-        for owner in (container, root):
-            _mark_model_owner(owner, asset_id, asset_name, instance_id, variant, model_path)
+        _place_imported_roots(roots, _cursor_location(scene))
+        resolution = str(payload.get("resolution", "")).strip()
+        file_format = str(payload.get("format", "USD")).strip() or "USD"
+        for item in imported:
+            _mark_model_owner(item, asset_id, asset_name, instance_id, variant, model_path)
+            item["shotbox_resolution"] = resolution
+            item["shotbox_format"] = file_format
+        for material in _new_data(bpy, "materials", before["materials"]):
+            _mark_model_owner(material, asset_id, asset_name, instance_id, variant, model_path)
+            material["shotbox_resolution"] = resolution
+            material["shotbox_format"] = file_format
+        active = next(
+            (item for item in imported if str(getattr(item, "type", "")).upper() == "MESH"),
+            imported[0],
+        )
         try:
-            root.select_set(True)
-            bpy.context.view_layer.objects.active = root
+            active.select_set(True)
+            bpy.context.view_layer.objects.active = active
         except Exception:
             pass
     except Exception:
-        _rollback_model_import(bpy, before, root, container)
+        _rollback_model_import(bpy, before)
         raise
     names = [str(getattr(item, "name", "Object")) for item in imported]
     return {
         "ok": True,
         "session_id": session_id,
         "model_path": model_path.as_posix(),
-        "collection_name": str(getattr(container, "name", "")),
-        "root_object": str(getattr(root, "name", "")),
+        "collection_name": "",
+        "root_object": "",
         "imported_targets": names,
         "diagnostic": f"Imported {asset_name} ({variant}) as {len(names)} Blender object(s).",
         "data": session_data(bpy),
     }
+
+
+def import_fbx_model(bpy, payload, session_id):
+    model_path, library = _validated_fbx_path(payload)
+    asset_id = _required_text(payload, "asset_id")
+    asset_name = _required_text(payload, "asset_name")
+    variant = str(payload.get("variant", "")).strip() or "FBX"
+    resolution = str(payload.get("resolution", "")).strip()
+    texture_sets = _validated_model_texture_sets(payload, library)
+    instance_id = str(uuid.uuid4())
+    scene = getattr(getattr(bpy, "context", None), "scene", None)
+    if scene is None:
+        raise ActionError("Blender has no active scene.")
+    tracked = (
+        "objects", "collections", "materials", "images", "meshes", "curves",
+        "armatures", "actions", "cameras", "lights",
+    )
+    before = {
+        name: _identity_set(getattr(getattr(bpy, "data", None), name, ()))
+        for name in tracked
+    }
+    imported = []
+    try:
+        operator = getattr(getattr(bpy.ops, "wm", None), "fbx_import", None)
+        operator = operator or getattr(getattr(bpy.ops, "import_scene", None), "fbx", None)
+        if operator is None:
+            raise ActionError("This Blender installation has no FBX importer.")
+        result = operator(filepath=str(model_path), use_anim=False)
+        if result is not None and "FINISHED" not in result:
+            raise ActionError("Blender's FBX importer did not finish successfully.")
+        imported = _new_data(bpy, "objects", before["objects"])
+        for item in tuple(imported):
+            if str(getattr(item, "type", "")).upper() in {"CAMERA", "LIGHT"}:
+                _remove_data(getattr(bpy.data, "objects", None), item)
+                imported.remove(item)
+        _validate_static_fbx(bpy, imported, before)
+        meshes = [
+            item for item in imported
+            if str(getattr(item, "type", "")).upper() == "MESH"
+        ]
+        if not meshes:
+            raise ActionError("The FBX file did not produce any importable mesh geometry.")
+        _assign_fbx_materials(
+            bpy, meshes, texture_sets, before,
+            asset_id, asset_name, instance_id, resolution, variant, model_path,
+        )
+
+        roots = [item for item in imported if getattr(item, "parent", None) not in imported]
+        _place_imported_roots(roots, _cursor_location(scene))
+        for item in imported:
+            _mark_model_owner(item, asset_id, asset_name, instance_id, variant, model_path)
+            item["shotbox_resolution"] = resolution
+            item["shotbox_format"] = "FBX"
+        active = meshes[0]
+        try:
+            active.select_set(True)
+            bpy.context.view_layer.objects.active = active
+        except Exception:
+            pass
+    except Exception:
+        _rollback_model_import(bpy, before)
+        raise
+    names = [str(getattr(item, "name", "Object")) for item in imported]
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "model_path": model_path.as_posix(),
+        "collection_name": "",
+        "root_object": "",
+        "imported_targets": names,
+        "diagnostic": (
+            f"Imported {asset_name} ({variant}) as {len(names)} Blender object(s)"
+            + (f" with {len(texture_sets)} managed material(s)." if texture_sets else " without materials.")
+        ),
+        "data": session_data(bpy),
+    }
+
+
+def _validate_static_fbx(bpy, imported, before):
+    if any(str(getattr(item, "type", "")).upper() == "ARMATURE" for item in imported):
+        raise ActionError("Static FBX import does not support armatures, joints, or skinning.")
+    if _new_data(bpy, "actions", before.get("actions", set())):
+        raise ActionError("Static FBX import does not support animation actions.")
+    for item in imported:
+        if str(getattr(item, "type", "")).upper() != "MESH":
+            continue
+        data = getattr(item, "data", None)
+        shape_keys = getattr(data, "shape_keys", None)
+        if shape_keys is not None and len(tuple(getattr(shape_keys, "key_blocks", ()))) > 1:
+            raise ActionError("Static FBX import does not support blend shapes.")
+        for modifier in tuple(getattr(item, "modifiers", ())):
+            if str(getattr(modifier, "type", "")).upper() == "ARMATURE":
+                raise ActionError("Static FBX import does not support skinned meshes.")
+
+
+def _assign_fbx_materials(
+    bpy, meshes, texture_sets, before,
+    asset_id, asset_name, instance_id, resolution, variant, model_path,
+):
+    slots = {}
+    unassigned = []
+    for obj in meshes:
+        object_slots = tuple(getattr(obj, "material_slots", ()))
+        if not object_slots:
+            unassigned.append(obj)
+            continue
+        for slot in object_slots:
+            material = getattr(slot, "material", None)
+            name = str(getattr(material, "name", "") or getattr(slot, "name", "")).strip()
+            if name:
+                slots.setdefault(name, []).append(slot)
+            else:
+                unassigned.append(obj)
+    imported_materials = _new_data(bpy, "materials", before.get("materials", set()))
+    imported_images = _new_data(bpy, "images", before.get("images", set()))
+    if not texture_sets:
+        for obj in meshes:
+            values = getattr(getattr(obj, "data", None), "materials", None)
+            try:
+                values.clear()
+            except Exception:
+                pass
+        for material in reversed(imported_materials):
+            _remove_data(getattr(bpy.data, "materials", None), material)
+        for image in reversed(imported_images):
+            _remove_data(getattr(bpy.data, "images", None), image)
+        return
+
+    matches = _match_fbx_materials(slots, texture_sets)
+    if unassigned:
+        if len(texture_sets) != 1:
+            raise ActionError(
+                "FBX meshes without material slots require exactly one managed texture set."
+            )
+    for material in reversed(imported_materials):
+        _remove_data(getattr(bpy.data, "materials", None), material)
+    for image in reversed(imported_images):
+        _remove_data(getattr(bpy.data, "images", None), image)
+
+    built = {}
+    for texture_set in texture_sets:
+        key = _normalized_name(texture_set["name"])
+        material = bpy.data.materials.new(
+            f"ShotBox_{_identifier(asset_name)}_{_identifier(texture_set['name'])}"
+        )
+        values = {
+            OWNER_KEY: OWNER_VALUE,
+            "shotbox_asset_id": asset_id,
+            "shotbox_asset_name": asset_name,
+            "shotbox_instance_id": instance_id,
+            "shotbox_texture_set": texture_set["name"],
+            "shotbox_resolution": texture_set["resolution"] or resolution,
+            "shotbox_variant": variant,
+            "shotbox_model_path": model_path.as_posix(),
+            "shotbox_format": "FBX",
+        }
+        _configure_principled_material(bpy, material, texture_set["maps"], values)
+        built[key] = material
+    for name, texture_set in matches.items():
+        material = built[_normalized_name(texture_set["name"])]
+        for slot in slots[name]:
+            slot.material = material
+    if unassigned:
+        material = built[_normalized_name(texture_sets[0]["name"])]
+        for obj in dict.fromkeys(unassigned):
+            getattr(obj.data, "materials").append(material)
+
+
+def _match_fbx_materials(slots, texture_sets):
+    by_name = {}
+    for item in texture_sets:
+        key = _normalized_name(item["name"])
+        if key in by_name:
+            raise ActionError(
+                f"Managed texture-set names are ambiguous after normalization: {item['name']}"
+            )
+        by_name[key] = item
+    matches = {}
+    for name in slots:
+        item = by_name.get(_normalized_name(name))
+        if item is not None:
+            matches[name] = item
+    if len(slots) == 1 and len(texture_sets) == 1 and not matches:
+        matches[next(iter(slots))] = texture_sets[0]
+    missing = [name for name in slots if name not in matches]
+    if missing:
+        raise ActionError(
+            "Managed texture sets could not be matched to FBX material slots: "
+            + ", ".join(sorted(missing, key=str.casefold))
+        )
+    return matches
+
+
+def _normalized_name(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
 
 
 def _texture_sources(tree, images, records):
@@ -305,10 +505,12 @@ def _build_principled_graph(tree, material, shader, output, sources):
         ("Specular", ("Specular IOR Level", "Specular")),
         ("Opacity", ("Alpha",)),
         ("Emission", ("Emission Color", "Emission")),
-        ("Translucency", ("Subsurface Weight", "Subsurface")),
     ):
         if semantic in sources:
             _link(tree, sources[semantic][0], _socket(shader.inputs, *names))
+    subsurface = sources.get("Translucency") or sources.get("Thickness")
+    if subsurface:
+        _link(tree, subsurface[0], _socket(shader.inputs, "Subsurface Weight", "Subsurface"))
     if "Emission" in sources:
         strength = _optional_socket(shader.inputs, "Emission Strength")
         if strength is not None:
@@ -450,6 +652,49 @@ def _validated_model_path(payload):
     return resolved_source, resolved_library
 
 
+def _validated_fbx_path(payload):
+    source = Path(_required_text(payload, "model_path")).expanduser()
+    library = Path(_required_text(payload, "library_root")).expanduser()
+    try:
+        resolved_source = source.resolve(strict=True)
+        resolved_library = library.resolve(strict=True)
+    except OSError as error:
+        raise ActionError(f"The managed FBX path is unavailable: {error}") from error
+    if not resolved_library.is_dir():
+        raise ActionError("The supplied library root is not a directory.")
+    try:
+        resolved_source.relative_to(resolved_library)
+    except ValueError as error:
+        raise ActionError("The FBX model is outside the managed library root.") from error
+    if resolved_source.suffix.casefold() != ".fbx":
+        raise ActionError("Only managed FBX files can use the Blender FBX importer.")
+    if not resolved_source.is_file():
+        raise ActionError("The managed FBX model is not a file.")
+    return resolved_source, resolved_library
+
+
+def _validated_model_texture_sets(payload, library):
+    values = payload.get("texture_sets", [])
+    if values in (None, []):
+        return []
+    if not isinstance(values, list):
+        raise ActionError("Model texture_sets must be a list.")
+    result = []
+    for value in values:
+        if not isinstance(value, dict):
+            raise ActionError("Model texture-set records must be objects.")
+        records, _unused = _validated_texture_maps({
+            "library_root": library.as_posix(),
+            "maps": value.get("maps"),
+        })
+        result.append({
+            "name": _required_text(value, "name"),
+            "resolution": str(value.get("resolution", "")),
+            "maps": records,
+        })
+    return result
+
+
 def _identity_set(values):
     try:
         return {id(value) for value in values}
@@ -475,10 +720,15 @@ def _remove_data(collection, value):
         pass
 
 
-def _rollback_model_import(bpy, before, root, container):
+def _rollback_model_import(bpy, before):
     for value in reversed(_new_data(bpy, "objects", before["objects"])):
         _remove_data(getattr(bpy.data, "objects", None), value)
-    for name in ("collections", "materials", "images"):
+    for name in (
+        "collections", "materials", "images", "meshes", "curves", "armatures",
+        "actions", "cameras", "lights",
+    ):
+        if name not in before:
+            continue
         values = list(reversed(_new_data(bpy, name, before[name])))
         for value in values:
             _remove_data(getattr(bpy.data, name, None), value)
@@ -498,12 +748,24 @@ def _cursor_location(scene):
         return (0.0, 0.0, 0.0)
 
 
-def _link_object(collection, obj):
-    try:
-        if obj not in collection.objects:
-            collection.objects.link(obj)
-    except Exception:
-        pass
+def _place_imported_roots(roots, cursor):
+    for obj in roots:
+        matrix = _copy_value(getattr(obj, "matrix_world", None))
+        translation = getattr(matrix, "translation", None)
+        if translation is not None:
+            try:
+                matrix.translation = translation + cursor
+                obj.matrix_world = matrix
+                continue
+            except Exception:
+                pass
+        location = getattr(obj, "location", (0.0, 0.0, 0.0))
+        try:
+            obj.location = tuple(
+                float(location[index]) + float(cursor[index]) for index in range(3)
+            )
+        except Exception:
+            obj.location = cursor
 
 
 def _mark_model_owner(owner, asset_id, asset_name, instance_id, variant, model_path):
@@ -631,6 +893,6 @@ def session_data(bpy):
     return {
         "blender_version": version,
         "blend_file": blend_file,
-        "bridge_version": "0.4.4",
-        "capabilities": ["hdri", "texture_material", "usd_model"],
+        "bridge_version": "0.6.0",
+        "capabilities": ["hdri", "texture_material", "usd_model", "fbx_model"],
     }

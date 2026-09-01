@@ -18,6 +18,7 @@ PBR_CHANNELS = (
     "Opacity",
     "Emission",
     "Translucency",
+    "Thickness",
     "Packed ARM",
 )
 

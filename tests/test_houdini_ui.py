@@ -137,6 +137,21 @@ def test_model_inspector_selects_usd_variant_and_houdini_target(tmp_path) -> Non
     panel.set_blender_sessions([blender])
     assert panel.export_footer.isVisibleTo(panel)
     assert not panel.blender_send_button.isEnabled()
-    assert "no managed USD" in panel.blender_status.text()
+    assert "Update the Blender plug-in" in panel.blender_status.text()
+    fbx_blender = BlenderSession(
+        "blend-fbx", 1, 1, "5.2", "", "now", "0.5.0",
+        ("hdri", "texture_material", "usd_model", "fbx_model"),
+    )
+    fbx_houdini = HoudiniSession(
+        "houdini-fbx", 1, 1, "22.0", "", "now", "0.7.0",
+        ("hdri", "texture_material", "usd_model", "fbx_model"),
+    )
+    panel.set_blender_sessions([fbx_blender])
+    panel.set_houdini_sessions([fbx_houdini])
+    assert panel.blender_send_button.isEnabled()
+    assert panel.houdini_target.currentData() == "sop"
+    assert panel.houdini_target.currentText() == "SOPs · FBX"
+    assert not panel.houdini_target.isEnabled()
+    assert panel.houdini_send_button.isEnabled()
     panel.deleteLater()
     app.processEvents()

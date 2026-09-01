@@ -449,7 +449,8 @@ def test_bridge_handles_ping_from_blender_timer_without_threads(monkeypatch, tmp
 
     assert response["ok"] is True
     assert response["request_id"] == "ping-one"
-    assert response["data"]["bridge_version"] == "0.4.4"
+    assert response["data"]["bridge_version"] == "0.6.0"
+    assert "fbx_model" in response["data"]["capabilities"]
     assert bpy.app.timers.callback is None
 
 
@@ -486,10 +487,12 @@ def test_texture_material_is_created_unassigned_and_updated_by_asset_id(tmp_path
     base = library / "base.jpg"
     arm = library / "arm.png"
     displacement = library / "displacement.exr"
+    thickness = library / "thickness.png"
     library.mkdir()
     base.write_bytes(b"base")
     arm.write_bytes(b"arm")
     displacement.write_bytes(b"displacement")
+    thickness.write_bytes(b"thickness")
     request = {
         "asset_id": "stone-id", "asset_name": "Stone Wall", "resolution": "4K",
         "library_root": str(library), "missing_channels": ["Emission"],
@@ -497,6 +500,7 @@ def test_texture_material_is_created_unassigned_and_updated_by_asset_id(tmp_path
             {"channel": "Base Color", "path": str(base), "color_space": "sRGB", "normal_convention": "", "packed_channels": {}},
             {"channel": "Packed ARM", "path": str(arm), "color_space": "Raw", "normal_convention": "", "packed_channels": {"R": "Ambient Occlusion", "G": "Roughness", "B": "Metalness"}},
             {"channel": "Displacement", "path": str(displacement), "color_space": "Raw", "normal_convention": "", "packed_channels": {}},
+            {"channel": "Thickness", "path": str(thickness), "color_space": "Raw", "normal_convention": "", "packed_channels": {}},
         ],
     }
     bpy = Bpy()
@@ -509,6 +513,8 @@ def test_texture_material_is_created_unassigned_and_updated_by_asset_id(tmp_path
     assert material.displacement_method == "DISPLACEMENT"
     assert any(node.type == "BSDF_PRINCIPLED" for node in material.node_tree.nodes)
     assert any(node.type == "SEPARATE_COLOR" for node in material.node_tree.nodes)
+    shader = next(node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED")
+    assert shader.inputs["Subsurface Weight"].links[0].from_node.name == "ShotBox Thickness"
     texture_coordinates = next(
         node for node in material.node_tree.nodes if node.type == "TEX_COORD"
     )
@@ -644,6 +650,7 @@ class ModelWmOps:
     def __init__(self, bpy):
         self.bpy = bpy
         self.calls = []
+        self.fbx_material_names = ["Oak Bark"]
 
     def usd_import(self, **kwargs):
         self.calls.append(kwargs)
@@ -652,12 +659,24 @@ class ModelWmOps:
         child.parent = parent
         return {"FINISHED"}
 
+    def fbx_import(self, **kwargs):
+        self.calls.append(kwargs)
+        materials = [self.bpy.data.materials.new(name) for name in self.fbx_material_names]
+        mesh = type("Mesh", (), {"materials": list(materials), "shape_keys": None})()
+        slots = [type("Slot", (), {"name": item.name, "material": item})() for item in materials]
+        parent = self.bpy.data.objects.new("Oak FBX", mesh)
+        parent.material_slots = slots
+        parent.modifiers = []
+        return {"FINISHED"}
+
 
 class ModelBpy(Bpy):
     def __init__(self):
         super().__init__()
         self.data.objects = ModelObjects()
         self.data.collections = ModelCollections()
+        for name in ("meshes", "curves", "armatures", "actions", "cameras", "lights"):
+            setattr(self.data, name, [])
         self.context.scene.collection = ModelCollection("Scene Collection")
         vector = type("Vector", (), {"copy": lambda self: (3.0, 4.0, 5.0)})()
         self.context.scene.cursor = type("Cursor", (), {"location": vector})()
@@ -682,7 +701,34 @@ def _model_request(library, source):
     }
 
 
-def test_import_usd_model_creates_cursor_root_and_new_instance_each_send(tmp_path) -> None:
+def _fbx_request(library, source, maps=True):
+    request = {
+        "asset_id": "oak-id",
+        "asset_name": "Oak Tree",
+        "asset_slug": "oak-tree",
+        "variant": "LOD0 · FBX",
+        "format": "FBX",
+        "resolution": "",
+        "lod": "LOD0",
+        "model_path": str(source),
+        "library_root": str(library),
+        "texture_sets": [],
+    }
+    if maps:
+        request["texture_sets"] = [{
+            "name": "Oak Bark",
+            "resolution": "4K",
+            "maps": [{
+                "channel": "Base Color",
+                "path": str(library / "oak_base.jpg"),
+                "color_space": "sRGB",
+                "packed_channels": {},
+            }],
+        }]
+    return request
+
+
+def test_import_usd_model_uses_current_collection_without_wrapper(tmp_path) -> None:
     library = tmp_path / "library"
     source = library / "models" / "oak.usdc"
     source.parent.mkdir(parents=True)
@@ -690,18 +736,24 @@ def test_import_usd_model_creates_cursor_root_and_new_instance_each_send(tmp_pat
     bpy = ModelBpy()
 
     first = actions.import_usd_model(bpy, _model_request(library, source), "session")
-    root = next(item for item in bpy.data.objects if item.name == first["root_object"])
     imported = [item for item in bpy.data.objects if item.name in first["imported_targets"]]
-    assert root.location == (3.0, 4.0, 5.0)
-    assert imported[0].parent is root
+    assert first["collection_name"] == ""
+    assert first["root_object"] == ""
+    assert bpy.data.collections == []
+    assert all(item.type != "EMPTY" for item in bpy.data.objects)
+    assert imported[0].location == (3.0, 4.0, 5.0)
+    assert imported[0].parent is None
     assert imported[1].parent is imported[0]
-    assert root.get("shotbox_asset_id") == "oak-id"
+    assert imported[0].get("shotbox_asset_id") == "oak-id"
     assert bpy.ops.wm.calls[0]["import_cameras"] is False
     assert bpy.ops.wm.calls[0]["import_lights"] is False
 
+    first_instance = imported[0].get("shotbox_instance_id")
     second = actions.import_usd_model(bpy, _model_request(library, source), "session")
-    assert second["collection_name"] != first["collection_name"]
-    assert second["root_object"] != first["root_object"]
+    second_imported = [item for item in bpy.data.objects if item.name in second["imported_targets"]]
+    assert second_imported[0].get("shotbox_instance_id") != first_instance
+    assert bpy.data.collections == []
+    assert all(item.type != "EMPTY" for item in bpy.data.objects)
 
 
 def test_import_usd_model_rejects_outside_library(tmp_path) -> None:
@@ -711,3 +763,55 @@ def test_import_usd_model_rejects_outside_library(tmp_path) -> None:
     source.write_bytes(b"usd")
     with pytest.raises(actions.ActionError, match="outside"):
         actions.import_usd_model(ModelBpy(), _model_request(library, source), "session")
+
+
+def test_import_fbx_model_builds_managed_material_and_geometry_only_fallback(tmp_path) -> None:
+    library = tmp_path / "library"
+    source = library / "models" / "oak.fbx"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"fbx")
+    (library / "oak_base.jpg").write_bytes(b"base")
+    bpy = ModelBpy()
+
+    result = actions.import_fbx_model(bpy, _fbx_request(library, source), "session")
+
+    imported = next(item for item in bpy.data.objects if item.name == "Oak FBX")
+    assert bpy.ops.wm.calls[0]["use_anim"] is False
+    assert imported.material_slots[0].material.get("shotbox_asset_id") == "oak-id"
+    assert imported.material_slots[0].material.get("shotbox_texture_set") == "Oak Bark"
+    assert result["root_object"] == ""
+    assert result["collection_name"] == ""
+    assert bpy.data.collections == []
+    assert imported.location == (3.0, 4.0, 5.0)
+    assert imported.parent is None
+    assert imported.get("shotbox_asset_id") == "oak-id"
+    assert "managed material" in result["diagnostic"]
+
+    geometry_only = ModelBpy()
+    result = actions.import_fbx_model(
+        geometry_only, _fbx_request(library, source, maps=False), "session"
+    )
+    imported = next(item for item in geometry_only.data.objects if item.name == "Oak FBX")
+    assert imported.data.materials == []
+    assert geometry_only.data.materials == []
+    assert "without materials" in result["diagnostic"]
+
+
+def test_import_fbx_model_rolls_back_ambiguous_materials(tmp_path) -> None:
+    library = tmp_path / "library"
+    source = library / "models" / "oak.fbx"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"fbx")
+    (library / "oak_base.jpg").write_bytes(b"base")
+    bpy = ModelBpy()
+    bpy.ops.wm.fbx_material_names = ["Bark", "Leaves"]
+    request = _fbx_request(library, source)
+    request["texture_sets"].append({
+        "name": "Moss", "resolution": "4K", "maps": request["texture_sets"][0]["maps"],
+    })
+
+    with pytest.raises(actions.ActionError, match="could not be matched"):
+        actions.import_fbx_model(bpy, request, "session")
+
+    assert bpy.data.objects == []
+    assert bpy.data.materials == []

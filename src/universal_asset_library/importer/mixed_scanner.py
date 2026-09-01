@@ -218,7 +218,7 @@ def _loose_hdri_group(root: Path, paths: list[Path], default_category: str) -> H
         preferred.preferred = True
     display_key = loose_hdri_key(paths[0])
     relative = paths[0].relative_to(root).as_posix()
-    warning = "No readable preview found; a JPEG placeholder will be generated during import."
+    warning = "No readable preview found; the catalog will use its built-in placeholder."
     diagnostics = [
         Diagnostic("info", "asset_type_detected", "Detected and grouped as a loose HDRI from its HDR/EXR files and dimensions.", relative, display_key),
         Diagnostic("warning", "hdri_preview_missing", warning, relative, display_key),

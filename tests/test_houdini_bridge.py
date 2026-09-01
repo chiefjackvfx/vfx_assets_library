@@ -126,8 +126,8 @@ def test_installer_detects_installs_updates_and_uninstalls(tmp_path) -> None:
     assert config.stat().st_mode & 0o077 == 0
     package = json.loads((h21 / "packages" / "shotbox_assets_bridge.json").read_text(encoding="utf-8"))
     assert package["enable"] is True
-    assert package["version"] == "0.6.0"
-    assert package["path"].endswith("shotbox-assets-plugin-0.6.0")
+    assert package["version"] == "0.7.0"
+    assert package["path"].endswith("shotbox-assets-plugin-0.7.0")
     plugin_root = Path(package["path"])
     assert (plugin_root / "python3.11libs" / "uiready.py").is_file()
     assert (plugin_root / "python3.13libs" / "uiready.py").is_file()
@@ -225,3 +225,15 @@ def test_model_client_dispatches_target(monkeypatch, tmp_path) -> None:
     assert captured["request"].payload["target"] == "sop"
     with pytest.raises(HoudiniBridgeError, match="Unsupported"):
         client.import_usd_model(session, payload, target="obj")
+
+    fbx_payload = ModelExportPayload(
+        "id", "Tree", "tree", tmp_path,
+        ModelExportFile(tmp_path / "tree.fbx", "FBX", "4K", "LOD0"),
+    )
+    fbx_session = HoudiniSession(
+        "s", 1, 1, "22.0", "", "now", "0.7.0", ("usd_model", "fbx_model")
+    )
+    assert client.import_model(fbx_session, fbx_payload, target="sop").ok
+    assert captured["request"].action == "import_fbx_model"
+    with pytest.raises(HoudiniBridgeError, match="only be imported"):
+        client.import_model(fbx_session, fbx_payload, target="lop")

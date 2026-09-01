@@ -15,7 +15,7 @@ from .paths import config_path, runtime_dir
 
 
 PROTOCOL_VERSION = 1
-BRIDGE_VERSION = "0.4.4"
+BRIDGE_VERSION = "0.6.0"
 MAX_MESSAGE_BYTES = 64 * 1024
 WORLD_MODES = ("new", "edit_current")
 
@@ -210,6 +210,29 @@ class BlenderBridgeClient:
         if not response.ok:
             raise BlenderBridgeError(response.diagnostic or "Blender could not import the USD model.")
         return response
+
+    def import_fbx_model(
+        self,
+        session: BlenderSession,
+        payload: ModelExportPayload,
+    ) -> BlenderBridgeResponse:
+        if "fbx_model" not in session.capabilities:
+            raise BlenderBridgeError("Update the Blender plug-in in Settings and restart Blender.")
+        if payload.model.file_format.upper() != "FBX":
+            raise BlenderBridgeError("The selected model is not an FBX file.")
+        response = self._request(session, "import_fbx_model", payload.document())
+        if not response.ok:
+            raise BlenderBridgeError(response.diagnostic or "Blender could not import the FBX model.")
+        return response
+
+    def import_model(
+        self,
+        session: BlenderSession,
+        payload: ModelExportPayload,
+    ) -> BlenderBridgeResponse:
+        if payload.model.file_format.upper() == "FBX":
+            return self.import_fbx_model(session, payload)
+        return self.import_usd_model(session, payload)
 
     def _request(self, session: BlenderSession, action: str, payload: dict[str, Any]) -> BlenderBridgeResponse:
         token = self._load_token(session.config_file)

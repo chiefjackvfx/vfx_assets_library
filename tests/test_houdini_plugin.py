@@ -178,14 +178,61 @@ class FakeNode:
         pass
 
     def destroy(self):
+        for child in tuple(self.children):
+            child.destroy()
+        path = self.path()
         self._parent.children.remove(self)
-        self.hou.nodes.pop(self.path(), None)
+        self.hou.nodes.pop(path, None)
+
+    def displayNode(self):
+        return next(
+            (child for child in reversed(self.children) if child.type().category().name() == "Sop"),
+            None,
+        )
+
+    def geometry(self):
+        return getattr(self, "fake_geometry", FakeGeometry([]))
+
+
+class FakePrimitive:
+    def __init__(self, material_path):
+        self.material_path = material_path
+
+    def stringAttribValue(self, name):
+        return self.material_path if name == "shop_materialpath" else ""
+
+
+class FakeGeometry:
+    def __init__(self, material_paths):
+        self.material_paths = material_paths
+
+    def prims(self):
+        return tuple(FakePrimitive(value) for value in self.material_paths)
 
 
 class FakeHipFile:
+    def __init__(self, hou):
+        self.hou = hou
+        self.fbx_calls = []
+        self.fbx_material_paths = ["/mat/Oak_Bark"]
+
     @staticmethod
     def path():
         return "/project/test.hip"
+
+    def importFBX(self, path, **kwargs):
+        self.fbx_calls.append((path, kwargs))
+        root = self.hou.node("/")
+        obj = self.hou.node("/obj") or root.createNode("objnet", "obj")
+        subnet = obj.createNode("subnet", "oak_fbx")
+        geo = subnet.createNode("geo", "oak_mesh")
+        file_node = geo.createNode("file", "file1")
+        file_node.parm("file").set(path)
+        file_node.fake_geometry = FakeGeometry(self.fbx_material_paths)
+        if kwargs.get("import_materials"):
+            mat = self.hou.node("/mat") or root.createNode("matnet", "mat")
+            mat.createNode("fbxshader", "Oak_Bark")
+        return subnet, "fixture loaded"
 
 
 class FakeUndos:
@@ -199,9 +246,9 @@ class FakeHou:
         self.nodes = {}
         self.selected = []
         self.undos = FakeUndos()
-        self.hipFile = FakeHipFile()
         root = FakeNode(self, "", "root")
         self.nodes["/"] = root
+        self.hipFile = FakeHipFile(self)
 
     def node(self, path):
         return self.nodes.get(path)
@@ -335,15 +382,18 @@ def test_creates_unassigned_solaris_materialx_and_updates_owned_library(tmp_path
     library = tmp_path / "library"
     base = library / "base.jpg"
     roughness = library / "rough.exr"
+    thickness = library / "thickness.png"
     library.mkdir()
     base.write_bytes(b"base")
     roughness.write_bytes(b"rough")
+    thickness.write_bytes(b"thickness")
     request = {
         "asset_id": "stone-id", "asset_name": "Stone Wall", "resolution": "4K",
         "library_root": str(library), "missing_channels": ["Normal"],
         "maps": [
             {"channel": "Base Color", "path": str(base), "color_space": "sRGB", "packed_channels": {}},
             {"channel": "Roughness", "path": str(roughness), "color_space": "Raw", "packed_channels": {}},
+            {"channel": "Thickness", "path": str(thickness), "color_space": "Raw", "packed_channels": {}},
         ],
     }
     hou = FakeHou()
@@ -367,6 +417,8 @@ def test_creates_unassigned_solaris_materialx_and_updates_owned_library(tmp_path
     assert uv_control.inputs[0][0] is uv_coordinates
     images = [node for node in builder.children if node.type().name() == "mtlximage"]
     assert images and all(image.inputs[3][0] is uv_control for image in images)
+    surface = next(node for node in builder.children if node.type().name() == "mtlxstandard_surface")
+    assert surface.inputs[surface.inputIndex("subsurface")][0].name() == "image_3_thickness"
     stage = hou.node("/stage")
     second = actions.create_texture_material(hou, request, "session")
     assert second["node_path"] == first["node_path"]
@@ -386,6 +438,34 @@ def _model_payload(library: Path, source: Path, target: str = "lop"):
         "library_root": str(library),
         "target": target,
     }
+
+
+def _fbx_payload(library: Path, source: Path, maps=True):
+    payload = {
+        "asset_id": "tree-id",
+        "asset_name": "Oak Tree",
+        "asset_slug": "oak-tree",
+        "variant": "LOD0 · FBX",
+        "format": "FBX",
+        "resolution": "",
+        "lod": "LOD0",
+        "model_path": str(source),
+        "library_root": str(library),
+        "target": "sop",
+        "texture_sets": [],
+    }
+    if maps:
+        payload["texture_sets"] = [{
+            "name": "Oak Bark",
+            "resolution": "4K",
+            "maps": [{
+                "channel": "Base Color",
+                "path": str(library / "oak_base.jpg"),
+                "color_space": "sRGB",
+                "packed_channels": {},
+            }],
+        }]
+    return payload
 
 
 def test_import_usd_model_creates_new_lop_reference_each_send(tmp_path) -> None:
@@ -475,3 +555,72 @@ def test_import_usd_model_rejects_outside_library(tmp_path) -> None:
     source.write_bytes(b"usd")
     with pytest.raises(actions.ActionError, match="outside"):
         actions.import_usd_model(FakeHou(), _model_payload(library, source), "session")
+
+
+def test_import_fbx_model_creates_live_sops_and_managed_materialx(tmp_path) -> None:
+    library = tmp_path / "library"
+    source = library / "models" / "oak.fbx"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"fbx")
+    (library / "oak_base.jpg").write_bytes(b"base")
+    hou = FakeHou()
+
+    result = actions.import_fbx_model(hou, _fbx_payload(library, source), "session")
+
+    path, options = hou.hipFile.fbx_calls[0]
+    assert path == source.as_posix()
+    assert options["unlock_geometry"] is True
+    assert options["convert_file_paths_to_relative"] is False
+    assert options["import_animation"] is False
+    assert options["import_joints_and_skin"] is False
+    assert options["import_cameras"] is False and options["import_lights"] is False
+    imported_file = hou.node(result["imported_targets"][0])
+    assert imported_file.userData("shotbox_role") == "fbx_file_sop"
+    assert len(result["material_paths"]) == 1
+    builder = hou.node(result["material_paths"][0])
+    assert builder.userData("shotbox_texture_set") == "Oak Bark"
+    assignment = imported_file.parent().displayNode()
+    assert assignment.type().name() == "material"
+    assert assignment.parm("shop_materialpath1").value == builder.path()
+    assert "live FBX SOP geometry" in result["diagnostic"]
+
+
+def test_import_fbx_model_geometry_only_and_ambiguous_rollback(tmp_path) -> None:
+    library = tmp_path / "library"
+    source = library / "models" / "oak.fbx"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"fbx")
+    (library / "oak_base.jpg").write_bytes(b"base")
+    hou = FakeHou()
+    result = actions.import_fbx_model(
+        hou, _fbx_payload(library, source, maps=False), "session"
+    )
+    assert hou.hipFile.fbx_calls[0][1]["import_materials"] is False
+    assert result["material_paths"] == []
+
+    ambiguous = FakeHou()
+    ambiguous.hipFile.fbx_material_paths = ["/mat/Bark", "/mat/Leaves"]
+    request = _fbx_payload(library, source)
+    request["texture_sets"].append({
+        "name": "Moss", "resolution": "4K", "maps": request["texture_sets"][0]["maps"],
+    })
+    with pytest.raises(actions.ActionError, match="could not be matched"):
+        actions.import_fbx_model(ambiguous, request, "session")
+    assert ambiguous.node("/obj/oak_fbx") is None
+
+
+def test_import_fbx_model_rejects_lop_and_outside_library(tmp_path) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    source = library / "oak.fbx"
+    source.write_bytes(b"fbx")
+    request = _fbx_payload(library, source, maps=False)
+    request["target"] = "lop"
+    with pytest.raises(actions.ActionError, match="only be imported"):
+        actions.import_fbx_model(FakeHou(), request, "session")
+    outside = tmp_path / "outside.fbx"
+    outside.write_bytes(b"fbx")
+    with pytest.raises(actions.ActionError, match="outside"):
+        actions.import_fbx_model(
+            FakeHou(), _fbx_payload(library, outside, maps=False), "session"
+        )

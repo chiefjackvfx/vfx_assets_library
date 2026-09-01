@@ -15,6 +15,9 @@ from universal_asset_library.integrations.texture_export import (
 
 USD_FORMATS = {"USD", "USDA", "USDC", "USDZ"}
 USD_SUFFIXES = {".usd", ".usda", ".usdc", ".usdz"}
+FBX_FORMAT = "FBX"
+FBX_SUFFIX = ".fbx"
+BRIDGE_MODEL_FORMATS = USD_FORMATS | {FBX_FORMAT}
 
 
 class ModelExportError(RuntimeError):
@@ -87,12 +90,13 @@ class ModelExportTextureSet:
 def model_export_options(asset: LibraryModelAsset) -> tuple[LibraryModelFile, ...]:
     records = [
         item for item in asset.model_files
-        if item.available and item.file_format.upper() in USD_FORMATS
+        if item.available and item.file_format.upper() in BRIDGE_MODEL_FORMATS
     ]
     return tuple(sorted(
         records,
         key=lambda item: (
             not item.preferred,
+            item.file_format.upper() not in USD_FORMATS,
             _resolution_rank(item.resolution),
             _lod_rank(item.lod),
             item.path.casefold(),
@@ -112,10 +116,10 @@ def prepare_model_export(
 ) -> ModelExportPayload:
     options = model_export_options(asset)
     if not options:
-        raise ModelExportError("This model has no managed USD file.")
+        raise ModelExportError("This model has no managed USD or FBX file.")
     record = next((item for item in options if item.path == selected_path), None) if selected_path else options[0]
     if record is None:
-        raise ModelExportError("The selected USD variant is not part of this asset.")
+        raise ModelExportError("The selected model variant is not part of this asset.")
     relative = Path(record.path)
     if relative.is_absolute() or ".." in relative.parts:
         raise ModelExportError("The selected USD record has an unsafe managed path.")
@@ -123,18 +127,25 @@ def prepare_model_export(
         root = Path(library_root).expanduser().resolve(strict=True)
         managed = (asset.asset_dir / relative).resolve(strict=True)
     except OSError as error:
-        raise ModelExportError(f"The managed USD file is unavailable: {error}") from error
+        raise ModelExportError(f"The managed model file is unavailable: {error}") from error
     if not root.is_dir():
         raise ModelExportError("The configured library root is not a directory.")
     try:
         managed.relative_to(root)
     except ValueError as error:
-        raise ModelExportError("The managed USD file is outside the configured library.") from error
+        raise ModelExportError("The managed model file is outside the configured library.") from error
     if not managed.is_file():
         raise ModelExportError("The managed USD path is not a regular file.")
     file_format = record.file_format.upper()
-    if file_format not in USD_FORMATS or managed.suffix.casefold() not in USD_SUFFIXES:
-        raise ModelExportError("Only managed USD, USDA, USDC, and USDZ files can be sent to a DCC.")
+    suffix = managed.suffix.casefold()
+    valid_format = (
+        file_format in USD_FORMATS and suffix in USD_SUFFIXES
+        or file_format == FBX_FORMAT and suffix == FBX_SUFFIX
+    )
+    if not valid_format:
+        raise ModelExportError(
+            "Only managed USD, USDA, USDC, USDZ, and FBX files can be sent to a DCC."
+        )
     model = ModelExportFile(managed, file_format, record.resolution, record.lod)
     texture_sets = tuple(
         prepared

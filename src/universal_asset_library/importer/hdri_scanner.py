@@ -299,7 +299,7 @@ def _assign_hdri_preview(candidate: HdriCandidate, entries) -> None:
         candidate.selected_thumbnail = selected.relative_path
         candidate.selected_hero = selected.relative_path
     else:
-        candidate.warnings.append("No readable preview found; a JPEG placeholder will be generated during import.")
+        candidate.warnings.append("No readable preview found; the catalog will use its built-in placeholder.")
 
 
 def _strings(value) -> list[str]:

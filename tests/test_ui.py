@@ -1153,6 +1153,38 @@ def test_checked_import_state_requires_writable_library(app, tmp_path) -> None:
     assert not tab.preflight_button.isEnabled()
 
 
+def test_detected_assets_panel_selects_all_or_none(app, tmp_path) -> None:
+    texture_source(tmp_path, "Brick_Red")
+    texture_source(tmp_path, "Stone_Grey")
+    tab = ImporterTab()
+    tab._scan_token = 1
+    tab._scan_finished(1, scan_texture_folder(tmp_path))
+
+    assert tab.material_list.count() == 2
+    assert not tab.select_all_assets_button.isEnabled()
+    assert tab.select_none_assets_button.isEnabled()
+
+    tab.select_none_assets_button.click()
+
+    assert all(
+        tab.material_list.item(row).checkState() == Qt.CheckState.Unchecked
+        for row in range(tab.material_list.count())
+    )
+    assert tab.preflight_button.text() == "Preflight checked assets (0)"
+    assert tab.select_all_assets_button.isEnabled()
+    assert not tab.select_none_assets_button.isEnabled()
+
+    tab.select_all_assets_button.click()
+
+    assert all(
+        tab.material_list.item(row).checkState() == Qt.CheckState.Checked
+        for row in range(tab.material_list.count())
+    )
+    assert tab.preflight_button.text() == "Preflight checked assets (2)"
+    assert not tab.select_all_assets_button.isEnabled()
+    assert tab.select_none_assets_button.isEnabled()
+
+
 def test_background_preflight_enables_import_and_sets_ready_state(app, tmp_path) -> None:
     tab = ImporterTab()
     result = scan_texture_folder(texture_source(tmp_path))
@@ -1207,6 +1239,48 @@ def test_settings_detects_abandoned_staging_for_confirmed_cleanup(app, tmp_path)
     assert "1 abandoned" in tab.recovery_status.text()
     assert tab.cleanup_staging_button.isEnabled()
     assert tab.update_library_button.isEnabled()
+
+
+def test_settings_fix_library_registers_manually_added_model_preview(app, tmp_path) -> None:
+    source = tmp_path / "manual-preview-model"
+    source.mkdir()
+    (source / "manual-preview-model.fbx").write_bytes(b"fbx")
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_models(
+        scan_model_folder(source).materials
+    ).imported[0]
+    preview = asset.asset_dir / "previews" / "Manual_Preview_Model_Preview.png"
+    preview.parent.mkdir()
+    value = QImage(800, 450, QImage.Format.Format_RGB32)
+    value.fill(QColor("#556677"))
+    assert value.save(str(preview))
+
+    store = SettingsStore(
+        QSettings(str(tmp_path / "manual-preview.ini"), QSettings.Format.IniFormat)
+    )
+    settings = store.save(AppSettings(str(library)))
+    tab = SettingsTab(store, settings)
+    tab.refresh_maintenance_state()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+
+    assert tab._library_update_count == 1
+    assert tab.update_library_button.text() == "Update / Fix Library (1)"
+    assert tab.update_library_button.isEnabled()
+
+    tab._start_library_update()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+
+    repaired = LibraryRepository(library).list_model_assets()[0]
+    assert repaired.thumbnail_path == preview
+    assert repaired.hero_path == preview
+    activity = tab.maintenance_log.toPlainText()
+    assert "Starting Update / Fix Library" in activity
+    assert "registered preview and thumbnail files" in activity
+    assert "Complete: Updated 1" in activity
+    tab.shutdown_maintenance()
 
 
 def test_settings_maintenance_refresh_coalesces_and_ignores_stale_results(

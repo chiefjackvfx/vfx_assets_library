@@ -93,6 +93,7 @@ def test_selects_every_plugin_supported_material_channel() -> None:
         "Base Color", "Ambient Occlusion", "Cavity", "Roughness",
         "Glossiness", "Metalness", "Specular", "Normal", "Bump",
         "Height", "Displacement", "Opacity", "Emission", "Translucency",
+        "Thickness",
     )
     variant = {
         "maps": {

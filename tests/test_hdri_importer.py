@@ -194,8 +194,9 @@ def test_hdri_render_exception_never_fails_import_or_replaces_fallback(tmp_path,
     assert not summary.failed
     asset = summary.imported[0]
     assert asset.preview_render["status"] == "failed"
-    assert asset.hero_path == asset.thumbnail_path
-    assert asset.hero_path.is_file()
+    assert asset.hero_path is None
+    assert asset.thumbnail_path is None
+    assert not (asset.asset_dir / "previews").exists()
     assert not (asset.asset_dir / ".preview-render").exists()
 
 

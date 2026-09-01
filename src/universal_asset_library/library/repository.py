@@ -14,7 +14,7 @@ from typing import Callable, Iterable, Mapping
 from uuid import uuid4
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QImage, QImageReader, QPainter, QPen
+from PyQt6.QtGui import QColor, QImage, QImageReader
 
 from universal_asset_library.domain import (
     LibraryExtraFile,
@@ -51,6 +51,7 @@ from universal_asset_library.importer.models import (
     VdbCandidate,
 )
 from universal_asset_library.importer.adapters import normalize_channel
+from universal_asset_library.importer.scanner import _filename_preview_role
 from universal_asset_library.importer.stock_taxonomy import StockTaxonomyStore, classify_stock_path
 from universal_asset_library.importer.stock_scanner import (
     StockProbeError,
@@ -200,6 +201,9 @@ class RepairProgress:
     asset: str
     completed_assets: int
     total_assets: int
+    operation: str = ""
+    status: str = "completed"
+    details: str = ""
 
 
 @dataclass(slots=True)
@@ -2412,9 +2416,11 @@ class LibraryRepository:
         model_candidates, model_failures = self._model_layout_candidates()
         stock_candidates, stock_failures = self._stock_layout_candidates()
         metadata_candidates, metadata_failures = self._metadata_migration_candidates()
+        preview_candidates, preview_failures = self._preview_repair_candidates()
         failures.update(model_failures)
         failures.update(stock_failures)
         failures.update(metadata_failures)
+        failures.update(preview_failures)
         candidate_paths = {
             path
             for path, _document in (
@@ -2422,6 +2428,7 @@ class LibraryRepository:
                 *model_candidates,
                 *stock_candidates,
                 *metadata_candidates,
+                *preview_candidates,
             )
             if str(path) not in failures
         }
@@ -2441,12 +2448,15 @@ class LibraryRepository:
             model_candidates, model_failures = self._model_layout_candidates()
             stock_candidates, stock_failures = self._stock_layout_candidates()
             metadata_candidates, metadata_failures = self._metadata_migration_candidates()
+            preview_candidates, preview_failures = self._preview_repair_candidates()
             failures.update(model_failures)
             failures.update(stock_failures)
             failures.update(metadata_failures)
+            failures.update(preview_failures)
             summary.failed.update(failures)
             metadata_by_path = {path: document for path, document in metadata_candidates}
-            blocked_paths = set(metadata_failures)
+            preview_by_path = {path: document for path, document in preview_candidates}
+            blocked_paths = {*metadata_failures, *preview_failures}
             layout_candidates = [
                 item
                 for item in (
@@ -2456,23 +2466,30 @@ class LibraryRepository:
                 )
                 if str(item[1]) not in blocked_paths
             ]
-            normalized_layout_candidates = [
-                (
-                    kind,
-                    path,
+            normalized_layout_candidates = []
+            for kind, path, document in layout_candidates:
+                updated = (
                     self._single_category_document(document)
-                    if path in metadata_by_path else document,
+                    if path in metadata_by_path else document
                 )
-                for kind, path, document in layout_candidates
-            ]
+                if path in preview_by_path:
+                    updated = _merge_preview_repair(updated, preview_by_path[path])
+                normalized_layout_candidates.append((kind, path, updated))
             layout_paths = {path for _kind, path, _document in layout_candidates}
+            manifest_paths = (
+                set(metadata_by_path) | set(preview_by_path)
+            ) - layout_paths - blocked_paths
+            manifest_candidates = []
+            for path in sorted(manifest_paths, key=lambda value: str(value).casefold()):
+                document = metadata_by_path.get(path) or preview_by_path[path]
+                if path in metadata_by_path:
+                    document = self._single_category_document(document)
+                if path in preview_by_path:
+                    document = _merge_preview_repair(document, preview_by_path[path])
+                manifest_candidates.append(("metadata", path, document))
             candidates = (
                 normalized_layout_candidates
-                + [
-                    ("metadata", path, document)
-                    for path, document in metadata_candidates
-                    if path not in layout_paths
-                ]
+                + manifest_candidates
             )
             if candidates:
                 # Updates are published and cleaned one asset at a time, so
@@ -2492,6 +2509,20 @@ class LibraryRepository:
                     summary.canceled = True
                     break
                 name = str(document.get("name", manifest_path.parent.name))
+                operations = []
+                if kind == "model":
+                    operations.append("updated the model layout")
+                elif kind == "stock":
+                    operations.append("flattened the legacy Stock layout")
+                elif kind == "hdri":
+                    operations.append("updated the HDRI layout")
+                if manifest_path in metadata_by_path:
+                    operations.append("migrated category metadata")
+                if manifest_path in preview_by_path:
+                    operations.append("registered preview and thumbnail files")
+                operation = "; ".join(operations) or "validated the manifest"
+                status = "completed"
+                details = ""
                 try:
                     asset = (
                         self._flatten_model_layout(manifest_path.parent, document, token)
@@ -2504,10 +2535,20 @@ class LibraryRepository:
                     )
                 except Exception as error:
                     summary.failed[name] = str(error)
+                    status = "failed"
+                    details = str(error)
                 else:
                     summary.updated.append(asset)
+                    _remove_unreferenced_preview_placeholders(asset.asset_dir)
                 if progress:
-                    progress(RepairProgress(name, index + 1, len(candidates)))
+                    progress(RepairProgress(
+                        name,
+                        index + 1,
+                        len(candidates),
+                        operation,
+                        status,
+                        details,
+                    ))
             for asset in self.list_assets():
                 if asset.id not in {item.id for item in summary.updated}:
                     summary.valid += 1
@@ -2537,6 +2578,24 @@ class LibraryRepository:
                     document.get("category", "")
                 ).strip().casefold() == "surface":
                     candidates.append((path, document))
+            except Exception as error:
+                failures[str(path)] = str(error)
+        return candidates, failures
+
+    def _preview_repair_candidates(
+        self,
+    ) -> tuple[list[tuple[Path, dict]], dict[str, str]]:
+        candidates: list[tuple[Path, dict]] = []
+        failures: dict[str, str] = {}
+        for path in _asset_manifest_paths(self.root):
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+                if str(document.get("type", "texture_set")) == "stock":
+                    continue
+                updated = _repaired_preview_document(path.parent, document)
+                if updated is not None:
+                    _asset_from_manifest(updated, path.parent)
+                    candidates.append((path, updated))
             except Exception as error:
                 failures[str(path)] = str(error)
         return candidates, failures
@@ -3138,10 +3197,24 @@ class LibraryRepository:
                 except Exception as error:
                     summary.failed[name] = str(error)
                     claimed.discard(final.resolve().as_posix().casefold())
+                    if progress:
+                        progress(RepairProgress(
+                            name,
+                            index + 1,
+                            total,
+                            "renamed the legacy asset",
+                            "failed",
+                            str(error),
+                        ))
                     continue
                 summary.renamed.append(repaired)
                 if progress:
-                    progress(RepairProgress(name, index + 1, total))
+                    progress(RepairProgress(
+                        name,
+                        index + 1,
+                        total,
+                        "renamed the legacy asset",
+                    ))
         return summary
 
     def _legacy_manifests(self, summary: RepairSummary | None = None) -> list[tuple[Path, dict]]:
@@ -4014,9 +4087,12 @@ class LibraryRepository:
                 shutil.rmtree(stage)
                 return None, copied_bytes
 
-            preview_path = stage / "previews" / f"{_filename_token(material.name)}_Thumbnail.jpg"
-            _write_hdri_thumbnail(material, preview_path, token)
-            preview_relative = preview_path.relative_to(stage).as_posix()
+            preview_path: Path | None = None
+            preview_relative = ""
+            if material.selected_thumbnail:
+                preview_path = stage / "previews" / f"{_filename_token(material.name)}_Thumbnail.jpg"
+                _write_hdri_thumbnail(material, preview_path, token)
+                preview_relative = preview_path.relative_to(stage).as_posix()
 
             render_result: HdriPreviewResult | None = None
             existing_webp = (
@@ -4082,7 +4158,7 @@ class LibraryRepository:
                                     os.replace(render_result.thumbnail_path, thumbnail)
                                 render_result.hero_path = hero
                                 render_result.thumbnail_path = thumbnail
-                                if preview_path not in {hero, thumbnail}:
+                                if preview_path and preview_path not in {hero, thumbnail}:
                                     preview_path.unlink(missing_ok=True)
                         except Exception as error:
                             render_result = HdriPreviewResult(
@@ -4354,15 +4430,6 @@ class LibraryRepository:
                         relative = thumbnail.relative_to(stage).as_posix()
                         preview_manifest["thumbnail"] = relative
                         preview_manifest["hero"] = relative
-            if not preview_manifest["thumbnail"]:
-                placeholder = stage / "previews" / (
-                    f"{_filename_token(material.name)}_Placeholder.jpg"
-                )
-                _write_vdb_placeholder(material.name, placeholder, token)
-                relative = placeholder.relative_to(stage).as_posix()
-                preview_manifest["thumbnail"] = relative
-                preview_manifest["hero"] = relative
-
             now = _utc_now()
             manifest = {
                 "schema_version": SCHEMA_VERSION,
@@ -4483,15 +4550,10 @@ class LibraryRepository:
                 if relative and relative in copied:
                     preview_manifest[role] = copied[relative][0]
                     preview_original_paths[role] = relative
-            if not preview_manifest.get("thumbnail"):
-                placeholder = stage / "previews" / f"{_filename_token(material.name)}_Placeholder.jpg"
-                _write_model_placeholder(material.name, placeholder, token)
-                relative = placeholder.relative_to(stage).as_posix()
-                preview_manifest["thumbnail"] = relative
-                preview_original_paths["thumbnail"] = None
-                preview_manifest.setdefault("hero", relative)
-                preview_original_paths.setdefault("hero", None)
-            elif not preview_manifest.get("hero"):
+            if not preview_manifest.get("thumbnail") and preview_manifest.get("hero"):
+                preview_manifest["thumbnail"] = preview_manifest["hero"]
+                preview_original_paths["thumbnail"] = preview_original_paths.get("hero")
+            elif preview_manifest.get("thumbnail") and not preview_manifest.get("hero"):
                 preview_manifest["hero"] = preview_manifest["thumbnail"]
                 preview_original_paths["hero"] = preview_original_paths.get("thumbnail")
 
@@ -6051,6 +6113,137 @@ def _optional_asset_path(asset_dir: Path, relative: object) -> Path | None:
     return path if path.is_file() else None
 
 
+def _repaired_preview_document(asset_dir: Path, document: dict) -> dict | None:
+    previews = document.get("previews", {})
+    if not isinstance(previews, dict):
+        previews = {}
+    repaired = dict(previews)
+    preview_dir = asset_dir / "previews"
+    candidates: list[tuple[Path, str, int, int]] = []
+    legacy_placeholders = False
+    if preview_dir.is_dir():
+        for path in sorted(preview_dir.iterdir(), key=lambda value: value.name.casefold()):
+            if (
+                path.is_file()
+                and not path.is_symlink()
+                and "placeholder" in path.stem.casefold()
+            ):
+                legacy_placeholders = True
+                continue
+            if (
+                not path.is_file()
+                or path.is_symlink()
+                or path.suffix.casefold() not in {".jpg", ".jpeg", ".png", ".webp"}
+            ):
+                continue
+            role = _filename_preview_role(path.name)
+            if not role:
+                continue
+            reader = QImageReader(str(path))
+            reader.setDecideFormatFromContent(True)
+            size = reader.size()
+            if not size.isValid() or not reader.canRead():
+                continue
+            candidates.append((path, role, size.width(), size.height()))
+
+    if candidates:
+        thumbnail_pool = [item for item in candidates if item[1] == "thumbnail"]
+        hero_pool = [item for item in candidates if item[1] == "hero"]
+        thumbnail = max(
+            thumbnail_pool or hero_pool,
+            key=lambda item: _managed_preview_rank(item, "thumbnail"),
+        )
+        hero = max(
+            hero_pool or thumbnail_pool,
+            key=lambda item: _managed_preview_rank(item, "hero"),
+        )
+        repaired["thumbnail"] = thumbnail[0].relative_to(asset_dir).as_posix()
+        repaired["hero"] = hero[0].relative_to(asset_dir).as_posix()
+    else:
+        for role in ("thumbnail", "hero"):
+            relative = str(repaired.get(role, "") or "")
+            if not relative:
+                continue
+            try:
+                managed = asset_dir / _safe_manifest_path(relative)
+            except ValueError:
+                managed = None
+            if (
+                managed is None
+                or not managed.is_file()
+                or "placeholder" in Path(relative).stem.casefold()
+            ):
+                repaired[role] = ""
+
+    if repaired == previews and not legacy_placeholders:
+        return None
+    updated = json.loads(json.dumps(document))
+    updated["previews"] = repaired
+    originals = updated.get("preview_original_paths", {})
+    if isinstance(originals, dict):
+        originals = dict(originals)
+        originals["thumbnail"] = None
+        originals["hero"] = None
+        updated["preview_original_paths"] = originals
+    updated["updated_at"] = _utc_now()
+    return updated
+
+
+def _remove_unreferenced_preview_placeholders(asset_dir: Path) -> None:
+    manifest_path = asset_dir / "asset.json"
+    preview_dir = asset_dir / "previews"
+    if not manifest_path.is_file() or not preview_dir.is_dir():
+        return
+    try:
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return
+    previews = document.get("previews", {})
+    referenced = {
+        str(value)
+        for value in previews.values()
+        if isinstance(value, str) and value
+    } if isinstance(previews, dict) else set()
+    for path in preview_dir.iterdir():
+        relative = path.relative_to(asset_dir).as_posix()
+        if (
+            path.is_file()
+            and not path.is_symlink()
+            and "placeholder" in path.stem.casefold()
+            and relative not in referenced
+        ):
+            path.unlink()
+    try:
+        if not any(preview_dir.iterdir()):
+            preview_dir.rmdir()
+    except OSError:
+        pass
+
+
+def _managed_preview_rank(
+    item: tuple[Path, str, int, int], desired_role: str,
+) -> tuple[int, int, str]:
+    path, role, width, height = item
+    aspect = width / height if width and height else 1.0
+    shape = (
+        max(0, 1000 - int(abs(1.0 - aspect) * 1000))
+        if desired_role == "thumbnail"
+        else int(min(3.0, aspect) * 500)
+    )
+    return (2000 if role == desired_role else 0) + shape, width * height, path.name.casefold()
+
+
+def _merge_preview_repair(document: dict, repaired: dict) -> dict:
+    updated = json.loads(json.dumps(document))
+    updated["previews"] = json.loads(json.dumps(repaired.get("previews", {})))
+    if "preview_original_paths" in repaired:
+        updated["preview_original_paths"] = json.loads(json.dumps(
+            repaired.get("preview_original_paths", {})
+        ))
+    updated["updated_at"] = str(repaired.get("updated_at", _utc_now()))
+    return updated
+
+
 def _material_source_bytes(material: MaterialCandidate) -> int:
     return sum(_safe_source(material.source_root, path).stat().st_size for path in _candidate_source_paths(material))
 
@@ -6314,39 +6507,6 @@ def _convert_webp_to_jpeg(
         os.fsync(handle.fileno())
     token.check()
     return processed, source_digest, destination.stat().st_size, _sha256_file(destination)
-
-
-def _write_model_placeholder(name: str, destination: Path, token: CancelToken) -> None:
-    token.check()
-    image = QImage(640, 360, QImage.Format.Format_RGB32)
-    image.fill(QColor("#29243a"))
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if not image.save(str(destination), "JPG", 90):
-        raise LibraryError(f"Could not create a placeholder preview for {name}.")
-    with destination.open("rb") as handle:
-        os.fsync(handle.fileno())
-
-
-def _write_vdb_placeholder(name: str, destination: Path, token: CancelToken) -> None:
-    token.check()
-    image = QImage(640, 360, QImage.Format.Format_RGB32)
-    image.fill(QColor("#263340"))
-    painter = QPainter(image)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setPen(QPen(QColor("#9eb1c1"), 3))
-    painter.setBrush(QColor("#70869b"))
-    for x, y, width, height in (
-        (120, 170, 210, 105), (230, 105, 230, 160),
-        (355, 155, 165, 120), (185, 205, 300, 80),
-    ):
-        painter.drawEllipse(x, y, width, height)
-    painter.end()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if not image.save(str(destination), "JPG", 90):
-        raise LibraryError(f"Could not create a VDB placeholder preview for {name}.")
-    with destination.open("rb") as handle:
-        os.fsync(handle.fileno())
-    token.check()
 
 
 def _hash_source(

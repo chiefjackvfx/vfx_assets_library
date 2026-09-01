@@ -31,6 +31,8 @@ def execute(hou, action, payload, session_id):
         return create_texture_material(hou, payload, session_id)
     if action == "import_usd_model":
         return import_usd_model(hou, payload, session_id)
+    if action == "import_fbx_model":
+        return import_fbx_model(hou, payload, session_id)
     if action == "import_vdb":
         return import_vdb(hou, payload, session_id)
     raise ActionError(f"Unsupported bridge action: {action}")
@@ -316,6 +318,114 @@ def import_usd_model(hou, payload, session_id):
     }
 
 
+def import_fbx_model(hou, payload, session_id):
+    model_path, library_root = _validated_fbx_path(payload)
+    asset_id = _required_text(payload, "asset_id")
+    asset_name = _required_text(payload, "asset_name")
+    variant = str(payload.get("variant", "")).strip() or "FBX"
+    resolution = str(payload.get("resolution", "")).strip()
+    target = _required_text(payload, "target").casefold()
+    if target != "sop":
+        raise ActionError("FBX models can only be imported into Houdini SOPs.")
+    texture_sets = _validated_model_texture_sets(payload, library_root)
+    instance_id = str(uuid.uuid4())
+    imported_root = None
+    builders = []
+    assignments = []
+    native_materials = []
+    imported_sops = []
+    messages = ""
+    with hou.undos.group("Import FBX model from ShotBox Assets"):
+        try:
+            material_children = {
+                id(child) for child in _network_children_by_path(hou, ("/mat", "/shop"))
+            }
+            result = hou.hipFile.importFBX(
+                model_path.as_posix(),
+                suppress_save_prompt=True,
+                merge_into_scene=True,
+                import_cameras=False,
+                import_joints_and_skin=False,
+                import_geometry=True,
+                import_lights=False,
+                import_animation=False,
+                import_materials=bool(texture_sets),
+                convert_file_paths_to_relative=False,
+                unlock_geometry=True,
+                unlock_deformations=False,
+                import_nulls_as_subnets=True,
+                import_into_object_subnet=True,
+                override_scene_frame_range=False,
+            )
+            if not isinstance(result, tuple) or not result:
+                raise ActionError("Houdini's FBX importer did not return an imported object subnet.")
+            imported_root = result[0]
+            messages = str(result[1] if len(result) > 1 else "").strip()
+            if imported_root is None or imported_root.path() in {"/", "/obj"}:
+                raise ActionError("Houdini's FBX importer did not create an isolated object subnet.")
+            imported_sops = _fbx_geometry_outputs(imported_root)
+            if not imported_sops:
+                raise ActionError("The FBX file did not produce any importable SOP geometry.")
+            native_materials = [
+                child for child in _network_children_by_path(hou, ("/mat", "/shop"))
+                if id(child) not in material_children
+            ]
+            if texture_sets:
+                builders, assignments = _setup_fbx_materials(
+                    hou, imported_sops, texture_sets,
+                    asset_id, asset_name, instance_id, resolution, model_path,
+                )
+            for node in _descendants(imported_root):
+                role = str(node.userData("shotbox_role") or "")
+                if not role:
+                    role = "fbx_file_sop" if _base_type(node) == "file" else "fbx_import_node"
+                _mark_model_node(
+                    node, asset_id, asset_name, instance_id, variant,
+                    target, model_path, role,
+                )
+                node.setUserData("shotbox_resolution", resolution)
+            _mark_model_node(
+                imported_root, asset_id, asset_name, instance_id, variant,
+                target, model_path, "fbx_object_subnet",
+            )
+            imported_root.setUserData("shotbox_resolution", resolution)
+            for native in reversed(native_materials):
+                _destroy(native)
+            try:
+                imported_root.moveToGoodPosition()
+                imported_root.setSelected(True, clear_all_selected=True)
+                imported_root.setCurrent(True, clear_all_selected=True)
+            except Exception:
+                pass
+        except Exception:
+            for assignment in reversed(assignments):
+                _destroy(assignment)
+            for builder in reversed(builders):
+                _destroy(builder)
+            for native in reversed(native_materials):
+                _destroy(native)
+            if imported_root is not None and imported_root.path() not in {"/", "/obj"}:
+                _destroy(imported_root)
+            raise
+    diagnostic = (
+        f"Imported {asset_name} ({variant}) as live FBX SOP geometry"
+        + (f" with {len(builders)} managed MaterialX shader(s)." if builders else " without materials.")
+    )
+    if messages:
+        diagnostic += f" FBX importer: {messages}"
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "node_path": imported_root.path(),
+        "network_path": imported_root.path(),
+        "model_path": model_path.as_posix(),
+        "material_paths": [builder.path() for builder in builders],
+        "imported_targets": [node.path() for node in imported_sops],
+        "diagnostic": diagnostic,
+        "data": _session_data(hou),
+    }
+
+
 def _materialx_sources(builder, records):
     explicit = {record["channel"] for record in records if not record["packed_channels"]}
     sources = {}
@@ -368,10 +478,12 @@ def _build_materialx_graph(builder, surface, displacement, sources):
     for semantic, input_name in (
         ("Metalness", "metalness"), ("Specular", "specular"),
         ("Opacity", "opacity"), ("Emission", "emission_color"),
-        ("Translucency", "subsurface"),
     ):
         if semantic in sources:
             _connect_named(surface, input_name, sources[semantic])
+    subsurface = sources.get("Translucency") or sources.get("Thickness")
+    if subsurface:
+        _connect_named(surface, "subsurface", subsurface)
     if "Emission" in sources:
         _set_named_input_default(surface, "emission", 1.0)
     normal_source = None
@@ -534,6 +646,27 @@ def _validated_model_path(payload):
     return resolved_source, resolved_library
 
 
+def _validated_fbx_path(payload):
+    source = Path(_required_text(payload, "model_path")).expanduser()
+    library = Path(_required_text(payload, "library_root")).expanduser()
+    try:
+        resolved_source = source.resolve(strict=True)
+        resolved_library = library.resolve(strict=True)
+    except OSError as error:
+        raise ActionError(f"The managed FBX path is unavailable: {error}") from error
+    if not resolved_library.is_dir():
+        raise ActionError("The supplied library root is not a directory.")
+    try:
+        resolved_source.relative_to(resolved_library)
+    except ValueError as error:
+        raise ActionError("The FBX model is outside the managed library root.") from error
+    if resolved_source.suffix.casefold() != ".fbx":
+        raise ActionError("Only managed FBX files can use the Houdini FBX importer.")
+    if not resolved_source.is_file():
+        raise ActionError("The managed FBX model is not a file.")
+    return resolved_source, resolved_library
+
+
 def _setup_sop_materials(
     hou, network, import_node, payload, library_root, asset_id, asset_name
 ):
@@ -590,6 +723,175 @@ def _setup_sop_materials(
         for builder in reversed(builders):
             _destroy(builder)
         raise
+
+
+def _setup_fbx_materials(
+    hou, imported_sops, texture_sets,
+    asset_id, asset_name, instance_id, resolution, model_path,
+):
+    by_name = {}
+    for item in texture_sets:
+        key = _normalized_name(item["name"])
+        if key in by_name:
+            raise ActionError(
+                f"Managed texture-set names are ambiguous after normalization: {item['name']}"
+            )
+        by_name[key] = item
+
+    assignments_by_sop = []
+    used_sets = {}
+    for sop in imported_sops:
+        material_paths, has_unassigned = _fbx_material_bindings(sop)
+        if len(texture_sets) == 1:
+            item = texture_sets[0]
+            assignments_by_sop.append((sop, [("", item)]))
+            used_sets[_normalized_name(item["name"])] = item
+            continue
+        if not material_paths or has_unassigned:
+            raise ActionError(
+                "FBX geometry without complete material assignments requires exactly one managed texture set."
+            )
+        matched = []
+        missing = []
+        for material_path in material_paths:
+            item = by_name.get(_normalized_name(material_path.rsplit("/", 1)[-1]))
+            if item is None:
+                missing.append(material_path)
+            else:
+                matched.append((material_path, item))
+                used_sets[_normalized_name(item["name"])] = item
+        if missing:
+            raise ActionError(
+                "Managed texture sets could not be matched to FBX material slots: "
+                + ", ".join(sorted(missing, key=str.casefold))
+            )
+        assignments_by_sop.append((sop, matched))
+
+    material_network = _material_network(hou)
+    builders = []
+    assignments = []
+    built = {}
+    try:
+        for key, item in used_sets.items():
+            builder, surface, displacement = _create_usd_materialx_builder(
+                material_network,
+                f"shotbox_{_slug(asset_name)}_{_slug(item['name'])}_{instance_id[:8]}",
+            )
+            _mark_model_node(
+                builder, asset_id, asset_name, instance_id,
+                f"{item['resolution']} · FBX Material", "sop", model_path,
+                "fbx_material_builder",
+            )
+            builder.setUserData("shotbox_texture_set", item["name"])
+            builder.setUserData("shotbox_resolution", item["resolution"] or resolution)
+            sources = _materialx_sources(builder, item["maps"])
+            _build_materialx_graph(builder, surface, displacement, sources)
+            _layout_materialx_graph(builder)
+            builders.append(builder)
+            built[key] = builder
+
+        for sop, bindings in assignments_by_sop:
+            assignment = _create_first_node(
+                sop.parent(), ("material",), f"assign_{_slug(asset_name)}"
+            )
+            assignment.setInput(0, sop)
+            _set_first_parm(
+                assignment, ("num_materials", "nummaterials"), len(bindings), required=False
+            )
+            for index, (source_path, item) in enumerate(bindings, start=1):
+                group = ""
+                if source_path:
+                    escaped = source_path.replace("\\", "\\\\").replace('"', '\\"')
+                    group = f'@shop_materialpath="{escaped}"'
+                _set_first_parm(assignment, (f"group{index}",), group, required=False)
+                _set_first_parm(
+                    assignment,
+                    (f"shop_materialpath{index}", f"matpath{index}"),
+                    built[_normalized_name(item["name"])].path(),
+                )
+            _mark_model_node(
+                assignment, asset_id, asset_name, instance_id,
+                "FBX Material Assignment", "sop", model_path,
+                "fbx_material_assignment",
+            )
+            try:
+                assignment.setDisplayFlag(True)
+                assignment.setRenderFlag(True)
+                assignment.moveToGoodPosition()
+            except Exception:
+                pass
+            assignments.append(assignment)
+        return builders, assignments
+    except Exception:
+        for assignment in reversed(assignments):
+            _destroy(assignment)
+        for builder in reversed(builders):
+            _destroy(builder)
+        raise
+
+
+def _fbx_material_bindings(sop):
+    paths = []
+    has_unassigned = False
+    try:
+        primitives = tuple(sop.geometry().prims())
+    except Exception as error:
+        raise ActionError(f"Houdini could not inspect imported FBX geometry: {error}") from error
+    if not primitives:
+        return [], True
+    for primitive in primitives:
+        try:
+            value = str(primitive.stringAttribValue("shop_materialpath") or "").strip()
+        except Exception:
+            value = ""
+        if not value:
+            has_unassigned = True
+        elif value not in paths:
+            paths.append(value)
+    return paths, has_unassigned
+
+
+def _fbx_geometry_outputs(imported_root):
+    outputs = []
+    for node in (imported_root, *_descendants(imported_root)):
+        if _node_category(node) not in {"object", "obj"} or _base_type(node) != "geo":
+            continue
+        display = None
+        try:
+            display = node.displayNode()
+        except Exception:
+            pass
+        if display is None:
+            display = next(
+                (child for child in reversed(tuple(_children(node))) if _node_category(child) == "sop"),
+                None,
+            )
+        if display is not None and display not in outputs:
+            outputs.append(display)
+    return outputs
+
+
+def _network_children_by_path(hou, paths):
+    result = []
+    for path in paths:
+        network = hou.node(path)
+        if network is not None:
+            result.extend(tuple(_children(network)))
+    return result
+
+
+def _descendants(node):
+    result = []
+    pending = list(_children(node))
+    while pending:
+        child = pending.pop(0)
+        result.append(child)
+        pending.extend(_children(child))
+    return result
+
+
+def _normalized_name(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
 
 
 def _validated_model_texture_sets(payload, library_root):
@@ -869,6 +1171,6 @@ def _session_data(hou):
     return {
         "houdini_version": version,
         "hip_file": hip_file,
-        "bridge_version": "0.6.0",
-        "capabilities": ["hdri", "texture_material", "usd_model", "vdb_file"],
+        "bridge_version": "0.7.0",
+        "capabilities": ["hdri", "texture_material", "usd_model", "fbx_model", "vdb_file"],
     }

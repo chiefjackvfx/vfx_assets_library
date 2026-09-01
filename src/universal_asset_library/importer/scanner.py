@@ -68,7 +68,18 @@ TOKEN_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Opacity", ("opacity", "alphamasked", "alpha_masked", "alpha")),
     ("Emission", ("emission", "emissive", "emit")),
     ("Translucency", ("translucency", "translucent", "subsurface", "sss")),
+    ("Thickness", ("thickness",)),
 )
+PREVIEW_FILENAME_ROLES = {
+    "thumbnail": "thumbnail", "thumb": "thumbnail", "icon": "thumbnail",
+    "swatch": "thumbnail", "preview": "hero", "render": "hero",
+    "beauty": "hero", "hero": "hero", "cover": "hero", "popup": "hero",
+    "perspective": "hero", "angle": "hero", "front": "hero", "side": "hero",
+    "threequarter": "hero", "turntable": "hero", "shot": "hero", "still": "hero",
+}
+PREVIEW_FILENAME_TRAILING_TOKENS = {
+    "final", "image", "img", "small", "large", "retina", "highres", "lowres",
+}
 
 
 @dataclass(slots=True)
@@ -872,12 +883,17 @@ def _scan_material(
             warnings.append(message)
             diagnostics.append(Diagnostic("warning", "ambiguous_metadata_basename", message, relative, root.name))
             ambiguous_reported.add(path.name.casefold())
-        channel, convention, packed = _map_identity(path.name, declaration)
+        metadata_role = facts.preview_roles_by_path.get(relative.casefold(), "") if facts else ""
+        if not metadata_role and facts and basename_counts[path.name.casefold()] == 1:
+            metadata_role = facts.preview_roles_by_basename.get(path.name.casefold(), "")
+        filename_preview_role = _filename_preview_role(path.name)
+        channel, convention, packed = (
+            ("", "", {})
+            if not declaration and (metadata_role or filename_preview_role)
+            else _map_identity(path.name, declaration)
+        )
         dimensions = (entry.snapshot.width, entry.snapshot.height)
         if not channel:
-            metadata_role = facts.preview_roles_by_path.get(relative.casefold(), "") if facts else ""
-            if not metadata_role and facts and basename_counts[path.name.casefold()] == 1:
-                metadata_role = facts.preview_roles_by_basename.get(path.name.casefold(), "")
             # TIFFs are texture payloads or companions, never display previews.
             # Filename-inferred previews use lightweight display formats; a
             # provider-declared preview may additionally use WebP.
@@ -1053,19 +1069,50 @@ def _metadata_for_root(
 def _filename_channel(filename: str) -> tuple[str, str, dict[str, str]]:
     stem = Path(filename).stem.casefold()
     normalized = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
-    for channel, aliases in TOKEN_PATTERNS:
+    matches = []
+    for priority, (channel, aliases) in enumerate(TOKEN_PATTERNS):
         for alias in aliases:
-            pattern = rf"(?:^|_){re.escape(alias)}(?:_|$)"
-            if re.search(pattern, normalized):
-                convention = ""
-                if channel == "Normal":
-                    if re.search(r"(?:^|_)(?:ogl|gl)(?:_|$)", normalized):
-                        convention = "OpenGL"
-                    elif re.search(r"(?:^|_)dx(?:_|$)", normalized):
-                        convention = "DirectX"
-                packed = {"R": "Ambient Occlusion", "G": "Roughness", "B": "Metalness"} if channel == "Packed ARM" else {}
-                return channel, convention, packed
-    return "", "", {}
+            normalized_alias = re.sub(r"[^a-z0-9]+", "_", alias).strip("_")
+            pattern = rf"(?:^|_){re.escape(normalized_alias)}(?:_|$)"
+            for match in re.finditer(pattern, normalized):
+                start = match.start() + (1 if match.group().startswith("_") else 0)
+                matches.append((start, len(normalized_alias), -priority, channel))
+    if not matches:
+        return "", "", {}
+    channel = max(matches)[3]
+    convention = ""
+    if channel == "Normal":
+        if re.search(r"(?:^|_)(?:ogl|gl)(?:_|$)", normalized):
+            convention = "OpenGL"
+        elif re.search(r"(?:^|_)dx(?:_|$)", normalized):
+            convention = "DirectX"
+    packed = (
+        {"R": "Ambient Occlusion", "G": "Roughness", "B": "Metalness"}
+        if channel == "Packed ARM" else {}
+    )
+    return channel, convention, packed
+
+
+def _filename_preview_role(filename: str) -> str:
+    tokens = [
+        token for token in re.split(r"[^a-z0-9]+", Path(filename).stem.casefold())
+        if token
+    ]
+    positions = [
+        (index, PREVIEW_FILENAME_ROLES[token])
+        for index, token in enumerate(tokens)
+        if token in PREVIEW_FILENAME_ROLES
+    ]
+    if not positions:
+        return ""
+    index, role = positions[-1]
+    trailing = tokens[index + 1:]
+    if all(
+        token in PREVIEW_FILENAME_TRAILING_TOKENS or bool(re.fullmatch(r"\d+k?", token))
+        for token in trailing
+    ):
+        return role
+    return ""
 
 
 def _map_identity(filename: str, declaration: MapDeclaration | None) -> tuple[str, str, dict[str, str]]:

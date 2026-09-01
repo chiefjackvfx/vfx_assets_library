@@ -144,6 +144,7 @@ CHANNEL_COLORS = {
     "Opacity": "#69c995",
     "Emission": "#efcb62",
     "Translucency": "#ef89a7",
+    "Thickness": "#dd7fa0",
     "Specular": "#b5c7db",
     "Glossiness": "#b8c2cf",
     "Cavity": "#697586",
@@ -2103,6 +2104,7 @@ class DetailPanel(QFrame):
         self.houdini_session = QComboBox()
         self.houdini_session.currentIndexChanged.connect(self._update_houdini_controls)
         self.houdini_resolution = QComboBox()
+        self.houdini_resolution.currentIndexChanged.connect(self._houdini_model_variant_changed)
         self.houdini_target = QComboBox()
         self.houdini_target.addItem("Solaris LOP", "lop")
         self.houdini_target.addItem("SOPs · Packed USD", "sop")
@@ -2120,6 +2122,7 @@ class DetailPanel(QFrame):
         self.blender_session = QComboBox()
         self.blender_session.currentIndexChanged.connect(self._update_blender_controls)
         self.blender_resolution = QComboBox()
+        self.blender_resolution.currentIndexChanged.connect(self._update_blender_controls)
         self.blender_world_mode = QComboBox()
         self.blender_world_mode.addItem("Edit current World", "edit_current")
         self.blender_world_mode.addItem("Create new World", "new")
@@ -2964,7 +2967,9 @@ class DetailPanel(QFrame):
             self.houdini_session.addItem(session.label, session)
         self.houdini_refresh_button.setEnabled(True)
         self.houdini_resolution.setEnabled(True)
-        self.houdini_target.setEnabled(True)
+        self.houdini_target.setEnabled(
+            self._selected_model_format(self.houdini_resolution) != "FBX"
+        )
         self.houdini_session.setEnabled(True)
         target = next((index for index, session in enumerate(sessions) if session.id == current_id), 0)
         if sessions:
@@ -2980,7 +2985,9 @@ class DetailPanel(QFrame):
         self.houdini_send_button.setEnabled(not active and self._houdini_can_send())
         self.houdini_refresh_button.setEnabled(not active)
         self.houdini_resolution.setEnabled(not active)
-        self.houdini_target.setEnabled(not active)
+        self.houdini_target.setEnabled(
+            not active and self._selected_model_format(self.houdini_resolution) != "FBX"
+        )
         self.houdini_session.setEnabled(not active)
         if message:
             self.houdini_status.setText(message)
@@ -3002,14 +3009,12 @@ class DetailPanel(QFrame):
         if isinstance(self._asset, LibraryTextureAsset) and isinstance(session, HoudiniSession) and "texture_material" not in session.capabilities:
             self.houdini_status.setText("Update the Houdini plug-in in Settings and restart Houdini.")
             self.houdini_status.setStyleSheet("color: #e6b566;")
-        if isinstance(self._asset, LibraryModelAsset) and isinstance(session, HoudiniSession) and "usd_model" not in session.capabilities:
+        model_capability = self._selected_model_capability(self.houdini_resolution)
+        if isinstance(self._asset, LibraryModelAsset) and isinstance(session, HoudiniSession) and model_capability not in session.capabilities:
             self.houdini_status.setText("Update the Houdini plug-in in Settings and restart Houdini.")
             self.houdini_status.setStyleSheet("color: #e6b566;")
         if isinstance(self._asset, LibraryVdbAsset) and isinstance(session, HoudiniSession) and "vdb_file" not in session.capabilities:
             self.houdini_status.setText("Update the Houdini plug-in in Settings and restart Houdini.")
-            self.houdini_status.setStyleSheet("color: #e6b566;")
-        elif isinstance(self._asset, LibraryModelAsset) and not self._asset.usd_ready:
-            self.houdini_status.setText("This model has no managed USD file. Download or import USD first.")
             self.houdini_status.setStyleSheet("color: #e6b566;")
 
     def _dcc_app_changed(self, index: int) -> None:
@@ -3033,7 +3038,7 @@ class DetailPanel(QFrame):
         return self.houdini_resolution.count() > 0 and (
             isinstance(self._asset, LibraryHdriAsset)
             or isinstance(self._asset, LibraryTextureAsset) and "texture_material" in session.capabilities
-            or isinstance(self._asset, LibraryModelAsset) and "usd_model" in session.capabilities
+            or isinstance(self._asset, LibraryModelAsset) and self._selected_model_capability(self.houdini_resolution) in session.capabilities
             or isinstance(self._asset, LibraryVdbAsset) and "vdb_file" in session.capabilities
         )
 
@@ -3086,11 +3091,9 @@ class DetailPanel(QFrame):
         if isinstance(self._asset, LibraryTextureAsset) and isinstance(session, BlenderSession) and "texture_material" not in session.capabilities:
             self.blender_status.setText("Update the Blender plug-in in Settings and restart Blender.")
             self.blender_status.setStyleSheet("color: #e6b566;")
-        if isinstance(self._asset, LibraryModelAsset) and isinstance(session, BlenderSession) and "usd_model" not in session.capabilities:
+        model_capability = self._selected_model_capability(self.blender_resolution)
+        if isinstance(self._asset, LibraryModelAsset) and isinstance(session, BlenderSession) and model_capability not in session.capabilities:
             self.blender_status.setText("Update the Blender plug-in in Settings and restart Blender.")
-            self.blender_status.setStyleSheet("color: #e6b566;")
-        elif isinstance(self._asset, LibraryModelAsset) and not self._asset.usd_ready:
-            self.blender_status.setText("This model has no managed USD file. Download or import USD first.")
             self.blender_status.setStyleSheet("color: #e6b566;")
 
     def _send_to_blender(self) -> None:
@@ -3110,7 +3113,7 @@ class DetailPanel(QFrame):
         return self.blender_resolution.count() > 0 and (
             isinstance(self._asset, LibraryHdriAsset)
             or isinstance(self._asset, LibraryTextureAsset) and "texture_material" in session.capabilities
-            or isinstance(self._asset, LibraryModelAsset) and "usd_model" in session.capabilities
+            or isinstance(self._asset, LibraryModelAsset) and self._selected_model_capability(self.blender_resolution) in session.capabilities
         )
 
     def _configure_texture_dcc(self, asset: LibraryTextureAsset) -> None:
@@ -3140,6 +3143,7 @@ class DetailPanel(QFrame):
                 combo.addItem(model_export_label(record), record.path)
         self.blender_world_mode.hide()
         self.houdini_target.show()
+        self._configure_houdini_model_target()
         self.blender_send_button.setText("Import model into Blender")
         self.houdini_send_button.setText("Import model into Houdini")
         self._update_houdini_controls()
@@ -3149,6 +3153,46 @@ class DetailPanel(QFrame):
         self.dcc_stack.show()
         self._dcc_app_changed(self.dcc_app.currentIndex())
         self.export_footer.show()
+
+    def _houdini_model_variant_changed(self, *_args) -> None:
+        if isinstance(self._asset, LibraryModelAsset):
+            self._configure_houdini_model_target()
+        self._update_houdini_controls()
+
+    def _configure_houdini_model_target(self) -> None:
+        is_fbx = self._selected_model_format(self.houdini_resolution) == "FBX"
+        current = str(self.houdini_target.currentData() or "lop")
+        self.houdini_target.blockSignals(True)
+        self.houdini_target.clear()
+        if is_fbx:
+            self.houdini_target.addItem("SOPs · FBX", "sop")
+            self.houdini_target.setToolTip(
+                "Import live FBX geometry and managed MaterialX shaders into SOPs."
+            )
+            self.houdini_target.setEnabled(False)
+        else:
+            self.houdini_target.addItem("Solaris LOP", "lop")
+            self.houdini_target.addItem("SOPs · Packed USD", "sop")
+            target = self.houdini_target.findData(current)
+            self.houdini_target.setCurrentIndex(max(0, target))
+            self.houdini_target.setToolTip(
+                "Reference in Solaris, or load lightweight packed USD primitives in SOPs."
+            )
+            self.houdini_target.setEnabled(True)
+        self.houdini_target.blockSignals(False)
+
+    def _selected_model_capability(self, combo: QComboBox) -> str:
+        return "fbx_model" if self._selected_model_format(combo) == "FBX" else "usd_model"
+
+    def _selected_model_format(self, combo: QComboBox) -> str:
+        if not isinstance(self._asset, LibraryModelAsset):
+            return ""
+        selected_path = str(combo.currentData() or "")
+        record = next(
+            (item for item in self._asset.model_files if item.path == selected_path),
+            None,
+        )
+        return record.file_format.upper() if record is not None else ""
 
     def _configure_vdb_dcc(self, asset: LibraryVdbAsset) -> None:
         labels = self._ordered_vdb_variants(asset)
@@ -3685,7 +3729,7 @@ class HoudiniWorker(QRunnable):
                     result = client.create_texture_material(self.session, payload)
                 elif isinstance(self.asset, LibraryModelAsset):
                     payload = prepare_model_export(self.asset, self.resolution, self.library_path)
-                    result = client.import_usd_model(self.session, payload, target=self.target)
+                    result = client.import_model(self.session, payload, target=self.target)
                 elif isinstance(self.asset, LibraryVdbAsset):
                     result = client.import_vdb(
                         self.session, self.asset, self.resolution,
@@ -3748,7 +3792,7 @@ class BlenderWorker(QRunnable):
                     result = client.create_texture_material(self.session, payload)
                 elif isinstance(self.asset, LibraryModelAsset):
                     payload = prepare_model_export(self.asset, self.resolution, self.library_path)
-                    result = client.import_usd_model(self.session, payload)
+                    result = client.import_model(self.session, payload)
                 else:
                     label, hdri_file = choose_hdri_file(self.asset, self.resolution)
                     managed_path = self.asset.asset_dir / hdri_file.path

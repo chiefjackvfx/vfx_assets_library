@@ -15,7 +15,7 @@ from .protocol import MAX_MESSAGE_BYTES, decode_payload, encode_message
 
 
 PROTOCOL_VERSION = 1
-BRIDGE_VERSION = "0.4.4"
+BRIDGE_VERSION = "0.6.0"
 REQUEST_TIMEOUT = 300.0
 TIMER_INTERVAL = 0.05
 MAX_ACCEPTS_PER_TICK = 8
@@ -189,7 +189,7 @@ class BridgeServer:
             )
             response["request_id"] = client.request_id
             self.cached_session_data = dict(response.get("data", self.cached_session_data))
-            if request["action"] in {"set_hdri_world", "create_texture_material", "import_usd_model"} and response.get("ok"):
+            if request["action"] in {"set_hdri_world", "create_texture_material", "import_usd_model", "import_fbx_model"} and response.get("ok"):
                 payload = request["payload"]
                 self.last_asset = str(payload.get("asset_name", ""))
                 self.last_resolution = str(payload.get("resolution", ""))
@@ -233,7 +233,7 @@ class BridgeServer:
             raise ValueError("Unsupported ShotBox Assets Blender Bridge protocol version.")
         if request.get("token") != self._token():
             raise PermissionError("ShotBox Assets Blender Bridge authentication failed.")
-        if request.get("action") not in {"ping", "set_hdri_world", "create_texture_material", "import_usd_model"}:
+        if request.get("action") not in {"ping", "set_hdri_world", "create_texture_material", "import_usd_model", "import_fbx_model"}:
             raise ValueError("Unsupported Blender Bridge action.")
         if not str(request.get("request_id", "")):
             raise ValueError("Bridge request has no request ID.")
@@ -259,7 +259,7 @@ class BridgeServer:
             "blend_file": data["blend_file"],
             "started_at": self.started_at,
             "bridge_version": BRIDGE_VERSION,
-            "capabilities": ["hdri", "texture_material", "usd_model"],
+            "capabilities": ["hdri", "texture_material", "usd_model", "fbx_model"],
         }
         temporary = self.descriptor_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")

@@ -4,6 +4,7 @@ import os
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html import escape
 
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
@@ -25,6 +26,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -253,6 +255,7 @@ class SettingsTab(QWidget):
         self._inspection_pending = False
         self._inspection_shutdown = False
         self._inspection_requested = False
+        self._reported_maintenance_failures: set[str] = set()
         self._houdini_worker: HoudiniBridgeWorker | None = None
         self._blender_bridge_worker: BlenderBridgeWorker | None = None
 
@@ -406,6 +409,18 @@ class SettingsTab(QWidget):
         recovery_row.addWidget(self.cleanup_staging_button)
         recovery_row.addWidget(self.recover_lock_button)
         maintenance_layout.addLayout(recovery_row)
+        activity_title = QLabel("Maintenance activity")
+        activity_title.setObjectName("mutedLabel")
+        self.maintenance_log = QTextEdit()
+        self.maintenance_log.setObjectName("maintenanceLog")
+        self.maintenance_log.setReadOnly(True)
+        self.maintenance_log.setPlaceholderText(
+            "Inspection and maintenance details will appear here."
+        )
+        self.maintenance_log.setFixedHeight(150)
+        self.maintenance_log.document().setMaximumBlockCount(500)
+        maintenance_layout.addWidget(activity_title)
+        maintenance_layout.addWidget(self.maintenance_log)
         root.addWidget(maintenance_panel)
 
         preferences_panel = QFrame()
@@ -1144,6 +1159,10 @@ class SettingsTab(QWidget):
     def _reset(self) -> None:
         self._show(self._saved)
 
+    def _append_maintenance_log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.maintenance_log.append(escape(f"{timestamp}  {message}"))
+
     def _show_maintenance_unchecked(self) -> None:
         self._legacy_count = 0
         self._library_update_count = 0
@@ -1190,6 +1209,7 @@ class SettingsTab(QWidget):
         if not path:
             self._show_maintenance_unchecked()
             return
+        self._append_maintenance_log(f"Inspecting library: {path}")
         self._set_inspection_busy(True)
         worker = LibraryInspectionWorker(path)
         self._inspection_worker = worker
@@ -1272,6 +1292,7 @@ class SettingsTab(QWidget):
             self.repair_status.setStyleSheet("color: #ef7d7d;")
             self.update_status.setText("Library maintenance status is unavailable.")
             self.recovery_status.setText("Recovery status is unavailable.")
+            self._append_maintenance_log(f"Inspection failed: {message}")
             self._set_inspection_busy(False)
             self.repair_button.setEnabled(False)
             self.update_library_button.setEnabled(False)
@@ -1323,6 +1344,13 @@ class SettingsTab(QWidget):
         )
         self.update_status.setStyleSheet("color: #8792a1;")
         self.recovery_status.setStyleSheet("color: #8792a1;")
+        lock_text = "lock detected" if recovery.lock_owner else "no lock"
+        self._append_maintenance_log(
+            "Inspection complete: "
+            f"{self._library_update_count} update(s), "
+            f"{self._legacy_count} legacy name(s), "
+            f"{staging_count} staging folder(s), {lock_text}."
+        )
         self._set_inspection_busy(False)
         self._update_repair_button(self._draft(), validate_library_path(self._draft().library_path)[0])
 
@@ -1367,7 +1395,7 @@ class SettingsTab(QWidget):
             self,
             "Update and validate library?",
             "Validate all catalog manifests, convert legacy secondary categories into tags, remove the reserved “surface” term, "
-            "upgrade older HDRI/model layouts, and flatten legacy Stock assets into their category folders.\n\n"
+            "register manually added Preview/Hero/Thumbnail images, upgrade older HDRI/model layouts, and flatten legacy Stock assets into their category folders.\n\n"
             "Updates use the library lock, staging, validation, and atomic replacement.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
@@ -1379,6 +1407,14 @@ class SettingsTab(QWidget):
         if self._repairing or not self._saved.library_path:
             return
         self._repairing = True
+        self._reported_maintenance_failures.clear()
+        self.maintenance_log.clear()
+        self._append_maintenance_log(
+            f"Starting Update / Fix Library: {self._saved.library_path}"
+        )
+        self._append_maintenance_log(
+            f"Found {self._library_update_count} asset or manifest operation(s) to process."
+        )
         self._repair_token = CancelToken()
         self._set_controls_for_repair(True)
         self.repair_progress.setRange(0, max(1, self._library_update_count))
@@ -1396,7 +1432,22 @@ class SettingsTab(QWidget):
     def _library_update_progressed(self, progress: RepairProgress) -> None:
         self.repair_progress.setMaximum(max(1, progress.total_assets))
         self.repair_progress.setValue(progress.completed_assets)
-        self.update_status.setText(f"Updated {progress.asset}")
+        operation = progress.operation or "processed the asset"
+        if progress.status == "failed":
+            self._reported_maintenance_failures.add(progress.asset)
+            details = f" — {progress.details}" if progress.details else ""
+            message = (
+                f"[{progress.completed_assets}/{progress.total_assets}] FAILED "
+                f"{progress.asset}: {operation}{details}"
+            )
+            self.update_status.setText(f"Could not update {progress.asset}")
+        else:
+            message = (
+                f"[{progress.completed_assets}/{progress.total_assets}] "
+                f"{progress.asset}: {operation}"
+            )
+            self.update_status.setText(f"Updated {progress.asset}: {operation}")
+        self._append_maintenance_log(message)
 
     def _library_update_finished(self, summary: LibraryUpdateSummary) -> None:
         self._repairing = False
@@ -1407,12 +1458,18 @@ class SettingsTab(QWidget):
         self.repair_cancel.hide()
         if summary.updated:
             self.library_updated.emit(summary)
-        self._refresh_repair_state()
         parts = [f"Updated {len(summary.updated)}", f"valid {summary.valid}"]
         if summary.failed:
             parts.append(f"needs attention {len(summary.failed)}")
         if summary.canceled:
             parts.append("canceled")
+        self.update_status.setText(" · ".join(parts))
+        self.update_status.setStyleSheet("color: #78c995;" if not summary.failed else "color: #e6b566;")
+        for asset, details in summary.failed.items():
+            if asset not in self._reported_maintenance_failures:
+                self._append_maintenance_log(f"FAILED {asset}: {details}")
+        self._append_maintenance_log("Complete: " + " · ".join(parts) + ".")
+        self._refresh_repair_state()
         self.update_status.setText(" · ".join(parts))
         self.update_status.setStyleSheet("color: #78c995;" if not summary.failed else "color: #e6b566;")
 
@@ -1423,8 +1480,11 @@ class SettingsTab(QWidget):
         self._set_controls_for_repair(False)
         self.repair_progress.hide()
         self.repair_cancel.hide()
-        self._refresh_repair_state()
         message = details.strip().splitlines()[-1] if details.strip() else "Unknown library update error"
+        self.update_status.setText(message)
+        self.update_status.setStyleSheet("color: #ef7d7d;")
+        self._append_maintenance_log(f"Update / Fix Library stopped: {message}")
+        self._refresh_repair_state()
         self.update_status.setText(message)
         self.update_status.setStyleSheet("color: #ef7d7d;")
 
@@ -1444,6 +1504,11 @@ class SettingsTab(QWidget):
         if self._repairing or not self._saved.library_path or self._legacy_count < 1:
             return
         self._repairing = True
+        self.maintenance_log.clear()
+        self._append_maintenance_log(
+            f"Starting legacy asset rename: {self._saved.library_path}"
+        )
+        self._append_maintenance_log(f"Found {self._legacy_count} asset(s) to rename.")
         self._repair_token = CancelToken()
         self._set_controls_for_repair(True)
         self.repair_progress.setRange(0, self._legacy_count)
@@ -1461,7 +1526,20 @@ class SettingsTab(QWidget):
     def _repair_progressed(self, progress: RepairProgress) -> None:
         self.repair_progress.setMaximum(progress.total_assets)
         self.repair_progress.setValue(progress.completed_assets)
-        self.repair_status.setText(f"Renamed {progress.asset}")
+        operation = progress.operation or "renamed the legacy asset"
+        if progress.status == "failed":
+            details = f" — {progress.details}" if progress.details else ""
+            self.repair_status.setText(f"Could not rename {progress.asset}")
+            self._append_maintenance_log(
+                f"[{progress.completed_assets}/{progress.total_assets}] FAILED "
+                f"{progress.asset}: {operation}{details}"
+            )
+        else:
+            self.repair_status.setText(f"Renamed {progress.asset}")
+            self._append_maintenance_log(
+                f"[{progress.completed_assets}/{progress.total_assets}] "
+                f"{progress.asset}: {operation}"
+            )
 
     def _cancel_repair(self) -> None:
         if self._repair_token:
@@ -1471,6 +1549,9 @@ class SettingsTab(QWidget):
             else:
                 self.repair_status.setText("Canceling safely…")
             self.repair_cancel.setEnabled(False)
+            self._append_maintenance_log(
+                "Cancellation requested; finishing the current asset safely."
+            )
 
     def _repair_finished(self, summary: RepairSummary) -> None:
         self._repairing = False
@@ -1488,6 +1569,9 @@ class SettingsTab(QWidget):
             parts.append("canceled")
         if summary.renamed:
             self.library_repaired.emit(summary)
+        self.repair_status.setText(" · ".join(parts))
+        self.repair_status.setStyleSheet("color: #78c995;" if summary.renamed and not summary.failed else "color: #e6b566;")
+        self._append_maintenance_log("Complete: " + " · ".join(parts) + ".")
         self._refresh_repair_state()
         self.repair_status.setText(" · ".join(parts))
         self.repair_status.setStyleSheet("color: #78c995;" if summary.renamed and not summary.failed else "color: #e6b566;")
@@ -1499,8 +1583,11 @@ class SettingsTab(QWidget):
         self._set_controls_for_repair(False)
         self.repair_progress.hide()
         self.repair_cancel.hide()
-        self._refresh_repair_state()
         message = details.strip().splitlines()[-1] if details.strip() else "Unknown repair error"
+        self.repair_status.setText(message)
+        self.repair_status.setStyleSheet("color: #ef7d7d;")
+        self._append_maintenance_log(f"Legacy asset rename stopped: {message}")
+        self._refresh_repair_state()
         self.repair_status.setText(message)
         self.repair_status.setStyleSheet("color: #ef7d7d;")
 
@@ -1555,6 +1642,12 @@ class SettingsTab(QWidget):
             self._start_maintenance("unlock", force=not local_stale)
 
     def _start_maintenance(self, operation: str, force: bool = False) -> None:
+        self.maintenance_log.clear()
+        self._append_maintenance_log(
+            "Cleaning abandoned staging folders."
+            if operation == "cleanup"
+            else "Recovering the library lock."
+        )
         self._set_controls_for_repair(True)
         self.recovery_status.setText("Cleaning staging safely…" if operation == "cleanup" else "Recovering library lock…")
         worker = MaintenanceWorker(self._saved.library_path, operation, force)
@@ -1566,17 +1659,24 @@ class SettingsTab(QWidget):
     def _maintenance_finished(self, operation: str, result: object) -> None:
         self._maintenance_worker = None
         self._set_controls_for_repair(False)
-        self._refresh_repair_state()
         if operation == "cleanup":
-            self.recovery_status.setText(f"Removed {int(result)} abandoned staging folder(s).")
+            message = f"Removed {int(result)} abandoned staging folder(s)."
         else:
-            self.recovery_status.setText("Library lock recovered." if result else "No library lock remained.")
+            message = "Library lock recovered." if result else "No library lock remained."
+        self.recovery_status.setText(message)
+        self._append_maintenance_log(message)
+        self._refresh_repair_state()
+        self.recovery_status.setText(message)
 
-    def _maintenance_failed(self, _operation: str, details: str) -> None:
+    def _maintenance_failed(self, operation: str, details: str) -> None:
         self._maintenance_worker = None
         self._set_controls_for_repair(False)
-        self._refresh_repair_state()
         message = details.strip().splitlines()[-1] if details.strip() else "Unknown recovery error"
+        self.recovery_status.setText(message)
+        self.recovery_status.setStyleSheet("color: #ef7d7d;")
+        label = "Staging cleanup" if operation == "cleanup" else "Lock recovery"
+        self._append_maintenance_log(f"{label} failed: {message}")
+        self._refresh_repair_state()
         self.recovery_status.setText(message)
         self.recovery_status.setStyleSheet("color: #ef7d7d;")
 

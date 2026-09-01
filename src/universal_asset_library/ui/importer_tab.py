@@ -417,6 +417,21 @@ class ImporterTab(QWidget):
         layout.setContentsMargins(14, 14, 14, 14)
         self.detected_heading = QLabel("Detected assets")
         self.detected_heading.setObjectName("sectionTitle")
+        detected_header = QHBoxLayout()
+        detected_header.addWidget(self.detected_heading)
+        detected_header.addStretch()
+        self.select_all_assets_button = QPushButton("Select all")
+        self.select_all_assets_button.setToolTip("Check every detected asset for preflight and import.")
+        self.select_all_assets_button.clicked.connect(
+            lambda _checked=False: self._set_all_assets_checked(True)
+        )
+        self.select_none_assets_button = QPushButton("Select none")
+        self.select_none_assets_button.setToolTip("Uncheck every detected asset.")
+        self.select_none_assets_button.clicked.connect(
+            lambda _checked=False: self._set_all_assets_checked(False)
+        )
+        self.select_all_assets_button.setEnabled(False)
+        self.select_none_assets_button.setEnabled(False)
         self.material_list = QListWidget()
         self.material_list.setSpacing(4)
         self.material_list.setUniformItemSizes(True)
@@ -432,7 +447,12 @@ class ImporterTab(QWidget):
         self.ignored_summary = QLabel("")
         self.ignored_summary.setObjectName("mutedLabel")
         self.ignored_summary.setWordWrap(True)
-        layout.addWidget(self.detected_heading)
+        layout.addLayout(detected_header)
+        selection_actions = QHBoxLayout()
+        selection_actions.setSpacing(6)
+        selection_actions.addWidget(self.select_all_assets_button)
+        selection_actions.addWidget(self.select_none_assets_button)
+        layout.addLayout(selection_actions)
         layout.addWidget(self.material_list, 1)
         layout.addWidget(self.ignored_summary)
         return panel
@@ -1225,6 +1245,34 @@ class ImporterTab(QWidget):
                 materials.append(material)
         return materials
 
+    def _set_all_assets_checked(self, checked: bool) -> None:
+        target = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        changed = False
+        self.material_list.blockSignals(True)
+        try:
+            for row in range(self.material_list.count()):
+                item = self.material_list.item(row)
+                if item.checkState() != target:
+                    item.setCheckState(target)
+                    changed = True
+        finally:
+            self.material_list.blockSignals(False)
+        if changed:
+            self._update_import_state()
+
+    def _update_asset_selection_actions(self) -> None:
+        total = self.material_list.count()
+        checked = len(self._checked_materials())
+        available = bool(
+            total
+            and self.material_list.isEnabled()
+            and not self._importing
+            and not self._preflighting
+            and not self._reclassifying
+        )
+        self.select_all_assets_button.setEnabled(available and checked < total)
+        self.select_none_assets_button.setEnabled(available and checked > 0)
+
     def _reclassify_selected(self) -> None:
         if not self._current or self._reclassifying or not self.reclassify_button.isEnabled():
             return
@@ -1297,6 +1345,7 @@ class ImporterTab(QWidget):
 
     def _update_import_state(self, *_args) -> None:
         checked = self._checked_materials()
+        self._update_asset_selection_actions()
         self.preflight_button.setText(f"Preflight checked assets ({len(checked)})")
         self.import_button.setText(f"Import checked assets ({len(checked)})")
         valid_library = bool(self._library_path and Path(self._library_path).is_dir() and os.access(self._library_path, os.W_OK))
@@ -1543,9 +1592,13 @@ class ImporterTab(QWidget):
         self.browse_button.setEnabled(not active)
         self.source_path.setEnabled(not active)
         self.material_list.setEnabled(not active)
+        self.select_all_assets_button.setEnabled(False)
+        self.select_none_assets_button.setEnabled(False)
         self.preflight_button.setEnabled(not active)
         self.import_button.setEnabled(not active)
         self._set_review_enabled(not active and self._current is not None)
+        if not active:
+            self._update_asset_selection_actions()
 
     def _clear_review(self) -> None:
         self._current = None

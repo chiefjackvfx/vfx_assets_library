@@ -74,6 +74,7 @@ CHANNEL_NAMES = {
     "translucency": "Translucency",
     "subsurface": "Translucency",
     "sss": "Translucency",
+    "thickness": "Thickness",
     "arm": "Packed ARM",
 }
 

@@ -154,3 +154,14 @@ def test_model_client_dispatches_additive_action(monkeypatch, tmp_path) -> None:
     assert client.import_usd_model(session, payload).ok
     assert captured["action"] == "import_usd_model"
     assert captured["document"]["model_path"].endswith("tree.usdc")
+
+    fbx_payload = ModelExportPayload(
+        "id", "Tree", "tree", tmp_path,
+        ModelExportFile(tmp_path / "tree.fbx", "FBX", "4K", "LOD0"),
+    )
+    fbx_session = BlenderSession(
+        "s", 1, 1, "5.2", "", "now", "0.6.0", ("usd_model", "fbx_model")
+    )
+    assert client.import_model(fbx_session, fbx_payload).ok
+    assert captured["action"] == "import_fbx_model"
+    assert captured["document"]["format"] == "FBX"

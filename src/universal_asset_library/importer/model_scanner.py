@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from time import monotonic
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from universal_asset_library.domain import MODEL_CATEGORIES
 
@@ -37,6 +37,7 @@ from .scanner import (
     _image_dimensions,
     _inferred_bit_depth,
     _is_within,
+    _filename_preview_role,
     _map_preference,
     _map_resolution,
     _resolution_sort_key,
@@ -72,6 +73,30 @@ EXCLUDED_SUFFIXES = {
 }
 TEMP_SUFFIXES = {".tmp", ".temp", ".part", ".bak", ".autosave"}
 GENERIC_MODEL_CATEGORIES = {"3d", "3d asset", "asset", "model"}
+DISPLAY_PREVIEW_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+PREVIEW_DIRECTORY_TOKENS = {
+    "preview", "previews", "thumbnail", "thumbnails", "thumb", "thumbs",
+    "render", "renders", "rendering", "renderings", "screenshot", "screenshots",
+    "gallery", "beauty", "stills",
+}
+TEXTURE_DIRECTORY_TOKENS = {
+    "texture", "textures", "tex", "map", "maps", "material", "materials",
+    "sourceimage", "sourceimages",
+}
+THUMBNAIL_NAME_TOKENS = {"thumbnail", "thumb", "icon", "swatch"}
+THUMBNAIL_DIRECTORY_TOKENS = {"thumbnail", "thumbnails", "thumb", "thumbs"}
+HERO_NAME_TOKENS = {
+    "preview", "render", "beauty", "hero", "cover", "popup", "perspective",
+    "angle", "front", "side", "threequarter", "turntable", "shot", "still",
+}
+NON_PREVIEW_NAME_TOKENS = {
+    "logo", "license", "licence", "barcode", "qrcode", "wireframe", "wire",
+    "diagram", "contactsheet",
+}
+MODEL_PAYLOAD_DIRECTORIES = {
+    "model", "models", "mesh", "meshes", "geometry", "geo", "source", "sources",
+    "scene", "scenes", "fbx", "obj", "usd",
+}
 
 
 @dataclass(slots=True)
@@ -87,7 +112,8 @@ class _ModelFacts:
     dimensions: tuple[float, ...] = ()
     polycount: int | None = None
     model_declarations: dict[str, tuple[str, int | None, str]] = field(default_factory=dict)
-    preview_roles: dict[str, str] = field(default_factory=dict)
+    preview_roles_by_path: dict[str, str] = field(default_factory=dict)
+    preview_roles_by_basename: dict[str, str] = field(default_factory=dict)
     texture_declarations: dict[str, tuple[str, str, str, int | None, str]] = field(default_factory=dict)
 
 
@@ -149,7 +175,12 @@ def _discover_model_roots(scan_root: Path, inventory) -> list[Path]:
             current = current.parent
         if selected is None:
             relative = entry.path.relative_to(scan_root)
-            selected = scan_root if len(relative.parts) == 1 else scan_root / relative.parts[0]
+            selected = (
+                scan_root
+                if len(relative.parts) == 1
+                or relative.parts[0].casefold() in MODEL_PAYLOAD_DIRECTORIES
+                else scan_root / relative.parts[0]
+            )
         candidates.add(selected)
     ordered = sorted(candidates, key=lambda path: (len(path.parts), str(path).casefold()))
     return [path for path in ordered if not any(_is_within(path, prior) for prior in ordered if prior != path and len(prior.parts) < len(path.parts))]
@@ -218,13 +249,37 @@ def _scan_model(root: Path, default_category: str, entries, inherited_diagnostic
 
     texture_sets: dict[str, ModelTextureSet] = {}
     aggregate: dict[str, ResolutionVariant] = {}
-    preview_candidates: list[PreviewCandidate] = []
+    preview_images = []
+    image_basename_counts: dict[str, int] = {}
+    for entry in accepted:
+        if entry.snapshot.kind == "image":
+            basename = entry.path.name.casefold()
+            image_basename_counts[basename] = image_basename_counts.get(basename, 0) + 1
+    ambiguous_preview_metadata: set[str] = set()
     assigned: set[str] = {item.relative_path for item in model_files}
     for entry in sorted(accepted, key=lambda item: str(item.path).casefold()):
         if entry.snapshot.kind != "image":
             continue
         relative = entry.path.relative_to(root).as_posix()
+        basename = entry.path.name.casefold()
+        role = facts.preview_roles_by_path.get(relative.casefold(), "")
+        if not role and image_basename_counts.get(basename, 0) == 1:
+            role = facts.preview_roles_by_basename.get(basename, "")
+        elif (
+            not role
+            and basename in facts.preview_roles_by_basename
+            and basename not in ambiguous_preview_metadata
+        ):
+            diagnostics.append(Diagnostic(
+                "warning", "ambiguous_model_preview_basename",
+                f"Provider preview metadata names {entry.path.name}, but multiple local images share that basename; using path and filename evidence instead.",
+                relative, root.name,
+            ))
+            ambiguous_preview_metadata.add(basename)
         declaration = facts.texture_declarations.get(entry.path.name.casefold())
+        if not declaration and _has_explicit_model_preview_signal(root, entry.path, role):
+            preview_images.append((entry, relative, role))
+            continue
         channel, convention, packed = _filename_channel(entry.path.name)
         if declaration:
             channel = declaration[0] or channel
@@ -253,17 +308,15 @@ def _scan_model(root: Path, default_category: str, entries, inherited_diagnostic
             combined.maps.setdefault(channel, []).append(texture)
             assigned.add(relative)
             continue
-        role = facts.preview_roles.get(entry.path.name.casefold(), "")
-        lowered = entry.path.name.casefold()
-        if role or any(token in lowered for token in ("thumbnail", "preview", "render", "_thumb")):
-            aspect = (entry.snapshot.width / entry.snapshot.height) if entry.snapshot.width and entry.snapshot.height else 1.0
-            inferred = role or ("hero" if aspect >= 1.35 else "thumbnail")
-            preview_candidates.append(PreviewCandidate(relative, entry.snapshot.width, entry.snapshot.height, inferred, role))
+        preview_images.append((entry, relative, role))
 
     for texture_set in texture_sets.values():
         for variant in texture_set.resolutions.values():
             _select_texture_preferences(variant)
-    _select_model_previews(preview_candidates)
+    preview_candidates, preview_scores = _model_preview_candidates(
+        root, facts.name or root.name, model_files, preview_images
+    )
+    _select_model_previews(preview_candidates, preview_scores)
     selected_thumbnail = next((item.relative_path for item in preview_candidates if "thumbnail" in item.selected_roles), "")
     selected_hero = next((item.relative_path for item in preview_candidates if "hero" in item.selected_roles), "")
     assigned.update(path for path in (selected_thumbnail, selected_hero) if path)
@@ -291,7 +344,7 @@ def _scan_model(root: Path, default_category: str, entries, inherited_diagnostic
             f"Provider metadata declares {len(missing)} model file(s) that are not local.", material=root.name,
         ))
     if not preview_candidates:
-        diagnostics.append(Diagnostic("warning", "model_preview_missing", "No model preview found; a placeholder will be generated.", material=root.name))
+        diagnostics.append(Diagnostic("warning", "model_preview_missing", "No model preview found; the catalog will use its built-in placeholder.", material=root.name))
 
     category = _model_category(facts.categories, root.name, default_category)
     candidate = ModelCandidate(
@@ -407,10 +460,14 @@ def _parse_megascans(document: dict[str, Any]) -> _ModelFacts:
     for record in previews.get("images", []) if isinstance(previews, dict) else []:
         if not isinstance(record, dict):
             continue
-        basename = _basename(record.get("uri"))
+        uri = str(record.get("uri", ""))
+        basename = _basename(uri)
         tags = {str(value).casefold() for value in record.get("tags", [])}
-        if basename and not str(record.get("uri", "")).startswith("data:"):
-            facts.preview_roles[basename.casefold()] = "hero" if tags & {"preview", "retina", "sidepanel"} else "thumbnail"
+        if basename and not uri.startswith("data:"):
+            _register_preview_role(
+                facts, uri,
+                "hero" if tags & {"preview", "retina", "sidepanel"} else "thumbnail",
+            )
     return facts
 
 
@@ -446,7 +503,7 @@ def _parse_poly_haven(document: dict[str, Any], provider_id: str) -> _ModelFacts
                     facts.model_declarations[basename.casefold()] = ("", None, "scene" if str(format_name).casefold() == "blend" else "mesh")
     thumbnail = _basename(document.get("thumbnail_url"))
     if thumbnail:
-        facts.preview_roles[thumbnail.casefold()] = "thumbnail"
+        _register_preview_role(facts, str(document.get("thumbnail_url", "")), "thumbnail")
     return facts
 
 
@@ -479,15 +536,101 @@ def _select_texture_preferences(variant: ResolutionVariant) -> None:
             max(alternatives, key=_map_preference).preferred = True
 
 
-def _select_model_previews(previews: list[PreviewCandidate]) -> None:
+def _model_preview_candidates(root, asset_name, model_files, images):
+    previews = []
+    scores = {}
+    model_names = {
+        _normalized_preview_name(asset_name),
+        _normalized_preview_name(root.name),
+        *(_normalized_preview_name(Path(item.relative_path).stem) for item in model_files),
+    }
+    model_names = {value for value in model_names if len(value) >= 5}
+    for entry, relative, metadata_role in images:
+        path = entry.path
+        display_format = path.suffix.casefold() in DISPLAY_PREVIEW_SUFFIXES
+        name_tokens = _preview_tokens(path.stem)
+        directory_tokens = {
+            token
+            for part in path.relative_to(root).parts[:-1]
+            for token in _preview_tokens(part)
+        }
+        has_preview_directory = bool(directory_tokens & PREVIEW_DIRECTORY_TOKENS)
+        has_thumbnail_directory = bool(directory_tokens & THUMBNAIL_DIRECTORY_TOKENS)
+        in_texture_directory = bool(directory_tokens & TEXTURE_DIRECTORY_TOKENS)
+        thumbnail_name = bool(name_tokens & THUMBNAIL_NAME_TOKENS)
+        hero_name = bool(name_tokens & HERO_NAME_TOKENS)
+        rejected_name = bool(name_tokens & NON_PREVIEW_NAME_TOKENS)
+        normalized_stem = _normalized_preview_name(path.stem)
+        asset_match = any(
+            value in normalized_stem or normalized_stem in value
+            for value in model_names
+            if len(normalized_stem) >= 5
+        )
+        width = entry.snapshot.width or 0
+        height = entry.snapshot.height or 0
+        large_enough = width >= 96 and height >= 96
+        explicit_signal = _has_explicit_model_preview_signal(root, path, metadata_role)
+        if not display_format and not explicit_signal:
+            continue
+        if rejected_name and not metadata_role:
+            continue
+        if in_texture_directory and not explicit_signal:
+            continue
+        if not explicit_signal:
+            continue
+
+        aspect = width / height if width and height else 1.0
+        if metadata_role:
+            inferred = metadata_role
+        elif has_thumbnail_directory:
+            inferred = "thumbnail"
+        elif thumbnail_name and not hero_name:
+            inferred = "thumbnail"
+        elif hero_name and not thumbnail_name:
+            inferred = "hero"
+        else:
+            inferred = "hero" if aspect >= 1.35 else "thumbnail"
+        score = (
+            (1000 if metadata_role else 0)
+            + (450 if thumbnail_name or hero_name else 0)
+            + (350 if has_preview_directory else 0)
+            + (220 if asset_match else 0)
+            + (80 if path.parent == root else 0)
+            + (40 if large_enough else 0)
+        )
+        candidate = PreviewCandidate(
+            relative, entry.snapshot.width, entry.snapshot.height,
+            inferred, metadata_role,
+        )
+        previews.append(candidate)
+        scores[relative] = score
+    return previews, scores
+
+
+def _has_explicit_model_preview_signal(root, path, metadata_role):
+    if metadata_role:
+        return True
+    name_tokens = _preview_token_list(path.stem)
+    if set(name_tokens) & NON_PREVIEW_NAME_TOKENS:
+        return False
+    directory_tokens = {
+        token
+        for part in path.relative_to(root).parts[:-1]
+        for token in _preview_tokens(part)
+    }
+    if directory_tokens & PREVIEW_DIRECTORY_TOKENS:
+        return True
+    return bool(_filename_preview_role(path.name))
+
+
+def _select_model_previews(
+    previews: list[PreviewCandidate], scores: dict[str, int] | None = None,
+) -> None:
     if not previews:
         return
-    thumbnail = max(previews, key=lambda item: (
-        item.inferred_role == "thumbnail", item.width or 0, item.relative_path.casefold()
-    ))
-    hero = max(previews, key=lambda item: (
-        item.inferred_role == "hero", (item.width or 0) * (item.height or 0), item.relative_path.casefold()
-    ))
+    evidence = scores or {}
+    thumbnail = max(previews, key=lambda item: _model_preview_rank(item, "thumbnail", evidence))
+    hero = max(previews, key=lambda item: _model_preview_rank(item, "hero", evidence))
     for item in previews:
         roles = []
         if item is thumbnail:
@@ -495,6 +638,48 @@ def _select_model_previews(previews: list[PreviewCandidate]) -> None:
         if item is hero:
             roles.append("hero")
         item.selected_roles = tuple(roles)
+
+
+def _model_preview_rank(item, desired_role, evidence):
+    aspect = (item.width / item.height) if item.width and item.height else 1.0
+    shape_bonus = (
+        max(0, 100 - int(abs(1.0 - aspect) * 100))
+        if desired_role == "thumbnail"
+        else (100 if aspect >= 1.35 else int(max(0.0, aspect - 1.0) * 100))
+    )
+    metadata_score = (
+        5000 if item.metadata_role == desired_role
+        else 0
+    )
+    role_score = (
+        2000 if item.inferred_role == desired_role
+        else 1200 if item.inferred_role == "candidate"
+        else 600
+    )
+    pixels = (item.width or 0) * (item.height or 0)
+    return (
+        metadata_score + role_score + evidence.get(item.relative_path, 0) + shape_bonus,
+        pixels,
+        item.relative_path.casefold(),
+    )
+
+
+def _preview_tokens(value):
+    return set(_preview_token_list(value))
+
+
+def _preview_token_list(value):
+    return [
+        token for token in re.split(r"[^a-z0-9]+", str(value).casefold()) if token
+    ]
+
+
+def _normalized_preview_name(value):
+    cleaned = re.sub(
+        r"(?i)(?:^|[_\-\s])(?:lod[_\-]?\d+|thumbnail|thumb|preview|render|hero|cover)(?:$|[_\-\s])",
+        " ", str(value),
+    )
+    return re.sub(r"[^a-z0-9]+", "", cleaned.casefold())
 
 
 def _model_role(stem: str, file_format: str, lod: str) -> str:
@@ -569,6 +754,24 @@ def _flatten_values(values: Any, semantic: dict[str, Any]) -> list[str]:
         elif isinstance(value, str) and value.strip():
             result.append(value.strip())
     return sorted(set(result), key=str.casefold)
+
+
+def _register_preview_role(facts: _ModelFacts, uri: str, role: str) -> None:
+    parsed = urlparse(str(uri))
+    path = unquote(parsed.path or str(uri)).replace("\\", "/")
+    basename = Path(path).name
+    if not basename:
+        return
+    facts.preview_roles_by_basename[basename.casefold()] = role
+    relative = path.lstrip("./")
+    if (
+        relative
+        and not parsed.scheme
+        and not parsed.netloc
+        and not path.startswith("/")
+        and not re.match(r"^[A-Za-z]:/", path)
+    ):
+        facts.preview_roles_by_path[relative.casefold()] = role
 
 
 def _basename(value: Any) -> str:

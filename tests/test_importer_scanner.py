@@ -33,6 +33,24 @@ def test_filename_only_material_detects_resolution_channels_and_preview(tmp_path
     assert candidate.selected_thumbnail == "Bricks06.png"
 
 
+def test_asset_name_channel_word_does_not_override_trailing_map_or_preview(tmp_path) -> None:
+    material = tmp_path / "Rough_Bricks"
+    material.mkdir()
+    image(material / "Rough_Bricks_2K_BaseColor.png", 2048, 2048)
+    image(material / "Rough_Bricks_2K_Normal_DX.png", 2048, 2048)
+    image(material / "Rough_Bricks_2K_Thickness.png", 2048, 2048)
+    image(material / "Rough_Bricks_Preview.png", 600, 600)
+
+    candidate = scan_texture_folder(material).materials[0]
+
+    assert set(candidate.resolutions["2K"].maps) == {
+        "Base Color", "Normal", "Thickness",
+    }
+    assert candidate.resolutions["2K"].maps["Normal"][0].normal_convention == "DirectX"
+    assert candidate.selected_thumbnail == "Rough_Bricks_Preview.png"
+    assert candidate.selected_hero == "Rough_Bricks_Preview.png"
+
+
 @pytest.mark.parametrize("suffix", ("ALPHAMASKED", "ALPHA_MASKED"))
 def test_alpha_masked_filename_is_scanned_as_opacity(
     tmp_path,

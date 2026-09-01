@@ -923,6 +923,13 @@ def test_stale_vdb_source_retains_previous_preview_and_cleans_staging(
     tmp_path: Path, monkeypatch, _local_vdb_preview_cache: Path
 ) -> None:
     library, asset = _import_static_vdb(tmp_path)
+    monkeypatch.setattr(
+        "universal_asset_library.library.repository.render_vdb_preview",
+        lambda request, progress=None, cancel_token=None: _ready_render(request),
+    )
+    asset = LibraryRepository(library).render_vdb_preview(
+        asset.id, "Low"
+    ).asset
     old_preview = asset.thumbnail_path.read_bytes()
 
     def fake_render(request, progress=None, cancel_token=None):

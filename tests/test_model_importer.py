@@ -102,6 +102,135 @@ def test_non_usd_model_imports_with_best_available_fallback(tmp_path) -> None:
     assert repository.library_update_count() == 0
 
 
+def test_model_preview_discovery_uses_folders_names_and_rejects_texture_images(tmp_path) -> None:
+    source = tmp_path / "hero_chair"
+    source.mkdir()
+    (source / "Models").mkdir()
+    (source / "Models" / "hero_chair.fbx").write_bytes(b"fbx")
+    preview_name = "Brick_Rough_Rubble_tj0hbdyhw_3d_Preview.png"
+    image(source / preview_name, width=1200, height=700)
+    image(source / "textures" / "hero_chair_Thickness.png", width=2048, height=2048)
+    image(source / "textures" / "reference.jpg", width=2048, height=2048)
+    image(source / "license_logo.png", width=800, height=400)
+
+    candidate = scan_model_folder(source).materials[0]
+
+    assert candidate.selected_hero == preview_name
+    assert candidate.selected_thumbnail == preview_name
+    assert {item.relative_path for item in candidate.previews} == {
+        preview_name,
+    }
+    thickness = candidate.resolutions["2K"].maps["Thickness"]
+    assert [item.relative_path for item in thickness] == [
+        "textures/hero_chair_Thickness.png",
+    ]
+    assert "textures/reference.jpg" in candidate.extra_paths
+    assert "license_logo.png" in candidate.extra_paths
+    assert candidate.source_root == source
+
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_models([candidate]).imported[0]
+    assert asset.thumbnail_path and asset.thumbnail_path.is_file()
+    assert asset.hero_path and asset.hero_path.is_file()
+    assert asset.thumbnail_path.name.endswith("_Thumbnail.png")
+    assert asset.hero_path == asset.thumbnail_path
+
+
+def test_model_preview_discovery_requires_preview_evidence(tmp_path) -> None:
+    source = tmp_path / "oak_tree"
+    source.mkdir()
+    (source / "oak_tree_LOD0.fbx").write_bytes(b"fbx")
+    image(source / "Oak_Tree_thumbnail_01.jpeg", width=640, height=480)
+    image(source / "gallery" / "product-shot-02.jpg", width=1400, height=800)
+    image(source / "Oak_Tree_reference.png", width=1600, height=900)
+
+    candidate = scan_model_folder(source).materials[0]
+
+    assert {item.relative_path for item in candidate.previews} == {
+        "Oak_Tree_thumbnail_01.jpeg", "gallery/product-shot-02.jpg",
+    }
+    assert candidate.selected_thumbnail == "Oak_Tree_thumbnail_01.jpeg"
+    assert candidate.selected_hero == "gallery/product-shot-02.jpg"
+    assert "Oak_Tree_reference.png" in candidate.extra_paths
+
+
+def test_model_preview_metadata_uses_relative_path_when_basenames_repeat(tmp_path) -> None:
+    source = tmp_path / "metadata_chair"
+    source.mkdir()
+    (source / "chair.fbx").write_bytes(b"fbx")
+    image(source / "previews" / "shot.jpg", width=800, height=450)
+    image(source / "thumbs" / "shot.jpg", width=300, height=300)
+    (source / "asset.json").write_text(json.dumps({
+        "id": "chair-id",
+        "semanticTags": {"name": "Metadata Chair"},
+        "meshes": [],
+        "previews": {
+            "images": [{"uri": "previews/shot.jpg", "tags": ["preview"]}],
+        },
+    }), encoding="utf-8")
+
+    candidate = scan_model_folder(source).materials[0]
+
+    assert candidate.selected_hero == "previews/shot.jpg"
+    assert candidate.selected_thumbnail == "thumbs/shot.jpg"
+    hero = next(item for item in candidate.previews if item.relative_path == "previews/shot.jpg")
+    assert hero.metadata_role == "hero"
+    assert any(item.code == "ambiguous_model_preview_basename" for item in candidate.diagnostics)
+
+
+def test_fix_library_registers_manual_previews_without_managed_placeholder(tmp_path) -> None:
+    source = model_source(tmp_path, usd=False)
+    (source / "chair_preview.jpg").unlink()
+    candidate = scan_model_folder(source).materials[0]
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+
+    asset = repository.import_models([candidate]).imported[0]
+
+    assert asset.thumbnail_path is None
+    assert asset.hero_path is None
+    assert not (asset.asset_dir / "previews").exists()
+
+    legacy_placeholder = asset.asset_dir / "previews" / "Painted_Chair_Placeholder.jpg"
+    image(legacy_placeholder, width=640, height=360)
+    manifest_path = asset.asset_dir / "asset.json"
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    document["previews"] = {
+        "thumbnail": "previews/Painted_Chair_Placeholder.jpg",
+        "hero": "previews/Painted_Chair_Placeholder.jpg",
+    }
+    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+    manual_hero = asset.asset_dir / "previews" / "Painted_Chair_Preview.png"
+    image(manual_hero, width=1200, height=700)
+    assert repository.library_update_count() == 1
+
+    progress = []
+    first = repository.update_library(progress=progress.append)
+
+    assert len(first.updated) == 1
+    assert len(progress) == 1
+    assert progress[0].status == "completed"
+    assert progress[0].operation == "registered preview and thumbnail files"
+    repaired = repository.list_model_assets()[0]
+    assert repaired.thumbnail_path == manual_hero
+    assert repaired.hero_path == manual_hero
+    assert not legacy_placeholder.exists()
+
+    manual_thumbnail = asset.asset_dir / "previews" / "Painted_Chair_Thumbnail.png"
+    image(manual_thumbnail, width=320, height=320)
+    assert repository.library_update_count() == 1
+
+    second = repository.update_library()
+
+    assert len(second.updated) == 1
+    repaired = repository.list_model_assets()[0]
+    assert repaired.thumbnail_path == manual_thumbnail
+    assert repaired.hero_path == manual_hero
+    assert repository.library_update_count() == 0
+
+
 def test_update_library_removes_legacy_model_source_folder(tmp_path) -> None:
     candidate = scan_model_folder(model_source(tmp_path, usd=False)).materials[0]
     library = tmp_path / "library"

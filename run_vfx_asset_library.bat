@@ -1,37 +1,83 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 
-cd /d "%~dp0"
+for %%I in ("%~dp0.") do set "SCRIPT_DIR=%%~fI"
+cd /d "%SCRIPT_DIR%"
 if errorlevel 1 goto project_directory_error
 
 set "PROJECT_READY=0"
-if exist "pyproject.toml" if exist "run_vfx_asset_library.py" if exist "src" set "PROJECT_READY=1"
-set "SHOTBOX_INSTALL_ROOT=%LOCALAPPDATA%\ShotBoxAssets"
-if not defined LOCALAPPDATA set "SHOTBOX_INSTALL_ROOT=%USERPROFILE%\AppData\Local\ShotBoxAssets"
-if "%SHOTBOX_ARCHIVE_INSTALL%"=="1" goto configure_runtime
-if exist ".git" goto configure_runtime
-if /i "%SHOTBOX_AUTO_UPDATE%"=="0" if "%PROJECT_READY%"=="1" goto configure_runtime
-if /i "%SHOTBOX_AUTO_UPDATE%"=="false" if "%PROJECT_READY%"=="1" goto configure_runtime
-if /i "%~1"=="--no-update" if "%PROJECT_READY%"=="1" goto configure_runtime
-call :download_project_from_github
-if errorlevel 1 goto github_download_error
-cd /d "%DOWNLOADED_PROJECT%"
-if errorlevel 1 goto project_directory_error
-set "PROJECT_READY=1"
-set "SHOTBOX_ARCHIVE_INSTALL=1"
-set "SHOTBOX_VENV_ROOT=%SHOTBOX_INSTALL_ROOT%\application\.venv"
+if exist ".git" if exist "pyproject.toml" if exist "run_vfx_asset_library.py" if exist "scripts\windows_auto_update.py" if exist "src" set "PROJECT_READY=1"
+if "%PROJECT_READY%"=="1" goto configure_runtime
+
+set "INSTALL_TARGET=%SCRIPT_DIR%\vfx_assets_library"
+set "FORWARDED_ARGUMENTS="
+if "%~1"=="" goto prepare_standalone_install
+set "FIRST_ARGUMENT=%~1"
+if "%FIRST_ARGUMENT:~0,2%"=="--" goto collect_standalone_arguments
+set "INSTALL_TARGET=%~f1"
+shift
+
+:collect_standalone_arguments
+if "%~1"=="" goto prepare_standalone_install
+set FORWARDED_ARGUMENTS=%FORWARDED_ARGUMENTS% "%~1"
+shift
+goto collect_standalone_arguments
+
+:prepare_standalone_install
+if exist "%INSTALL_TARGET%\.git" goto validate_install_target
+if exist "%INSTALL_TARGET%" goto inspect_install_target
+goto clone_install_target
+
+:inspect_install_target
+dir /b "%INSTALL_TARGET%" 2>nul | findstr . >nul
+if not errorlevel 1 goto install_target_not_empty
+
+:clone_install_target
+where git >nul 2>&1
+if errorlevel 1 goto git_required_error
+for %%P in ("%INSTALL_TARGET%") do set "INSTALL_PARENT=%%~dpP"
+if not exist "%INSTALL_PARENT%" mkdir "%INSTALL_PARENT%" 2>nul
+if not exist "%INSTALL_PARENT%" goto install_parent_error
+echo Cloning ShotBox Assets into "%INSTALL_TARGET%"...
+set "GIT_TERMINAL_PROMPT=0"
+set "GCM_INTERACTIVE=Never"
+git clone --branch main --single-branch "https://github.com/chiefjackvfx/vfx_assets_library.git" "%INSTALL_TARGET%"
+if errorlevel 1 goto git_clone_error
+
+:validate_install_target
+if not exist "%INSTALL_TARGET%\.git" goto invalid_install_target
+if not exist "%INSTALL_TARGET%\pyproject.toml" goto invalid_install_target
+if not exist "%INSTALL_TARGET%\run_vfx_asset_library.bat" goto invalid_install_target
+if not exist "%INSTALL_TARGET%\run_vfx_asset_library.py" goto invalid_install_target
+if not exist "%INSTALL_TARGET%\scripts\windows_auto_update.py" goto invalid_install_target
+if not exist "%INSTALL_TARGET%\src" goto invalid_install_target
+
+where git >nul 2>&1
+if errorlevel 1 goto launch_installed_checkout
+set "TARGET_ORIGIN="
+for /f "delims=" %%R in ('git -C "%INSTALL_TARGET%" remote get-url origin 2^>nul') do if not defined TARGET_ORIGIN set "TARGET_ORIGIN=%%R"
+if /i "%TARGET_ORIGIN%"=="https://github.com/chiefjackvfx/vfx_assets_library.git" goto launch_installed_checkout
+if /i "%TARGET_ORIGIN%"=="https://github.com/chiefjackvfx/vfx_assets_library" goto launch_installed_checkout
+if /i "%TARGET_ORIGIN%"=="git@github.com:chiefjackvfx/vfx_assets_library.git" goto launch_installed_checkout
+if /i "%TARGET_ORIGIN%"=="ssh://git@github.com/chiefjackvfx/vfx_assets_library.git" goto launch_installed_checkout
+goto unexpected_install_origin
+
+:launch_installed_checkout
+echo Starting the ShotBox Assets installation at "%INSTALL_TARGET%"...
+call "%INSTALL_TARGET%\run_vfx_asset_library.bat" %FORWARDED_ARGUMENTS%
+set "CHILD_EXIT_CODE=%ERRORLEVEL%"
+endlocal & exit /b %CHILD_EXIT_CODE%
 
 :configure_runtime
-set "BOOTSTRAP_PYTHON_DIRECTORY=%SHOTBOX_INSTALL_ROOT%\runtime\python"
+set "BOOTSTRAP_PYTHON_DIRECTORY=%SCRIPT_DIR%\.runtime\python"
 set "BOOTSTRAP_PYTHON=%BOOTSTRAP_PYTHON_DIRECTORY%\python.exe"
-set "VENV_DIRECTORY=.venv"
-if defined SHOTBOX_VENV_ROOT set "VENV_DIRECTORY=%SHOTBOX_VENV_ROOT%"
+set "VENV_DIRECTORY=%SCRIPT_DIR%\.venv"
 set "VENV_PYTHON=%VENV_DIRECTORY%\Scripts\python.exe"
 set "PYTHON_COMMAND="
 set "PYTHON_ARGUMENT="
 set "UPDATE_PYTHON="
 set "UPDATE_PYTHON_ARGUMENT="
-set "UPDATE_SCRIPT=scripts\windows_auto_update.py"
+set "UPDATE_SCRIPT=%SCRIPT_DIR%\scripts\windows_auto_update.py"
 set "VENV_NEEDS_REPAIR=0"
 
 if exist "%VENV_PYTHON%" goto validate_existing_venv
@@ -100,25 +146,9 @@ goto find_base_python
 set "UPDATE_PYTHON=%VENV_PYTHON%"
 
 :check_for_update
-if /i "%SHOTBOX_AUTO_UPDATE%"=="0" if "%PROJECT_READY%"=="1" goto after_update
-if /i "%SHOTBOX_AUTO_UPDATE%"=="false" if "%PROJECT_READY%"=="1" goto after_update
-if "%SHOTBOX_UPDATE_RELAUNCHED%"=="1" goto after_update
-if "%SHOTBOX_ARCHIVE_INSTALL%"=="1" goto after_update
-if exist "%UPDATE_SCRIPT%" goto run_updater
-if defined LOCALAPPDATA if exist "%LOCALAPPDATA%\ShotBoxAssets\application\bootstrap\windows_auto_update.py" set "UPDATE_SCRIPT=%LOCALAPPDATA%\ShotBoxAssets\application\bootstrap\windows_auto_update.py"
-if exist "%UPDATE_SCRIPT%" goto run_updater
-where powershell >nul 2>&1
-if errorlevel 1 goto updater_missing
-set "UPDATE_SCRIPT=%TEMP%\shotbox-windows-updater-%RANDOM%-%RANDOM%.py"
-set "SHOTBOX_UPDATE_SCRIPT=%UPDATE_SCRIPT%"
-echo Downloading the ShotBox Assets bootstrap from GitHub...
-powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $headers=@{Accept='application/vnd.github+json'; 'User-Agent'='ShotBox-Assets-Windows-Bootstrap'; 'X-GitHub-Api-Version'='2022-11-28'}; if($env:SHOTBOX_GITHUB_TOKEN){$headers.Authorization='Bearer ' + $env:SHOTBOX_GITHUB_TOKEN}; $response=Invoke-RestMethod -UseBasicParsing -Headers $headers -Uri 'https://api.github.com/repos/chiefjackvfx/vfx_assets_library/contents/scripts/windows_auto_update.py?ref=main'; [IO.File]::WriteAllBytes($env:SHOTBOX_UPDATE_SCRIPT,[Convert]::FromBase64String(($response.content -replace '\s','')))"
-if errorlevel 1 goto updater_missing
-
-:run_updater
+if not exist "%UPDATE_SCRIPT%" goto updater_missing
 echo Checking GitHub for ShotBox Assets updates...
-"%UPDATE_PYTHON%" %UPDATE_PYTHON_ARGUMENT% "%UPDATE_SCRIPT%" --project "%CD%" --launcher "%~f0" -- %* & if errorlevel 100 exit /b 0
-if errorlevel 20 goto github_download_error
+"%UPDATE_PYTHON%" %UPDATE_PYTHON_ARGUMENT% "%UPDATE_SCRIPT%" --project "%SCRIPT_DIR%" --launcher "%~f0" -- %* & if errorlevel 100 exit /b 0
 if errorlevel 1 goto updater_error
 
 :after_update
@@ -141,20 +171,15 @@ if errorlevel 1 goto create_venv_error
 if errorlevel 1 goto create_venv_error
 
 echo Synchronizing ShotBox Assets dependencies...
-"%VENV_PYTHON%" -m pip install -e "."
+"%VENV_PYTHON%" -m pip install -e "%SCRIPT_DIR%"
 if errorlevel 1 goto install_error
 
 echo Starting ShotBox Assets...
-"%VENV_PYTHON%" "run_vfx_asset_library.py" %*
+"%VENV_PYTHON%" "%SCRIPT_DIR%\run_vfx_asset_library.py" %*
 set "APP_EXIT_CODE=%ERRORLEVEL%"
 if not "%APP_EXIT_CODE%"=="0" goto app_error
 
 endlocal & exit /b 0
-
-:project_directory_error
-echo Error: could not open the ShotBox Assets project directory.
-set "FAILURE_CODE=1"
-goto pause_on_error
 
 :locate_python_manager
 set "PYTHON_MANAGER="
@@ -165,56 +190,58 @@ if defined PYTHON_MANAGER exit /b 0
 for /f "delims=" %%P in ('where py 2^>nul') do if not defined PYTHON_MANAGER set "PYTHON_MANAGER=%%~fP"
 exit /b 0
 
-:download_project_from_github
-where powershell >nul 2>&1
-if errorlevel 1 exit /b 1
-set "SHOTBOX_BOOTSTRAP_SOURCE=%~f0"
-set "SHOTBOX_BOOTSTRAP_SCRIPT=%TEMP%\shotbox-archive-bootstrap-%RANDOM%-%RANDOM%.ps1"
-set "SHOTBOX_BOOTSTRAP_RESULT=%TEMP%\shotbox-archive-result-%RANDOM%-%RANDOM%.txt"
-powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $source=[IO.File]::ReadAllText($env:SHOTBOX_BOOTSTRAP_SOURCE); $marker='# SHOTBOX_EMBEDDED_POWERSHELL'; $index=$source.LastIndexOf($marker); if($index -lt 0){throw 'Embedded GitHub installer is missing.'}; [IO.File]::WriteAllText($env:SHOTBOX_BOOTSTRAP_SCRIPT,$source.Substring($index + $marker.Length),[Text.UTF8Encoding]::new($false))"
-if errorlevel 1 exit /b 1
-powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SHOTBOX_BOOTSTRAP_SCRIPT%" -InstallRoot "%SHOTBOX_INSTALL_ROOT%" -ResultFile "%SHOTBOX_BOOTSTRAP_RESULT%"
-set "BOOTSTRAP_EXIT_CODE=%ERRORLEVEL%"
-if not "%BOOTSTRAP_EXIT_CODE%"=="0" goto github_bootstrap_cleanup
-if not exist "%SHOTBOX_BOOTSTRAP_RESULT%" goto github_bootstrap_result_error
-set /p "DOWNLOADED_PROJECT="<"%SHOTBOX_BOOTSTRAP_RESULT%"
-if not defined DOWNLOADED_PROJECT goto github_bootstrap_result_error
-if not exist "%DOWNLOADED_PROJECT%\pyproject.toml" goto github_bootstrap_result_error
-goto github_bootstrap_cleanup
+:project_directory_error
+echo Error: could not open the ShotBox Assets launcher directory.
+set "FAILURE_CODE=1"
+goto pause_on_error
 
-:github_bootstrap_result_error
-set "BOOTSTRAP_EXIT_CODE=1"
+:git_required_error
+echo Error: Git for Windows is required to install ShotBox Assets.
+echo Install Git from https://git-scm.com/download/win, then run this launcher again.
+set "FAILURE_CODE=1"
+goto pause_on_error
 
-:github_bootstrap_cleanup
-if exist "%SHOTBOX_BOOTSTRAP_SCRIPT%" del /q "%SHOTBOX_BOOTSTRAP_SCRIPT%" >nul 2>&1
-if exist "%SHOTBOX_BOOTSTRAP_RESULT%" del /q "%SHOTBOX_BOOTSTRAP_RESULT%" >nul 2>&1
-exit /b %BOOTSTRAP_EXIT_CODE%
+:install_parent_error
+echo Error: could not create the parent directory for "%INSTALL_TARGET%".
+set "FAILURE_CODE=1"
+goto pause_on_error
+
+:install_target_not_empty
+echo Error: the installation target exists and is not an empty Git checkout:
+echo "%INSTALL_TARGET%"
+echo Choose an empty target folder or an existing ShotBox Assets checkout.
+set "FAILURE_CODE=1"
+goto pause_on_error
+
+:git_clone_error
+echo Error: Git could not clone ShotBox Assets into "%INSTALL_TARGET%".
+echo Check the Git output and network connection, then run this launcher again.
+set "FAILURE_CODE=1"
+goto pause_on_error
+
+:invalid_install_target
+echo Error: "%INSTALL_TARGET%" is not a complete ShotBox Assets checkout.
+echo Repair or remove that target, then run this launcher again.
+set "FAILURE_CODE=1"
+goto pause_on_error
+
+:unexpected_install_origin
+echo Error: the existing checkout does not use the approved ShotBox Assets GitHub repository.
+echo Target: "%INSTALL_TARGET%"
+echo Origin: "%TARGET_ORIGIN%"
+set "FAILURE_CODE=1"
+goto pause_on_error
 
 :updater_missing
-if "%PROJECT_READY%"=="1" (
-    echo Warning: the automatic updater could not be downloaded; starting the installed version.
-    goto after_update
-)
-echo Error: the ShotBox Assets bootstrap could not be downloaded from GitHub.
-set "FAILURE_CODE=1"
-goto pause_on_error
-
-:github_download_error
-echo Error: ShotBox Assets could not be downloaded from GitHub and no cached installation is available.
-set "FAILURE_CODE=1"
-goto pause_on_error
+echo Warning: the automatic updater is missing; starting the installed version.
+goto after_update
 
 :updater_error
-if "%PROJECT_READY%"=="1" (
-    echo Warning: the automatic updater failed; starting the installed version.
-    goto after_update
-)
-echo Error: the ShotBox Assets updater failed before the application was downloaded.
-set "FAILURE_CODE=1"
-goto pause_on_error
+echo Warning: the automatic updater failed; starting the installed version.
+goto after_update
 
 :python_install_error
-echo Error: the automatic per-user Python installation failed.
+echo Error: the automatic local Python installation failed.
 echo Check the messages above, then run this launcher again.
 set "FAILURE_CODE=1"
 goto pause_on_error
@@ -238,116 +265,3 @@ echo.
 echo Press any key to close this window...
 pause >nul
 endlocal & exit /b %FAILURE_CODE%
-
-# SHOTBOX_EMBEDDED_POWERSHELL
-param(
-    [Parameter(Mandatory = $true)][string]$InstallRoot,
-    [Parameter(Mandatory = $true)][string]$ResultFile
-)
-
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-$applicationRoot = Join-Path $InstallRoot 'application'
-$versionsRoot = Join-Path $applicationRoot 'versions'
-$stateFile = Join-Path $applicationRoot 'state.json'
-$requiredPaths = @(
-    'pyproject.toml',
-    'run_vfx_asset_library.bat',
-    'run_vfx_asset_library.py',
-    'scripts\windows_auto_update.py',
-    'src'
-)
-
-function Test-ShotBoxProject([string]$Path) {
-    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
-    foreach ($relative in $requiredPaths) {
-        if (-not (Test-Path -LiteralPath (Join-Path $Path $relative))) { return $false }
-    }
-    return $true
-}
-
-function Get-CachedProject {
-    if (-not (Test-Path -LiteralPath $stateFile -PathType Leaf)) { return $null }
-    try {
-        $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
-        if ($state.commit -notmatch '^[0-9a-f]{40}$') { return $null }
-        $candidate = Join-Path $versionsRoot $state.commit
-        if (Test-ShotBoxProject $candidate) { return $candidate }
-    } catch {}
-    return $null
-}
-
-function Get-GitHubHeaders {
-    $headers = @{
-        Accept = 'application/vnd.github+json'
-        'User-Agent' = 'ShotBox-Assets-Windows-Bootstrap'
-        'X-GitHub-Api-Version' = '2022-11-28'
-    }
-    if ($env:SHOTBOX_GITHUB_TOKEN) { $headers.Authorization = 'Bearer ' + $env:SHOTBOX_GITHUB_TOKEN }
-    return $headers
-}
-
-New-Item -ItemType Directory -Path $versionsRoot -Force | Out-Null
-$cachedProject = Get-CachedProject
-$archivePath = $null
-$stagingPath = $null
-
-try {
-    $headers = Get-GitHubHeaders
-    $commitResponse = Invoke-RestMethod -UseBasicParsing -Headers $headers -Uri 'https://api.github.com/repos/chiefjackvfx/vfx_assets_library/commits/main' -TimeoutSec 30
-    $commit = [string]$commitResponse.sha
-    if ($commit -notmatch '^[0-9a-f]{40}$') { throw 'GitHub returned an invalid commit identifier.' }
-    $destination = Join-Path $versionsRoot $commit
-
-    if (-not (Test-ShotBoxProject $destination)) {
-        $archivePath = Join-Path $applicationRoot ('download-' + [Guid]::NewGuid().ToString('N') + '.zip')
-        $stagingPath = Join-Path $versionsRoot ('stage-' + [Guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Path $stagingPath -Force | Out-Null
-        Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri ('https://api.github.com/repos/chiefjackvfx/vfx_assets_library/zipball/' + $commit) -OutFile $archivePath -TimeoutSec 30
-
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $archive = [IO.Compression.ZipFile]::OpenRead($archivePath)
-        try {
-            $totalSize = [int64]0
-            $roots = @{}
-            foreach ($entry in $archive.Entries) {
-                $name = $entry.FullName.Replace('\', '/')
-                $parts = $name.Split('/', [StringSplitOptions]::RemoveEmptyEntries)
-                if ($name.StartsWith('/') -or $parts.Count -eq 0 -or $parts -contains '..') { throw 'The GitHub archive contains an unsafe path.' }
-                $roots[$parts[0]] = $true
-                $totalSize += $entry.Length
-                if ($totalSize -gt 2147483648) { throw 'The GitHub archive exceeds the extraction limit.' }
-            }
-            if ($roots.Count -ne 1) { throw 'The GitHub archive does not contain one project root.' }
-        } finally {
-            $archive.Dispose()
-        }
-
-        Expand-Archive -LiteralPath $archivePath -DestinationPath $stagingPath -Force
-        $projectRoots = @(Get-ChildItem -LiteralPath $stagingPath -Directory)
-        if ($projectRoots.Count -ne 1 -or -not (Test-ShotBoxProject $projectRoots[0].FullName)) { throw 'The downloaded archive is missing required ShotBox Assets files.' }
-        Move-Item -LiteralPath $projectRoots[0].FullName -Destination $destination
-    }
-
-    $state = [ordered]@{
-        commit = $commit
-        checked_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        updated_at = [DateTime]::UtcNow.ToString('o')
-    }
-    $temporaryState = $stateFile + '.tmp'
-    $state | ConvertTo-Json | Set-Content -LiteralPath $temporaryState -Encoding UTF8
-    Move-Item -LiteralPath $temporaryState -Destination $stateFile -Force
-    [IO.File]::WriteAllText($ResultFile, $destination, [Text.UTF8Encoding]::new($false))
-    exit 0
-} catch {
-    if ($cachedProject) {
-        Write-Warning ('GitHub is unavailable; using cached ShotBox Assets. ' + $_.Exception.Message)
-        [IO.File]::WriteAllText($ResultFile, $cachedProject, [Text.UTF8Encoding]::new($false))
-        exit 0
-    }
-    Write-Error ('ShotBox Assets could not be downloaded from GitHub: ' + $_.Exception.Message)
-    exit 1
-} finally {
-    if ($archivePath -and (Test-Path -LiteralPath $archivePath)) { Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue }
-    if ($stagingPath -and (Test-Path -LiteralPath $stagingPath)) { Remove-Item -LiteralPath $stagingPath -Recurse -Force -ErrorAction SilentlyContinue }
-}
