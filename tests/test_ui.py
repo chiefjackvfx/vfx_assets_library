@@ -199,6 +199,8 @@ def test_main_window_construction_defers_library_maintenance(
     tab = SettingsTab(store, settings)
 
     assert tab._inspection_worker is None
+    assert tab.blender_parallel_renders.maximum() == 36
+    assert tab.blender_parallel_renders.value() == 2
     assert tab.vdb_parallel_renders.maximum() == 36
     assert "not been checked" in tab.repair_status.text()
     assert tab.refresh_maintenance_button.isEnabled()
@@ -471,11 +473,12 @@ def test_vdb_preview_is_manual_only_and_uses_houdini_serial_queue(
     assert started[0].parallel_processes == 3
     assert started[0].houdini_path == "/opt/hfs22.0.368/bin/hython"
     assert started[0].preview_session is None
-    assert tab._preview_session is None
+    assert not tab._idle_preview_sessions
+    assert tab._active_preview_renders[asset.id].job.asset_type == "vdb"
     assert tab.card_delegate.task_state(asset.id) == (
         "preview_rendering", "Rendering VDB turntable in Houdini"
     )
-    tab._hdri_render_failed("fixture")
+    tab._preview_render_failed(asset.id, "fixture")
     app.processEvents()
     tab.shutdown_preview_queue()
 
@@ -541,7 +544,7 @@ def test_multiple_selected_vdbs_offer_bulk_still_and_turntable_previews(
 
     assert len(started) == 1
     jobs = (
-        tab._active_preview_render_job,
+        *(active.job for active in tab._active_preview_renders.values()),
         *tab._preview_render_jobs,
     )
     assert {job.asset_id for job in jobs} == {asset.id for asset in assets}
@@ -941,11 +944,13 @@ def test_settings_save_reset_and_invalid_state(app, tmp_path) -> None:
     tab.thumbnail_size.setCurrentIndex(tab.thumbnail_size.findData("large"))
     tab.render_texture_on_import.setChecked(False)
     tab.save_texture_preview_blend.setChecked(True)
+    tab.blender_parallel_renders.setValue(7)
     assert tab.save_button.isEnabled()
     tab._save()
     assert captured[-1].thumbnail_size == "large"
     assert captured[-1].render_texture_on_import is False
     assert captured[-1].save_texture_preview_blend is True
+    assert captured[-1].blender_parallel_renders == 7
     tab.default_category.setCurrentText("Wood")
     assert tab.reset_button.isEnabled()
     tab._reset()
@@ -968,7 +973,7 @@ def test_texture_inspector_exposes_shader_preview_controls(app, tmp_path) -> Non
     assert "disabled" in tab.detail.hdri_render_status.text().casefold()
 
 
-def test_missing_import_previews_are_rendered_one_at_a_time(
+def test_missing_import_previews_use_parallel_persistent_blender_sessions(
     app, tmp_path, monkeypatch
 ) -> None:
     first_source = texture_source(tmp_path, "Queue_Stone_A")
@@ -1012,36 +1017,173 @@ def test_missing_import_previews_are_rendered_one_at_a_time(
 
     tab.bulk_preview_button.click()
 
-    assert len(started) == 1
-    shared_session = started[0].preview_session
-    assert shared_session is not None
+    assert len(started) == 2
+    render_workers = [
+        worker for worker in started
+        if isinstance(worker, assets_tab_module.HdriRenderWorker)
+    ]
+    assert len(render_workers) == 2
+    sessions = {worker.preview_session for worker in render_workers}
+    assert None not in sessions
+    assert len(sessions) == 2
     queued_ids = {
-        tab._active_preview_render_job.asset_id,
+        *tab._active_preview_renders,
         *(job.asset_id for job in tab._preview_render_jobs),
     }
     assert queued_ids == {asset.id for asset in assets}
-    assert tab.card_delegate.task_state(
-        tab._active_preview_render_job.asset_id
-    )[0] == "preview_rendering"
-    assert tab.card_delegate.task_state(
-        tab._preview_render_jobs[0].asset_id
-    )[0] == "preview_queued"
-    second_id = tab._preview_render_jobs[0].asset_id
-    assert "Preview queue: 2" in tab.preview_queue_status.text()
-    assert not tab.preview_queue_clear.isHidden()
-    tab._hdri_render_failed("first render failed")
+    assert not tab._preview_render_jobs
+    assert all(
+        tab.card_delegate.task_state(asset.id)[0] == "preview_rendering"
+        for asset in assets
+    )
+    assert tab.preview_queue_status.text() == "Preview queue: 2 · rendering 2"
+    assert tab.preview_queue_clear.isHidden()
+    first_id, second_id = tuple(tab._active_preview_renders)
+    tab._preview_render_failed(first_id, "first render failed")
     app.processEvents()
     assert len(started) == 2
-    assert tab._active_preview_render_job.asset_id == second_id
-    assert started[1].preview_session is shared_session
+    assert tuple(tab._active_preview_renders) == (second_id,)
     assert tab.card_delegate.task_state(second_id)[0] == (
         "preview_rendering"
     )
     assert tab.preview_queue_clear.isHidden()
-    tab._hdri_render_failed("second render failed")
+    tab._preview_render_failed(second_id, "second render failed")
     app.processEvents()
-    assert tab._preview_session is None
-    assert started[-1].__class__.__name__ == "PreviewSessionCloseWorker"
+    assert not tab._active_preview_renders
+    close_workers = [
+        worker for worker in started
+        if isinstance(worker, assets_tab_module.PreviewSessionCloseWorker)
+    ]
+    assert {worker.session for worker in close_workers} == sessions
+    tab.shutdown_preview_queue()
+
+
+def test_parallel_blender_queue_refills_lane_and_preserves_manual_priority(
+    app, tmp_path, monkeypatch
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    candidates = []
+    for name, color in zip(
+        ("Queue_A", "Queue_B", "Queue_C", "Queue_D"),
+        ("#111111", "#333333", "#555555", "#777777"),
+        strict=True,
+    ):
+        source = texture_source(tmp_path, name)
+        image = QImage(1024, 1024, QImage.Format.Format_RGB32)
+        image.fill(QColor(color))
+        assert image.save(str(source / f"{name}_diff_4k.jpg"))
+        candidates.append(scan_texture_folder(source).materials[0])
+    assets = list(LibraryRepository(
+        library, render_texture_previews=False
+    ).import_materials(candidates).imported)
+    tab = AssetsTab()
+    tab._library_path = str(library)
+    tab._all_assets = assets
+    tab._reindex_all_assets()
+    tab.source_model.replace(assets)
+    tab.set_hdri_preview_settings("", parallel_renders=2)
+    started = []
+    monkeypatch.setattr(
+        QThreadPool,
+        "start",
+        lambda _pool, worker, *_args: started.append(worker),
+    )
+
+    tab.queue_preview_renders(assets[:3], automatic=True)
+
+    assert len(tab._active_preview_renders) == 2
+    assert [job.asset_id for job in tab._preview_render_jobs] == [assets[2].id]
+    first_id = assets[0].id
+    first_session = tab._active_preview_renders[first_id].session
+
+    tab.queue_preview_renders((assets[3],), automatic=False)
+
+    assert [job.asset_id for job in tab._preview_render_jobs] == [
+        assets[3].id,
+        assets[2].id,
+    ]
+    tab._preview_render_failed(first_id, "fixture")
+    app.processEvents()
+
+    assert assets[3].id in tab._active_preview_renders
+    assert tab._active_preview_renders[assets[3].id].session is first_session
+    assert [job.asset_id for job in tab._preview_render_jobs] == [assets[2].id]
+    for asset_id in tuple(tab._active_preview_renders):
+        tab._preview_render_failed(asset_id, "fixture")
+    app.processEvents()
+    for asset_id in tuple(tab._active_preview_renders):
+        tab._preview_render_failed(asset_id, "fixture")
+    app.processEvents()
+    tab.shutdown_preview_queue()
+
+
+def test_vdb_job_is_a_barrier_for_parallel_blender_queue(
+    app, tmp_path, monkeypatch
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    candidates = []
+    for name, color in (
+        ("Barrier_A", "#224466"),
+        ("Barrier_B", "#664422"),
+    ):
+        source = texture_source(tmp_path, name)
+        image = QImage(1024, 1024, QImage.Format.Format_RGB32)
+        image.fill(QColor(color))
+        assert image.save(str(source / f"{name}_diff_4k.jpg"))
+        candidates.append(scan_texture_folder(source).materials[0])
+    textures = list(LibraryRepository(
+        library, render_texture_previews=False
+    ).import_materials(candidates).imported)
+    vdb_source = tmp_path / "clouds"
+    vdb_source.mkdir()
+    (vdb_source / "cloud_Mid_Res.vdb").write_bytes(b"VDB")
+    vdb = LibraryRepository(library).import_vdbs(
+        scan_vdb_folder(vdb_source).materials
+    ).imported[0]
+    assets = [textures[0], vdb, textures[1]]
+    tab = AssetsTab()
+    tab._library_path = str(library)
+    tab._all_assets = assets
+    tab._reindex_all_assets()
+    tab.source_model.replace(assets)
+    started = []
+    monkeypatch.setattr(
+        QThreadPool,
+        "start",
+        lambda _pool, worker, *_args: started.append(worker),
+    )
+
+    tab.queue_preview_renders(
+        assets, automatic=True, vdb_variant="Mid"
+    )
+
+    assert tuple(tab._active_preview_renders) == (textures[0].id,)
+    assert [job.asset_id for job in tab._preview_render_jobs] == [
+        vdb.id, textures[1].id,
+    ]
+    tab._preview_render_failed(textures[0].id, "fixture")
+    app.processEvents()
+    close_worker = next(
+        worker for worker in started
+        if isinstance(worker, assets_tab_module.PreviewSessionCloseWorker)
+    )
+    assert not tab._active_preview_renders
+    close_worker.run()
+    app.processEvents()
+
+    assert tuple(tab._active_preview_renders) == (vdb.id,)
+    assert tab._active_preview_renders[vdb.id].session is None
+    assert [job.asset_id for job in tab._preview_render_jobs] == [
+        textures[1].id
+    ]
+    tab._preview_render_failed(vdb.id, "fixture")
+    app.processEvents()
+
+    assert tuple(tab._active_preview_renders) == (textures[1].id,)
+    tab._preview_render_failed(textures[1].id, "fixture")
+    app.processEvents()
     tab.shutdown_preview_queue()
 
 

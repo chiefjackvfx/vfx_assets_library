@@ -2,6 +2,9 @@ import json
 import os
 from pathlib import Path
 import shutil
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+from time import sleep
 
 import pytest
 
@@ -12,6 +15,7 @@ from PyQt6.QtWidgets import QApplication
 
 from universal_asset_library.importer import scan_texture_folder
 from universal_asset_library.library import LibraryRepository
+import universal_asset_library.library.repository as repository_module
 from universal_asset_library.previews import (
     BlenderPreviewSession,
     BlenderPreviewSessionError,
@@ -426,6 +430,64 @@ def test_repository_batch_import_reuses_one_preview_session(
     assert len(sessions) == 2
     assert sessions[0] is sessions[1]
     assert isinstance(sessions[0], BlenderPreviewSession)
+
+
+def test_parallel_preview_status_publications_are_serialized(
+    tmp_path, monkeypatch
+) -> None:
+    first_parent = tmp_path / "first"
+    second_parent = tmp_path / "second"
+    first_parent.mkdir()
+    second_parent.mkdir()
+    first = _texture_source(first_parent, source_preview=False)
+    second = _texture_source(second_parent, source_preview=False)
+    _image(second / "Stone_BaseColor_1K.jpg", "#123456")
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(
+        library, render_texture_previews=False
+    )
+    assets = repository.import_materials([
+        scan_texture_folder(first).materials[0],
+        scan_texture_folder(second).materials[0],
+    ]).imported
+    original_lock = repository_module._ImportLock
+    state_lock = Lock()
+    active_entries = 0
+    maximum_entries = 0
+
+    class TrackingImportLock:
+        def __init__(self, path: Path) -> None:
+            self.inner = original_lock(path)
+
+        def __enter__(self):
+            nonlocal active_entries, maximum_entries
+            with state_lock:
+                active_entries += 1
+                maximum_entries = max(maximum_entries, active_entries)
+            sleep(0.05)
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            nonlocal active_entries
+            try:
+                self.inner.__exit__(exc_type, exc, tb)
+            finally:
+                with state_lock:
+                    active_entries -= 1
+
+    monkeypatch.setattr(repository_module, "_ImportLock", TrackingImportLock)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            lambda asset: repository._record_texture_render_status(
+                asset.id, {"type": "texture_shader", "status": "failed"}
+            ),
+            assets,
+        ))
+
+    assert {result.id for result in results} == {asset.id for asset in assets}
+    assert maximum_entries == 1
 
 
 def test_texture_import_disabled_or_failed_retains_provider_preview(

@@ -59,12 +59,28 @@ def test_blender_and_hdri_render_preferences_round_trip(tmp_path) -> None:
         render_hdri_on_import=False,
         render_texture_on_import=False,
         save_texture_preview_blend=True,
+        blender_parallel_renders=12,
     ))
     assert saved.blender_path == str(executable)
     assert saved.render_hdri_on_import is False
     assert saved.render_texture_on_import is False
     assert saved.save_texture_preview_blend is True
+    assert saved.blender_parallel_renders == 12
     assert store.load() == saved
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [(0, 1), (1, 1), (36, 36), (99, 36)],
+)
+def test_blender_parallel_render_count_is_clamped(
+    tmp_path, requested: int, expected: int
+) -> None:
+    saved = make_store(tmp_path).save(AppSettings(
+        blender_parallel_renders=requested
+    ))
+
+    assert saved.blender_parallel_renders == expected
 
 
 def test_houdini_preview_path_round_trip(tmp_path) -> None:

@@ -51,6 +51,10 @@ from universal_asset_library.previews import (
 from universal_asset_library.previews.vdb_config import (
     VDB_TURNTABLE_MAX_WORKERS,
 )
+from universal_asset_library.previews.blender_config import (
+    BLENDER_PREVIEW_DEFAULT_WORKERS,
+    BLENDER_PREVIEW_MAX_WORKERS,
+)
 from universal_asset_library.integrations.houdini import HoudiniBridgeClient, HoudiniInstallation, HoudiniPluginInstaller
 from universal_asset_library.integrations.blender import (
     BlenderBridgeClient,
@@ -485,6 +489,24 @@ class SettingsTab(QWidget):
         self.blender_status = QLabel()
         self.blender_status.setObjectName("mutedLabel")
         self.blender_status.setWordWrap(True)
+        blender_parallel_row = QHBoxLayout()
+        blender_parallel_label = QLabel("Parallel Blender preview renders")
+        self.blender_parallel_renders = QSpinBox()
+        self.blender_parallel_renders.setRange(
+            1, BLENDER_PREVIEW_MAX_WORKERS
+        )
+        self.blender_parallel_renders.setValue(
+            BLENDER_PREVIEW_DEFAULT_WORKERS
+        )
+        self.blender_parallel_renders.setSuffix(" instances")
+        self.blender_parallel_renders.setToolTip(
+            "Each instance runs one texture or HDRI preview at a time. More "
+            "instances require additional GPU memory and system RAM, and may "
+            "reduce performance when the GPU is saturated."
+        )
+        blender_parallel_row.addWidget(blender_parallel_label)
+        blender_parallel_row.addWidget(self.blender_parallel_renders)
+        blender_parallel_row.addStretch()
         houdini_preview_row = QHBoxLayout()
         self.houdini_path = QLineEdit()
         self.houdini_path.setPlaceholderText("Auto-detect Houdini 22 for VDB previews")
@@ -567,6 +589,7 @@ class SettingsTab(QWidget):
         tools_layout.addWidget(tools_help)
         tools_layout.addLayout(blender_row)
         tools_layout.addWidget(self.blender_status)
+        tools_layout.addLayout(blender_parallel_row)
         tools_layout.addLayout(houdini_preview_row)
         tools_layout.addWidget(self.houdini_preview_status)
         tools_layout.addLayout(vdb_parallel_row)
@@ -687,6 +710,7 @@ class SettingsTab(QWidget):
         self.default_category.currentIndexChanged.connect(self._changed)
         self.default_model_category.currentIndexChanged.connect(self._changed)
         self.blender_path.textChanged.connect(self._changed)
+        self.blender_parallel_renders.valueChanged.connect(self._changed)
         self.houdini_path.textChanged.connect(self._changed)
         self.vdb_parallel_renders.valueChanged.connect(self._changed)
         self.deadline_command_path.textChanged.connect(self._changed)
@@ -1033,6 +1057,7 @@ class SettingsTab(QWidget):
             save_texture_preview_blend=(
                 self.save_texture_preview_blend.isChecked()
             ),
+            blender_parallel_renders=self.blender_parallel_renders.value(),
             ffmpeg_path=self.ffmpeg_path.text(),
             stock_hover_previews=self.stock_hover_previews.isChecked(),
             vdb_parallel_renders=self.vdb_parallel_renders.value(),
@@ -1050,6 +1075,9 @@ class SettingsTab(QWidget):
         self.default_category.setCurrentText(settings.default_import_category)
         self.default_model_category.setCurrentText(settings.default_model_category)
         self.blender_path.setText(settings.blender_path)
+        self.blender_parallel_renders.setValue(
+            settings.blender_parallel_renders
+        )
         self.houdini_path.setText(settings.houdini_path)
         self.vdb_parallel_renders.setValue(settings.vdb_parallel_renders)
         self.deadline_command_path.setText(settings.deadline_command_path)

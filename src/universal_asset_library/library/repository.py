@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import socket
-from threading import Event
+from threading import Event, Lock
 from typing import Callable, Iterable, Mapping
 from uuid import uuid4
 
@@ -118,6 +118,7 @@ from .polyhaven import (
 
 
 SCHEMA_VERSION = 1
+_PREVIEW_PUBLICATION_LOCK = Lock()
 LIBRARY_SCHEMA_VERSION = 1
 NAMING_VERSION = 2
 LAYOUT_VERSION = 2
@@ -961,7 +962,10 @@ class LibraryRepository:
                     result,
                 )
             token.check()
-            with _ImportLock(self.root / ".ual" / "import.lock"):
+            with (
+                _PREVIEW_PUBLICATION_LOCK,
+                _ImportLock(self.root / ".ual" / "import.lock"),
+            ):
                 current_path, current = self._manifest_by_id(asset_id)
                 if (
                     current_path != manifest_path
@@ -1656,7 +1660,10 @@ class LibraryRepository:
             if result.status != "ready" or not result.thumbnail_path or not result.hero_path:
                 return HdriPreviewUpdate(self._record_hdri_render_status(asset_id, result.metadata), result)
             token.check()
-            with _ImportLock(self.root / ".ual" / "import.lock"):
+            with (
+                _PREVIEW_PUBLICATION_LOCK,
+                _ImportLock(self.root / ".ual" / "import.lock"),
+            ):
                 current_path, current = self._manifest_by_id(asset_id)
                 if current_path != manifest_path or str(current.get("updated_at", "")) != manifest_stamp or str(current.get("fingerprint", "")) != manifest_fingerprint:
                     raise StaleSourceError("The HDRI manifest changed while its preview was rendering; the result was not published.")
@@ -2122,7 +2129,10 @@ class LibraryRepository:
             )
 
     def _record_hdri_render_status(self, asset_id: str, metadata: dict) -> LibraryHdriAsset:
-        with _ImportLock(self.root / ".ual" / "import.lock"):
+        with (
+            _PREVIEW_PUBLICATION_LOCK,
+            _ImportLock(self.root / ".ual" / "import.lock"),
+        ):
             manifest_path, document = self._manifest_by_id(asset_id)
             asset = _asset_from_manifest(document, manifest_path.parent)
             if not isinstance(asset, LibraryHdriAsset):
@@ -2135,7 +2145,10 @@ class LibraryRepository:
     def _record_texture_render_status(
         self, asset_id: str, metadata: dict
     ) -> LibraryTextureAsset:
-        with _ImportLock(self.root / ".ual" / "import.lock"):
+        with (
+            _PREVIEW_PUBLICATION_LOCK,
+            _ImportLock(self.root / ".ual" / "import.lock"),
+        ):
             manifest_path, document = self._manifest_by_id(asset_id)
             asset = _asset_from_manifest(document, manifest_path.parent)
             if (

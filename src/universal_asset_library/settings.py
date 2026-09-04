@@ -8,6 +8,10 @@ from PyQt6.QtCore import QSettings
 
 from .domain import MODEL_CATEGORIES, TEXTURE_CATEGORIES
 from .categories import CategoryConfigStore
+from .previews.blender_config import (
+    BLENDER_PREVIEW_DEFAULT_WORKERS,
+    normalize_blender_preview_workers,
+)
 from .previews.vdb_config import normalize_vdb_turntable_workers
 
 
@@ -64,6 +68,7 @@ class AppSettings:
     render_hdri_on_import: bool = True
     render_texture_on_import: bool = True
     save_texture_preview_blend: bool = False
+    blender_parallel_renders: int = BLENDER_PREVIEW_DEFAULT_WORKERS
     ffmpeg_path: str = ""
     stock_hover_previews: bool = True
     vdb_parallel_renders: int = 2
@@ -89,6 +94,12 @@ class AppSettings:
             render_texture_on_import=bool(self.render_texture_on_import),
             save_texture_preview_blend=bool(
                 self.save_texture_preview_blend
+            ),
+            blender_parallel_renders=normalize_blender_preview_workers(
+                _setting_int(
+                    self.blender_parallel_renders,
+                    BLENDER_PREVIEW_DEFAULT_WORKERS,
+                )
             ),
             ffmpeg_path=normalize_executable_path(self.ffmpeg_path),
             stock_hover_previews=bool(self.stock_hover_previews),
@@ -125,6 +136,13 @@ class SettingsStore:
                     "previews/save_texture_preview_blend", False
                 )
             ),
+            blender_parallel_renders=_setting_int(
+                self._settings.value(
+                    "previews/blender_parallel_renders",
+                    BLENDER_PREVIEW_DEFAULT_WORKERS,
+                ),
+                BLENDER_PREVIEW_DEFAULT_WORKERS,
+            ),
             ffmpeg_path=str(self._settings.value("tools/ffmpeg_path", "") or ""),
             stock_hover_previews=_setting_bool(
                 self._settings.value("display/stock_hover_previews", True)
@@ -159,6 +177,10 @@ class SettingsStore:
         self._settings.setValue(
             "previews/save_texture_preview_blend",
             normalized.save_texture_preview_blend,
+        )
+        self._settings.setValue(
+            "previews/blender_parallel_renders",
+            normalized.blender_parallel_renders,
         )
         self._settings.setValue("tools/ffmpeg_path", normalized.ffmpeg_path)
         self._settings.setValue(

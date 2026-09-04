@@ -115,6 +115,11 @@ from universal_asset_library.previews import (
 from universal_asset_library.previews.vdb_config import (
     normalize_vdb_turntable_workers,
 )
+from universal_asset_library.previews.blender_config import (
+    BLENDER_PREVIEW_DEFAULT_WORKERS,
+    BLENDER_PREVIEW_MAX_WORKERS,
+    normalize_blender_preview_workers,
+)
 from .asset_type_tabs import AssetTypeTabs
 from .category_rail import CategoryRail
 from .ai_classification import (
@@ -3474,6 +3479,16 @@ class HdriRenderWorker(QRunnable):
                 raise
 
 
+@dataclass(slots=True)
+class ActivePreviewRender:
+    job: PreviewRenderJob
+    worker: HdriRenderWorker
+    token: CancelToken
+    session: BlenderPreviewSession | None = None
+    progress: str = ""
+    retire_session: bool = False
+
+
 class DeadlineVdbExportWorker(QRunnable):
     def __init__(
         self,
@@ -3553,13 +3568,21 @@ class DeadlineVdbFinalizeWorker(QRunnable):
             self.signals.finished.emit(result)
 
 
+class PreviewSessionCloseSignals(QObject):
+    finished = pyqtSignal()
+
+
 class PreviewSessionCloseWorker(QRunnable):
     def __init__(self, session: BlenderPreviewSession) -> None:
         super().__init__()
         self.session = session
+        self.signals = PreviewSessionCloseSignals()
 
     def run(self) -> None:
-        self.session.close()
+        try:
+            self.session.close()
+        finally:
+            self.signals.finished.emit()
 
 
 class ModelConversionSignals(QObject):
@@ -4001,6 +4024,7 @@ class AssetsTab(QWidget):
         self._houdini_path = ""
         self._ffmpeg_path = ""
         self._vdb_parallel_renders = 2
+        self._blender_parallel_renders = BLENDER_PREVIEW_DEFAULT_WORKERS
         self._deadline_command_path = ""
         self._husk_submitter_path = ""
         self._deadline_export_worker: DeadlineVdbExportWorker | None = None
@@ -4019,12 +4043,17 @@ class AssetsTab(QWidget):
         self._save_texture_preview_blend = False
         self._render_hdri_previews_on_import = True
         self._render_texture_previews_on_import = True
-        self._hdri_render_worker: HdriRenderWorker | None = None
-        self._hdri_render_token: CancelToken | None = None
         self._preview_render_jobs: list[PreviewRenderJob] = []
         self._preview_render_ids: set[str] = set()
-        self._active_preview_render_job: PreviewRenderJob | None = None
-        self._preview_session: BlenderPreviewSession | None = None
+        self._active_preview_renders: dict[str, ActivePreviewRender] = {}
+        self._idle_preview_sessions: list[BlenderPreviewSession] = []
+        self._preview_session_close_workers: set[
+            PreviewSessionCloseWorker
+        ] = set()
+        self._preview_thread_pool = QThreadPool(self)
+        self._preview_thread_pool.setMaxThreadCount(
+            BLENDER_PREVIEW_MAX_WORKERS
+        )
         self._model_conversion_worker: ModelConversionWorker | None = None
         self._model_conversion_token: CancelToken | None = None
         self._model_rescan_worker: ModelRescanWorker | None = None
@@ -5736,11 +5765,7 @@ class AssetsTab(QWidget):
         active_ids = {
             job.asset_id for job in self._preview_render_jobs
         }
-        if (
-            self._hdri_render_worker is not None
-            and self._active_preview_render_job is not None
-        ):
-            active_ids.add(self._active_preview_render_job.asset_id)
+        active_ids.update(self._active_preview_renders)
         if self._deadline_export_worker is not None:
             active_ids.update(self._deadline_export_asset_ids)
         if (
@@ -6167,10 +6192,18 @@ class AssetsTab(QWidget):
         save_texture_preview_blend: bool = False,
         render_hdri_on_import: bool = True,
         render_texture_on_import: bool = True,
+        parallel_renders: int = BLENDER_PREVIEW_DEFAULT_WORKERS,
     ) -> None:
-        if blender_path != self._blender_path and self._preview_session is not None:
-            self._clear_preview_render_queue(cancel_active=True)
+        parallel_renders = normalize_blender_preview_workers(
+            parallel_renders
+        )
+        blender_changed = blender_path != self._blender_path
+        if blender_changed:
+            self._remove_blender_preview_jobs(cancel_active=True)
+            self._retire_idle_preview_sessions()
         self._blender_path = blender_path
+        old_parallel_renders = self._blender_parallel_renders
+        self._blender_parallel_renders = parallel_renders
         self._save_texture_preview_blend = bool(
             save_texture_preview_blend
         )
@@ -6180,6 +6213,9 @@ class AssetsTab(QWidget):
         self._render_texture_previews_on_import = bool(
             render_texture_on_import
         )
+        if parallel_renders < old_parallel_renders:
+            self._trim_idle_preview_sessions()
+        self._start_queued_preview_renders()
 
     def set_vdb_preview_settings(
         self,
@@ -6214,13 +6250,9 @@ class AssetsTab(QWidget):
         ]
         self._preview_render_ids.difference_update(pending_ids)
         self.card_delegate.clear_task_states(pending_ids)
-        active = self._active_preview_render_job
-        if (
-            active is not None
-            and active.asset_type == "vdb"
-            and self._hdri_render_token is not None
-        ):
-            self._hdri_render_token.cancel()
+        for active in tuple(self._active_preview_renders.values()):
+            if active.job.asset_type == "vdb":
+                active.token.cancel()
         self._update_preview_queue_controls()
 
     def refresh_houdini_sessions(self) -> None:
@@ -6534,7 +6566,7 @@ class AssetsTab(QWidget):
             self._preview_render_jobs.extend(new_jobs)
         else:
             self._preview_render_jobs[0:0] = new_jobs
-        self._start_next_preview_render()
+        self._start_queued_preview_renders()
         self._update_preview_queue_controls()
         self._sync_preview_render_status()
         return added
@@ -6558,26 +6590,47 @@ class AssetsTab(QWidget):
         labels = DetailPanel._ordered_vdb_variants(asset)
         return DetailPanel._default_vdb_variant(labels)
 
-    def _start_next_preview_render(self) -> None:
-        if self._hdri_render_worker is not None:
+    def _start_queued_preview_renders(self) -> None:
+        if self._preview_session_close_workers:
+            self._update_preview_queue_controls()
+            return
+        active = tuple(self._active_preview_renders.values())
+        if any(item.job.asset_type == "vdb" for item in active):
+            self._update_preview_queue_controls()
             return
         while self._preview_render_jobs:
-            job = self._preview_render_jobs.pop(0)
+            job = self._preview_render_jobs[0]
             if (
                 job.library_path != self._library_path
                 or self._asset_by_id(job.asset_id) is None
             ):
+                self._preview_render_jobs.pop(0)
                 self._preview_render_ids.discard(job.asset_id)
                 self.card_delegate.clear_task_state(job.asset_id)
                 continue
-            break
-        else:
-            self._active_preview_render_job = None
-            self._retire_preview_session()
-            self._update_preview_queue_controls()
-            self._sync_preview_render_status()
-            return
-        self._active_preview_render_job = job
+            if job.asset_type == "vdb":
+                if self._active_preview_renders:
+                    break
+                if self._idle_preview_sessions:
+                    self._retire_idle_preview_sessions()
+                    break
+                self._preview_render_jobs.pop(0)
+                self._start_preview_render(job)
+                break
+            active_blender = sum(
+                item.job.asset_type != "vdb"
+                for item in self._active_preview_renders.values()
+            )
+            if active_blender >= self._blender_parallel_renders:
+                break
+            self._preview_render_jobs.pop(0)
+            self._start_preview_render(job)
+        if not self._preview_render_jobs and not self._active_preview_renders:
+            self._retire_idle_preview_sessions()
+        self._update_preview_queue_controls()
+        self._sync_preview_render_status()
+
+    def _start_preview_render(self, job: PreviewRenderJob) -> None:
         application = "Houdini" if job.asset_type == "vdb" else "Blender"
         task_message = (
             "Rendering VDB turntable in Houdini"
@@ -6590,8 +6643,13 @@ class AssetsTab(QWidget):
             task_message,
         )
         token = CancelToken()
-        if job.asset_type != "vdb" and self._preview_session is None:
-            self._preview_session = BlenderPreviewSession(self._blender_path)
+        session = None
+        if job.asset_type != "vdb":
+            session = (
+                self._idle_preview_sessions.pop()
+                if self._idle_preview_sessions
+                else BlenderPreviewSession(self._blender_path)
+            )
         worker = HdriRenderWorker(
             job.library_path,
             job.asset_id,
@@ -6605,34 +6663,36 @@ class AssetsTab(QWidget):
             mode=job.mode,
             parallel_processes=self._vdb_parallel_renders,
             save_texture_preview_blend=self._save_texture_preview_blend,
-            preview_session=(
-                None if job.asset_type == "vdb" else self._preview_session
-            ),
+            preview_session=session,
         )
-        self._hdri_render_token = token
-        self._hdri_render_worker = worker
-        self._update_preview_queue_controls()
+        self._active_preview_renders[job.asset_id] = ActivePreviewRender(
+            job, worker, token, session
+        )
         worker.signals.progress.connect(
             lambda message, asset_id=job.asset_id:
             self._preview_render_progressed(asset_id, message)
         )
-        worker.signals.finished.connect(self._hdri_render_finished)
-        worker.signals.failed.connect(self._hdri_render_failed)
+        worker.signals.finished.connect(
+            lambda update, asset_id=job.asset_id:
+            self._preview_render_finished(asset_id, update)
+        )
+        worker.signals.failed.connect(
+            lambda details, asset_id=job.asset_id:
+            self._preview_render_failed(asset_id, details)
+        )
         self._sync_preview_render_status(f"Starting {application}…")
-        QThreadPool.globalInstance().start(worker)
+        self._preview_thread_pool.start(worker)
 
     def _cancel_hdri_render(self) -> None:
         asset = self.detail._asset
         if asset is None:
             return
-        active = self._active_preview_render_job
-        if (
-            active is not None
-            and active.asset_id == asset.id
-            and self._hdri_render_token
-        ):
-            self._hdri_render_token.cancel()
-            application = "Houdini" if active.asset_type == "vdb" else "Blender"
+        active = self._active_preview_renders.get(asset.id)
+        if active is not None:
+            active.token.cancel()
+            application = (
+                "Houdini" if active.job.asset_type == "vdb" else "Blender"
+            )
             self.detail.set_hdri_rendering(
                 True, f"Canceling {application} safely…"
             )
@@ -6655,6 +6715,9 @@ class AssetsTab(QWidget):
     def _preview_render_progressed(
         self, asset_id: str, message: str
     ) -> None:
+        active = self._active_preview_renders.get(asset_id)
+        if active is not None:
+            active.progress = message
         if self.detail._asset and self.detail._asset.id == asset_id:
             remaining = len(self._preview_render_jobs)
             suffix = f" · {remaining} queued" if remaining else ""
@@ -6664,12 +6727,13 @@ class AssetsTab(QWidget):
         asset = self.detail._asset
         if asset is None:
             return
-        active = self._active_preview_render_job
-        if active is not None and active.asset_id == asset.id:
+        active = self._active_preview_renders.get(asset.id)
+        if active is not None:
             remaining = len(self._preview_render_jobs)
             suffix = f" · {remaining} queued" if remaining else ""
             self.detail.set_hdri_rendering(
-                True, (message or "Rendering preview…") + suffix
+                True,
+                (message or active.progress or "Rendering preview…") + suffix,
             )
             return
         for position, job in enumerate(self._preview_render_jobs, start=1):
@@ -6679,14 +6743,25 @@ class AssetsTab(QWidget):
                 )
                 return
 
-    def _hdri_render_finished(self, update) -> None:
-        job = self._active_preview_render_job
-        self._hdri_render_worker = None
-        self._hdri_render_token = None
-        self._active_preview_render_job = None
-        if job is not None:
-            self._preview_render_ids.discard(job.asset_id)
-            self.card_delegate.clear_task_state(job.asset_id)
+    def _release_active_preview_render(
+        self, asset_id: str
+    ) -> ActivePreviewRender | None:
+        active = self._active_preview_renders.pop(asset_id, None)
+        if active is None:
+            return None
+        self._preview_render_ids.discard(asset_id)
+        self.card_delegate.clear_task_state(asset_id)
+        if active.session is not None:
+            if active.retire_session:
+                self._retire_preview_session(active.session)
+            else:
+                self._idle_preview_sessions.append(active.session)
+                self._trim_idle_preview_sessions()
+        return active
+
+    def _preview_render_finished(self, asset_id: str, update) -> None:
+        active = self._release_active_preview_render(asset_id)
+        job = active.job if active is not None else None
         self._update_preview_queue_controls()
         if job is not None and job.library_path == self._library_path:
             self.apply_asset_update_incremental(update.asset)
@@ -6706,16 +6781,11 @@ class AssetsTab(QWidget):
                 update.render.diagnostic
                 or f"Preview render ended with {update.render.status}."
             )
-        QTimer.singleShot(0, self._start_next_preview_render)
+        QTimer.singleShot(0, self._start_queued_preview_renders)
 
-    def _hdri_render_failed(self, details: str) -> None:
-        job = self._active_preview_render_job
-        self._hdri_render_worker = None
-        self._hdri_render_token = None
-        self._active_preview_render_job = None
-        if job is not None:
-            self._preview_render_ids.discard(job.asset_id)
-            self.card_delegate.clear_task_state(job.asset_id)
+    def _preview_render_failed(self, asset_id: str, details: str) -> None:
+        active = self._release_active_preview_render(asset_id)
+        job = active.job if active is not None else None
         self._update_preview_queue_controls()
         if (
             job is not None
@@ -6731,25 +6801,40 @@ class AssetsTab(QWidget):
             if details.strip()
             else "Preview rendering failed."
         )
-        QTimer.singleShot(0, self._start_next_preview_render)
+        QTimer.singleShot(0, self._start_queued_preview_renders)
 
     def _clear_preview_render_queue(
         self, *, cancel_active: bool
     ) -> None:
         cleared_ids = set(self._preview_render_ids)
         self._preview_render_jobs.clear()
-        active = self._active_preview_render_job
-        self._preview_render_ids = (
-            {active.asset_id} if active is not None else set()
-        )
-        if cancel_active and self._hdri_render_token is not None:
-            self._hdri_render_token.cancel()
+        active_ids = set(self._active_preview_renders)
+        self._preview_render_ids = active_ids
         if cancel_active:
-            self.card_delegate.clear_task_states(cleared_ids)
-        else:
-            self.card_delegate.clear_task_states(
-                cleared_ids - self._preview_render_ids
-            )
+            for active in self._active_preview_renders.values():
+                active.token.cancel()
+                if active.session is not None:
+                    active.retire_session = True
+        self.card_delegate.clear_task_states(cleared_ids - active_ids)
+        self._update_preview_queue_controls()
+
+    def _remove_blender_preview_jobs(self, *, cancel_active: bool) -> None:
+        pending_ids = {
+            job.asset_id
+            for job in self._preview_render_jobs
+            if job.asset_type != "vdb"
+        }
+        self._preview_render_jobs = [
+            job for job in self._preview_render_jobs
+            if job.asset_type == "vdb"
+        ]
+        self._preview_render_ids.difference_update(pending_ids)
+        self.card_delegate.clear_task_states(pending_ids)
+        if cancel_active:
+            for active in self._active_preview_renders.values():
+                if active.job.asset_type != "vdb":
+                    active.retire_session = True
+                    active.token.cancel()
         self._update_preview_queue_controls()
 
     def _clear_pending_preview_renders(self) -> None:
@@ -6768,15 +6853,11 @@ class AssetsTab(QWidget):
         self._update_preview_queue_controls()
 
     def _update_preview_queue_controls(self) -> None:
-        active = self._active_preview_render_job
+        active_count = len(self._active_preview_renders)
         pending = len(self._preview_render_jobs)
-        total = pending + (1 if active is not None else 0)
+        total = pending + active_count
         if total:
-            current = (
-                f" · rendering {active.asset_name}"
-                if active is not None
-                else ""
-            )
+            current = f" · rendering {active_count}" if active_count else ""
             self.preview_queue_status.setText(
                 f"Preview queue: {total}{current}"
             )
@@ -6793,20 +6874,49 @@ class AssetsTab(QWidget):
         if self._deadline_finalize_worker is not None:
             self._deadline_finalize_worker.token.cancel()
         self._clear_preview_render_queue(cancel_active=True)
-        if self._hdri_render_worker is None:
-            self._retire_preview_session(asynchronous=False)
+        self._retire_idle_preview_sessions(asynchronous=False)
 
-    def _retire_preview_session(self, *, asynchronous: bool = True) -> None:
-        session = self._preview_session
-        self._preview_session = None
-        if session is None:
-            return
-        if asynchronous:
-            QThreadPool.globalInstance().start(
-                PreviewSessionCloseWorker(session)
+    def _trim_idle_preview_sessions(self) -> None:
+        active_blender = sum(
+            active.job.asset_type != "vdb"
+            for active in self._active_preview_renders.values()
+        )
+        keep = max(0, self._blender_parallel_renders - active_blender)
+        while len(self._idle_preview_sessions) > keep:
+            self._retire_preview_session(self._idle_preview_sessions.pop())
+
+    def _retire_idle_preview_sessions(
+        self, *, asynchronous: bool = True
+    ) -> None:
+        sessions = tuple(self._idle_preview_sessions)
+        self._idle_preview_sessions.clear()
+        for session in sessions:
+            self._retire_preview_session(
+                session, asynchronous=asynchronous
             )
+
+    def _retire_preview_session(
+        self,
+        session: BlenderPreviewSession,
+        *,
+        asynchronous: bool = True,
+    ) -> None:
+        if asynchronous:
+            worker = PreviewSessionCloseWorker(session)
+            self._preview_session_close_workers.add(worker)
+            worker.signals.finished.connect(
+                lambda worker=worker: self._preview_session_closed(worker)
+            )
+            self._preview_thread_pool.start(worker)
         else:
             session.close()
+
+    def _preview_session_closed(
+        self, worker: PreviewSessionCloseWorker
+    ) -> None:
+        self._preview_session_close_workers.discard(worker)
+        if not self._preview_session_close_workers:
+            QTimer.singleShot(0, self._start_queued_preview_renders)
 
     def _convert_model_to_usd(self, asset: AssetRecord) -> None:
         if (

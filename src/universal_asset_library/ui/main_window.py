@@ -93,6 +93,7 @@ class MainWindow(QMainWindow):
             settings.save_texture_preview_blend,
             settings.render_hdri_on_import,
             settings.render_texture_on_import,
+            settings.blender_parallel_renders,
         )
         self.assets_tab.set_vdb_preview_settings(
             settings.houdini_path,
