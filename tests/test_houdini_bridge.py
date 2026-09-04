@@ -158,7 +158,16 @@ def test_installer_replaces_legacy_package_name(tmp_path) -> None:
     assert (packages / "shotbox_assets_bridge.json").is_file()
 
 
-def test_client_discovers_authenticated_session(tmp_path) -> None:
+def test_client_discovers_authenticated_session_without_signalling_process(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail(
+            "Session discovery must never signal the Houdini process"
+        ),
+    )
     token = "a" * 64
     config = tmp_path / "bridge.json"
     config.write_text(json.dumps({"token": token}), encoding="utf-8")

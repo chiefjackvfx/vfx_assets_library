@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import socket
 import struct
@@ -170,7 +169,12 @@ class HoudiniBridgeClient:
                         descriptor_path=descriptor,
                         config_file=config,
                     )
-                    if session.id in seen or session.port < 1 or session.port > 65535 or not _process_exists(session.pid):
+                    if (
+                        session.id in seen
+                        or session.pid <= 0
+                        or session.port < 1
+                        or session.port > 65535
+                    ):
                         continue
                     response = self._request(session, BridgeRequest("ping"))
                     if response.ok and response.session_id == session.id:
@@ -390,15 +394,3 @@ def _default_resolution(resolutions: dict[str, Any]) -> str:
 def _resolution_value(label: str) -> int:
     digits = "".join(character for character in str(label) if character.isdigit())
     return int(digits) if digits else 0
-
-
-def _process_exists(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
