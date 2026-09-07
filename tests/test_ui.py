@@ -19,6 +19,7 @@ from universal_asset_library.ui.assets_tab import (
     AssetsTab,
     DetailPanel,
     MaterialEditDialog,
+    MoveToTrashDialog,
     MetadataUpdateWorker,
     ModelAssetRescanDialog,
     ModelConversionDialog,
@@ -1522,6 +1523,61 @@ def test_material_edit_dialog_and_assets_tab_save_refresh(app, tmp_path) -> None
     tab.category.setCurrentText("Concrete")
     assert tab.proxy.rowCount() == 1
     assert LibraryRepository(library).list_assets()[0].tags == ("edited", "studio")
+
+
+def test_move_to_trash_dialog_identifies_asset_and_destination(app, tmp_path) -> None:
+    source = texture_source(tmp_path, "Dialog_Stone")
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_materials(
+        [scan_texture_folder(source).materials[0]]
+    ).imported[0]
+
+    dialog = MoveToTrashDialog(asset)
+
+    assert dialog.windowTitle() == "Move asset to Trash?"
+    assert dialog.asset_name.text() == asset.name
+    assert dialog.current_location.text() == str(asset.asset_dir)
+    assert dialog.destination.text() == str(
+        library / "textures" / "trash" / asset.asset_dir.name
+    )
+    assert dialog.buttons.button(
+        QDialogButtonBox.StandardButton.Ok
+    ).text() == "Move to Trash"
+
+
+def test_asset_trash_button_confirms_and_moves_managed_folder(
+    app, tmp_path, monkeypatch,
+) -> None:
+    source = texture_source(tmp_path, "Trash_Me")
+    library = tmp_path / "library"
+    library.mkdir()
+    asset = LibraryRepository(library).import_materials(
+        [scan_texture_folder(source).materials[0]]
+    ).imported[0]
+    monkeypatch.setattr(
+        MoveToTrashDialog,
+        "exec",
+        lambda _dialog: QDialog.DialogCode.Accepted,
+    )
+    tab = AssetsTab()
+    tab.load_library(str(library))
+
+    assert tab.detail.trash_button.text() == "Move to Trash…"
+    assert tab.detail.trash_button.isEnabled()
+    assert tab._move_asset_to_trash(asset)
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+
+    trashed = LibraryRepository(library).list_assets()[0]
+    assert trashed.category == "Trash"
+    assert trashed.asset_dir.parent == library / "textures" / "trash"
+    assert not asset.asset_dir.exists()
+    assert tab.detail._asset.category == "Trash"
+    assert tab.detail.trash_button.text() == "In Trash"
+    assert not tab.detail.trash_button.isEnabled()
+    assert tab.category.findText("Trash") >= 0
+    assert tab.task_status.text() == "Moved 1 asset to Trash."
 
 
 def test_rating_filter_sort_and_star_toggle(app, tmp_path) -> None:

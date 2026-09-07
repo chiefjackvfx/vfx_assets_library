@@ -361,6 +361,31 @@ def test_flat_stock_metadata_edit_renames_and_moves_only_its_files(
     assert outcome.asset.tags == ("hero", "smoke", "approved")
 
 
+def test_flat_stock_asset_moves_to_reserved_trash_folder(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    _video(incoming / "Smoke" / "Trashable_Smoke.mov")
+    candidate = scan_stock_folder(
+        incoming, ffprobe_path=FFPROBE
+    ).materials[0]
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library, ffmpeg_path=FFMPEG)
+    asset = repository.import_stock([candidate]).imported[0]
+
+    trashed = repository.update_asset_metadata(
+        asset.id,
+        AssetMetadataUpdate(asset.name, "Trash", asset.tags),
+    )
+
+    assert trashed.category == "Trash"
+    assert trashed.asset_dir == library / "stock" / "trash"
+    assert trashed.source_path.is_file()
+    assert trashed.preview_path.is_file()
+    assert trashed.thumbnail_path.is_file()
+    assert not asset.source_path.exists()
+    assert repository.list_stock_assets()[0].category == "Trash"
+
+
 def test_flat_stock_same_name_collision_uses_shared_numeric_token(
     tmp_path: Path,
 ) -> None:

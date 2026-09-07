@@ -58,7 +58,11 @@ from universal_asset_library.importer.stock_scanner import (
     probe_video,
     resolve_ffprobe,
 )
-from universal_asset_library.categories import CategoryCatalog, CategoryConfigStore
+from universal_asset_library.categories import (
+    TRASH_CATEGORY,
+    CategoryCatalog,
+    CategoryConfigStore,
+)
 from universal_asset_library.previews import (
     BlenderPreviewSession,
     HdriPreviewRequest,
@@ -514,7 +518,7 @@ class LibraryRepository:
         manifest_path, document = manifest or self._manifest_by_id(asset_id)
         asset_type = str(document.get("type", "texture_set"))
         catalog = category_catalog or CategoryConfigStore(self.root).load(asset_type)
-        canonical_category = catalog.canonical_name(category)
+        canonical_category = _canonical_metadata_category(catalog, category)
         if canonical_category is None:
             raise LibraryError(
                 f"Category {category!r} is not defined in {catalog.asset_type} categories."
@@ -2579,7 +2583,7 @@ class LibraryRepository:
                 asset_type = str(document.get("type", "texture_set"))
                 catalog = store.load(asset_type)
                 primary = _manifest_primary_category(document)
-                if catalog.canonical_name(primary) is None:
+                if _canonical_metadata_category(catalog, primary) is None:
                     raise ValueError(
                         f"Category {primary!r} is not defined in {catalog.asset_type} categories."
                     )
@@ -2633,7 +2637,7 @@ class LibraryRepository:
             raw_primary = legacy[0] if legacy else "Uncategorized"
         if raw_primary.casefold() == "surface":
             raw_primary = "Uncategorized"
-        primary = catalog.canonical_name(raw_primary)
+        primary = _canonical_metadata_category(catalog, raw_primary)
         if primary is None:
             raise LibraryError(
                 f"Category {raw_primary!r} is not defined in {catalog.asset_type} categories."
@@ -6935,6 +6939,15 @@ def _asset_container(asset_type: str) -> str:
         return containers[asset_type.casefold()]
     except KeyError as error:
         raise LibraryError(f"Unsupported asset type: {asset_type or 'unknown'}") from error
+
+
+def _canonical_metadata_category(
+    catalog: CategoryCatalog, value: str
+) -> str | None:
+    """Resolve configured categories plus the reserved recoverable Trash area."""
+    if re.sub(r"\s+", " ", str(value).strip()).casefold() == TRASH_CATEGORY.casefold():
+        return TRASH_CATEGORY
+    return catalog.canonical_name(value)
 
 
 def _safe_suffix(value: str) -> str:

@@ -78,7 +78,11 @@ from universal_asset_library.library import (
     PolyHavenDownloadPlan,
     PolyHavenOptions,
 )
-from universal_asset_library.categories import CategoryCatalog, default_category_catalog
+from universal_asset_library.categories import (
+    TRASH_CATEGORY,
+    CategoryCatalog,
+    default_category_catalog,
+)
 from universal_asset_library.ai import DEFAULT_MODEL, OllamaClient, load_tag_vocabulary
 from universal_asset_library.integrations.houdini import (
     BridgeResponse,
@@ -122,6 +126,7 @@ from universal_asset_library.previews.blender_config import (
 )
 from .asset_type_tabs import AssetTypeTabs
 from .category_rail import CategoryRail
+from .quick_look import AssetQuickLookController
 from .ai_classification import (
     AiOrganiserDialog,
     AiGuessWorker,
@@ -439,7 +444,7 @@ class MaterialEditDialog(QDialog):
         self.name = QLineEdit(asset.name)
         self.category = QComboBox()
         self.category.setEditable(False)
-        self.category.addItems(category_suggestions or (
+        suggestions = tuple(category_suggestions or (
                 MODEL_CATEGORIES if isinstance(asset, LibraryModelAsset)
                 else VDB_CATEGORIES if isinstance(asset, LibraryVdbAsset)
                 else STOCK_CATEGORIES if isinstance(asset, LibraryStockAsset)
@@ -447,6 +452,11 @@ class MaterialEditDialog(QDialog):
                 else ATLAS_CATEGORIES if asset.asset_type == "atlas"
                 else TEXTURE_CATEGORIES
         ))
+        if asset.category.casefold() not in {
+            value.casefold() for value in suggestions
+        }:
+            suggestions = (*suggestions, asset.category)
+        self.category.addItems(suggestions)
         self.category.setCurrentText(asset.category)
         self.tags = TagEditor(asset.tags)
         self.author = QLineEdit(asset.author)
@@ -489,6 +499,97 @@ class MaterialEditDialog(QDialog):
             self.category.setFocus()
             return
         self.accept()
+
+
+class MoveToTrashDialog(QDialog):
+    """Confirm a recoverable asset move and identify its managed payload."""
+
+    def __init__(self, asset: AssetRecord, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Move asset to Trash?")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        heading = QLabel(
+            f"Move “{html.escape(asset.name)}” to Trash?"
+        )
+        heading.setObjectName("pageTitle")
+        explanation = QLabel(
+            "The asset remains recoverable. ShotBox will change its category to "
+            "Trash and move all managed files into the Trash category folder."
+        )
+        explanation.setObjectName("mutedLabel")
+        explanation.setWordWrap(True)
+        layout.addWidget(heading)
+        layout.addWidget(explanation)
+
+        details = QFormLayout()
+        details.setHorizontalSpacing(22)
+        details.setVerticalSpacing(10)
+        self.asset_name = QLabel(asset.name)
+        self.asset_name.setWordWrap(True)
+        self.asset_kind = QLabel({
+            "texture_set": "Texture set",
+            "atlas": "Atlas",
+            "hdri": "HDRI",
+            "model": "3D model",
+            "vdb": "VDB volume",
+            "stock": "Stock clip",
+        }.get(asset.asset_type, "Asset"))
+        self.current_location = QLabel(str(asset.asset_dir))
+        self.current_location.setWordWrap(True)
+        self.current_location.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        container = {
+            "texture_set": "textures",
+            "atlas": "atlases",
+            "hdri": "hdris",
+            "model": "models",
+            "vdb": "vdbs",
+            "stock": "stock",
+        }.get(asset.asset_type, "assets")
+        asset_dir = Path(asset.asset_dir)
+        container_root = next(
+            (
+                path for path in (asset_dir, *asset_dir.parents)
+                if path.name.casefold() == container.casefold()
+            ),
+            Path(container),
+        )
+        destination = container_root / "trash"
+        if not (
+            asset.asset_type == "stock"
+            and not (asset_dir / "asset.json").is_file()
+        ):
+            destination /= asset_dir.name
+        self.destination = QLabel(str(destination))
+        self.destination.setWordWrap(True)
+        self.destination.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        details.addRow("Asset", self.asset_name)
+        details.addRow("Type", self.asset_kind)
+        details.addRow("Current location", self.current_location)
+        details.addRow("Destination", self.destination)
+        layout.addLayout(details)
+
+        warning = QLabel(
+            "No files will be permanently deleted. You can restore the asset "
+            "later by editing its category."
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color:#e6b566;")
+        layout.addWidget(warning)
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        move_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        move_button.setText("Move to Trash")
+        move_button.setObjectName("dangerButton")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
 
 
 class ModelAssetRescanDialog(QDialog):
@@ -1805,6 +1906,7 @@ class StarRatingWidget(QWidget):
 
 class DetailPanel(QFrame):
     edit_requested = pyqtSignal(object)
+    trash_requested = pyqtSignal(object)
     rating_requested = pyqtSignal(object, int)
     ai_guess_requested = pyqtSignal(object, str)
     model_convert_requested = pyqtSignal(object)
@@ -1954,6 +2056,12 @@ class DetailPanel(QFrame):
         self.path_button.clicked.connect(self._copy_path)
         self.reveal_button = QPushButton("Reveal in folder")
         self.reveal_button.clicked.connect(self._reveal)
+        self.trash_button = QPushButton("Move to Trash…")
+        self.trash_button.setObjectName("dangerButton")
+        self.trash_button.setToolTip(
+            "Move this asset and all managed files into its Trash category folder."
+        )
+        self.trash_button.clicked.connect(self._trash)
         self.edit_button = QPushButton("Edit material…")
         self.edit_button.setObjectName("primaryButton")
         self.edit_button.clicked.connect(self._edit)
@@ -2204,6 +2312,7 @@ class DetailPanel(QFrame):
         path_actions.setSpacing(6)
         path_actions.addWidget(self.path_button)
         path_actions.addWidget(self.reveal_button)
+        path_actions.addWidget(self.trash_button)
 
         self.files_section = CollapsibleSection("Files & Maps")
         self.files_section.body_layout.addWidget(self.maps_title)
@@ -2301,6 +2410,7 @@ class DetailPanel(QFrame):
             section.hide()
         self.path_button.setEnabled(False)
         self.reveal_button.setEnabled(False)
+        self.trash_button.setEnabled(False)
         self.edit_button.setEnabled(False)
         self.guess_category_button.setEnabled(False)
         self.guess_tags_button.setEnabled(False)
@@ -2759,6 +2869,9 @@ class DetailPanel(QFrame):
             self.extras_section.hide()
         self.path_button.setEnabled(True)
         self.reveal_button.setEnabled(True)
+        in_trash = asset.category.casefold() == TRASH_CATEGORY.casefold()
+        self.trash_button.setText("In Trash" if in_trash else "Move to Trash…")
+        self.trash_button.setEnabled(not in_trash)
         self.edit_button.setEnabled(True)
         self.guess_category_button.show()
         self.guess_tags_button.show()
@@ -2787,9 +2900,16 @@ class DetailPanel(QFrame):
             and not self._library_mutation_busy
             and not self._asset_task_busy
         )
+        self.trash_button.setEnabled(
+            self._asset is not None
+            and self._asset.category.casefold() != TRASH_CATEGORY.casefold()
+            and not self._library_mutation_busy
+            and not self._asset_task_busy
+        )
         if self._library_mutation_busy:
             for widget in (
                 self.edit_button,
+                self.trash_button,
                 self.guess_category_button,
                 self.guess_tags_button,
                 self.model_convert_button,
@@ -2807,6 +2927,7 @@ class DetailPanel(QFrame):
             for widget in (
                 self.path_button,
                 self.reveal_button,
+                self.trash_button,
                 self.houdini_send_button,
                 self.blender_send_button,
             ):
@@ -3313,6 +3434,10 @@ class DetailPanel(QFrame):
     def _edit(self) -> None:
         if self._asset:
             self.edit_requested.emit(self._asset)
+
+    def _trash(self) -> None:
+        if self._asset:
+            self.trash_requested.emit(self._asset)
 
     def _toggle_stock_playback(self) -> None:
         if not isinstance(self._asset, (LibraryStockAsset, LibraryVdbAsset)):
@@ -4199,14 +4324,22 @@ class AssetsTab(QWidget):
         self.view.setSpacing(2)
         self.view.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
         self.view.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
+        self.view.setStatusTip("Select an asset and press Space for Quick Look.")
         self.stock_hover_previews = StockHoverPreviewController(
             self.view, self.card_delegate
         )
+        self.quick_look = AssetQuickLookController(
+            self.view,
+            ASSET_ROLE,
+            selection_callback=self._selected,
+        )
+        self.proxy.modelReset.connect(self.quick_look.dismiss)
         self.detail = DetailPanel()
         self.detail.stock_playback_active_changed.connect(
             self.stock_hover_previews.set_suspended
         )
         self.detail.edit_requested.connect(self._edit_material)
+        self.detail.trash_requested.connect(self._move_asset_to_trash)
         self.detail.rating_requested.connect(self._rate_asset)
         self.detail.ai_guess_requested.connect(self._guess_asset_metadata)
         self.detail.model_convert_requested.connect(self._convert_model_to_usd)
@@ -4791,6 +4924,30 @@ class AssetsTab(QWidget):
             return
         self._save_material_edit(asset, dialog.metadata_update())
 
+    def _move_asset_to_trash(self, asset: AssetRecord) -> bool:
+        if (
+            self.metadata_update_active
+            or not self._library_path
+            or asset.category.casefold() == TRASH_CATEGORY.casefold()
+        ):
+            return False
+        dialog = MoveToTrashDialog(asset, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        self.quick_look.dismiss()
+        return self._save_material_edit(
+            asset,
+            AssetMetadataUpdate(
+                name=asset.name,
+                category=TRASH_CATEGORY,
+                tags=asset.tags,
+                author=asset.author,
+                description=asset.description,
+                physical_size=asset.physical_size,
+            ),
+            origin="trash",
+        )
+
     def _save_material_edit(
         self,
         asset: AssetRecord,
@@ -4983,7 +5140,12 @@ class AssetsTab(QWidget):
             self.apply_asset_update_incremental(updated)
         self.material_updated.emit(updated)
         self._set_library_mutation_busy(False)
-        self._show_completed_task("Updated 1 asset.", auto_hide=True)
+        self._show_completed_task(
+            "Moved 1 asset to Trash."
+            if origin == "trash"
+            else "Updated 1 asset.",
+            auto_hide=True,
+        )
         if origin.startswith("ai:"):
             operation = origin.partition(":")[2]
             if (

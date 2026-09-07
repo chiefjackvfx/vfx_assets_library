@@ -20,6 +20,7 @@ from universal_asset_library.domain import (
 SCHEMA_VERSION = 1
 DEFAULTS_VERSION = 1
 GENERIC_ICON_ID = "generic-category"
+TRASH_CATEGORY = "Trash"
 
 CATEGORY_FILENAMES = {
     "texture_set": "texture_categories.json",

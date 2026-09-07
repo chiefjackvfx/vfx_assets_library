@@ -810,6 +810,49 @@ def test_metadata_category_move_uses_readable_collision_suffix(tmp_path) -> None
     assert not asset.asset_dir.exists()
 
 
+def test_move_to_reserved_trash_category_is_recoverable(tmp_path) -> None:
+    _source, candidate = source_material(tmp_path)
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    asset = repository.import_materials([candidate]).imported[0]
+    payloads = {
+        path.relative_to(asset.asset_dir).as_posix(): path.read_bytes()
+        for path in asset.asset_dir.rglob("*")
+        if path.is_file() and path.name != "asset.json"
+    }
+
+    trashed = repository.update_asset_metadata(
+        asset.id,
+        AssetMetadataUpdate(
+            asset.name,
+            "Trash",
+            asset.tags,
+            asset.author,
+            asset.description,
+            asset.physical_size,
+        ),
+    )
+
+    assert trashed.category == "Trash"
+    assert trashed.asset_dir == library / "textures" / "trash" / asset.asset_dir.name
+    assert not asset.asset_dir.exists()
+    assert payloads == {
+        path.relative_to(trashed.asset_dir).as_posix(): path.read_bytes()
+        for path in trashed.asset_dir.rglob("*")
+        if path.is_file() and path.name != "asset.json"
+    }
+    assert repository.list_assets()[0].category == "Trash"
+    assert not repository.update_library().failed
+
+    restored = repository.update_asset_metadata(
+        asset.id,
+        AssetMetadataUpdate(asset.name, "Stone", asset.tags),
+    )
+    assert restored.category == "Stone"
+    assert restored.asset_dir == asset.asset_dir
+
+
 def test_metadata_category_move_rolls_back_when_manifest_write_fails(
     tmp_path, monkeypatch
 ) -> None:

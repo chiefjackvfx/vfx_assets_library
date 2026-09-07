@@ -20,6 +20,10 @@ QPushButton:pressed { background: #D85A28; border-color: #D85A28; }
 QPushButton#primaryButton { background: #FF6B35; border-color: #D85A28; color: #FFFFFF; }
 QPushButton#primaryButton:hover { background: #FF8357; border-color: #FF8357; }
 QPushButton#primaryButton:disabled { color: #6B7280; background: #252931; border-color: #2F3542; }
+QPushButton#dangerButton { background: #3A2529; color: #FFB4B4; border-color: #7A3D45; }
+QPushButton#dangerButton:hover { background: #9A3F4B; color: #FFFFFF; border-color: #C65B68; }
+QPushButton#dangerButton:pressed { background: #71313A; border-color: #9A3F4B; }
+QPushButton#dangerButton:disabled { color: #6B7280; background: #252931; border-color: #2F3542; }
 QPushButton:disabled { color: #6B7280; background: #252931; border-color: #2F3542; }
 QLabel#pageTitle { font-size: 24px; font-weight: bold; color: #FFFFFF; }
 QLabel#mutedLabel { color: #9CA3AF; }
