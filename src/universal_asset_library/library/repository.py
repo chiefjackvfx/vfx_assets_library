@@ -4315,21 +4315,34 @@ class LibraryRepository:
         copied_bytes = 0
         fingerprint_records: list[str] = []
         manifest_variants: dict[str, dict] = {}
+        used: set[str] = set()
         try:
             for label in material.resolution_labels:
                 variant = material.variants[label]
                 records: list[dict] = []
-                used: set[str] = set()
+                filenames = [
+                    _safe_filename(Path(item.relative_path).name)
+                    for item in variant.files
+                ]
+                # All LODs share volumes/. Prefix the entire variant on a
+                # collision so sequences retain a consistent frame pattern.
+                prefix = ""
+                counter = 1
+                while any(f"{prefix}{name}".casefold() in used for name in filenames):
+                    prefix = f"{_safe_component(label).lower()}_"
+                    if counter > 1:
+                        prefix += f"{counter}_"
+                    counter += 1
                 for source_file in variant.files:
                     source = _safe_source(material.source_root, source_file.relative_path)
-                    filename = _safe_filename(source.name)
+                    filename = prefix + _safe_filename(source.name)
                     stem, suffix = Path(filename).stem, Path(filename).suffix
                     counter = 2
                     while filename.casefold() in used:
                         filename = f"{stem}_{counter}{suffix}"
                         counter += 1
                     used.add(filename.casefold())
-                    destination = stage / "volumes" / _safe_component(label) / filename
+                    destination = stage / "volumes" / filename
                     size, digest = _copy_hash(
                         source, destination, material.name, progress, token,
                         completed_before + copied_bytes, total_bytes,
@@ -5981,7 +5994,7 @@ def _portable_candidate_diagnostics(material: MaterialCandidate, library_root: P
     )
     tail = (
         ("source", "textures", "16K") if isinstance(material, ModelCandidate)
-        else ("volumes", "high", "volume_1001.vdb") if isinstance(material, VdbCandidate)
+        else ("volumes", "volume_1001.vdb") if isinstance(material, VdbCandidate)
         else (f"{_filename_token(material.name)}{Path(material.source_video).suffix}",) if isinstance(material, StockCandidate)
         else ("maps", "16K")
     )

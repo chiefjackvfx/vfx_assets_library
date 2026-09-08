@@ -137,7 +137,23 @@ def normalize_channel(value: str) -> tuple[str, str, dict[str, str]]:
 class MegascansAdapter:
     def confidence(self, document: dict[str, Any], path: Path) -> int:
         has_maps = isinstance(document.get("maps"), list) or isinstance(document.get("components"), list)
-        return 100 if has_maps and "semanticTags" in document and "id" in document else 0
+        if not has_maps or not document.get("id"):
+            return 0
+        if "semanticTags" in document:
+            return 100
+        # Older Megascans downloads predate semanticTags. Require their
+        # surface/atlas category and map records, not just a generic id.
+        categories = document.get("categories")
+        if isinstance(categories, list) and any(
+            str(value).casefold() in {"surface", "atlas"} for value in categories
+        ) and any(
+            isinstance(item, dict) and item.get("type")
+            and (item.get("uri") or isinstance(item.get("uris"), list))
+            for key in ("maps", "components")
+            for item in (document.get(key) if isinstance(document.get(key), list) else [])
+        ):
+            return 90
+        return 0
 
     def parse(self, document: dict[str, Any], path: Path) -> MetadataFacts:
         semantic = document.get("semanticTags") if isinstance(document.get("semanticTags"), dict) else {}

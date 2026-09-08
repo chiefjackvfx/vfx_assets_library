@@ -8,6 +8,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from PyQt6.QtCore import QItemSelectionModel
 from PyQt6.QtCore import QAbstractListModel, QEvent, QModelIndex, QObject, QPoint, QPersistentModelIndex, QProcess, QRect, QRectF, QRunnable, QSettings, QSize, Qt, QSortFilterProxyModel, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
@@ -4478,6 +4479,15 @@ class AssetsTab(QWidget):
         )
         self.bulk_preview_button.hide()
         bulk_layout.addWidget(self.bulk_preview_button)
+        self.bulk_stop_deadline_button = QPushButton("Stop watching Deadline")
+        self.bulk_stop_deadline_button.setToolTip(
+            "Stop watching selected Deadline previews. Farm jobs and files remain untouched."
+        )
+        self.bulk_stop_deadline_button.clicked.connect(
+            self._stop_selected_deadline_previews
+        )
+        self.bulk_stop_deadline_button.hide()
+        bulk_layout.addWidget(self.bulk_stop_deadline_button)
         self.bulk_clear_button = QPushButton("Clear Selection")
         self.bulk_clear_button.clicked.connect(self._clear_asset_selection)
         bulk_layout.addWidget(self.bulk_clear_button)
@@ -4595,6 +4605,7 @@ class AssetsTab(QWidget):
         self.bulk_change_button.setEnabled(not active)
         self.bulk_ai_button.setEnabled(not active)
         self.bulk_preview_button.setEnabled(not active)
+        self.bulk_stop_deadline_button.setEnabled(not active)
         self.detail.set_library_mutation_busy(active)
         self.card_delegate.set_rating_enabled(not active)
         if changed:
@@ -5810,6 +5821,7 @@ class AssetsTab(QWidget):
         count = len(assets)
         self.bulk_count.setText(f"{count} assets selected")
         self.bulk_bar.setVisible(count > 1)
+        self._update_bulk_deadline_button()
         renderable_count = sum(
             isinstance(asset, LibraryHdriAsset)
             or isinstance(asset, LibraryTextureAsset)
@@ -6250,6 +6262,83 @@ class AssetsTab(QWidget):
         self._deadline_frame_signatures.pop(asset.id, None)
         self.card_delegate.clear_task_state(asset.id)
         self.apply_asset_updates((updated,))
+
+    def _can_stop_deadline_preview(self, asset: AssetRecord) -> bool:
+        return (
+            isinstance(asset, LibraryVdbAsset)
+            and asset.preview_render.get("backend") == DEADLINE_BACKEND
+            and asset.preview_render.get("status")
+            in {"preparing", "awaiting_deadline", "failed"}
+            and asset.id not in self._deadline_export_asset_ids
+            and asset.id != self._deadline_finalize_asset_id
+        )
+
+    def _update_bulk_deadline_button(self) -> None:
+        selected = self._selected_assets()
+        count = sum(self._can_stop_deadline_preview(asset) for asset in selected)
+        self.bulk_stop_deadline_button.setVisible(len(selected) > 1 and count > 0)
+        self.bulk_stop_deadline_button.setText(f"Stop watching Deadline ({count})")
+
+    def _stop_selected_deadline_previews(self) -> None:
+        if self.metadata_update_active or not self._library_path:
+            return
+        assets = tuple(
+            asset for asset in self._selected_assets()
+            if self._can_stop_deadline_preview(asset)
+        )
+        if not assets:
+            return
+        answer = QMessageBox.warning(
+            self,
+            "Stop watching selected Deadline previews",
+            f"Stop watching {len(assets)} selected preview(s)?\n\n"
+            + "\n".join(asset.name for asset in assets)
+            + "\n\nDeadline jobs will keep running. Shared USD and EXR files "
+            "will remain in place.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        repository = LibraryRepository(self._library_path)
+        updated_assets = []
+        failures = []
+        for asset in assets:
+            current = self._asset_by_id(asset.id)
+            # A preview may have finished while the confirmation was open.
+            if current is None or not self._can_stop_deadline_preview(current):
+                continue
+            try:
+                updated = repository.abandon_vdb_deadline_preview(
+                    current.id, asset_dir=current.asset_dir
+                )
+            except Exception as error:
+                failures.append(f"{current.name}: {error}")
+                continue
+            self._deadline_frame_signatures.pop(current.id, None)
+            self._deadline_frame_counts.pop(current.id, None)
+            self.card_delegate.clear_task_state(current.id)
+            updated_assets.append(updated)
+        # Publish once so the catalog index is updated without repeated resets.
+        if updated_assets:
+            selected_ids = {asset.id for asset in self._selected_assets()}
+            self.apply_asset_updates(updated_assets)
+            self.view.clearSelection()
+            for asset_id in selected_ids:
+                index = self._proxy_index_for_id(asset_id)
+                if index.isValid():
+                    self.view.selectionModel().select(
+                        index, QItemSelectionModel.SelectionFlag.Select
+                    )
+            self._show_completed_task(
+                f"Stopped watching {len(updated_assets)} Deadline preview(s).",
+                auto_hide=True,
+            )
+        self._update_bulk_deadline_button()
+        if failures:
+            QMessageBox.warning(
+                self, "Could not stop watching some previews", "\n".join(failures)
+            )
 
     def _change_selected_category(self) -> None:
         assets = self._selected_assets()

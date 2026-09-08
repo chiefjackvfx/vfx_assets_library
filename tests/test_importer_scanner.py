@@ -17,6 +17,57 @@ def image(path: Path, width: int = 1024, height: int = 1024) -> None:
     assert value.save(str(path))
 
 
+@pytest.mark.parametrize("manifest", [[], {"export": "Megascans"}])
+def test_collection_manifest_does_not_merge_materials(tmp_path, manifest) -> None:
+    (tmp_path / "megascansAsset.json").write_text(json.dumps(manifest))
+    for name in ("Stone", "Asphalt"):
+        folder = tmp_path / name
+        folder.mkdir()
+        (folder / "custom.json").write_text('{}')
+        image(folder / f"{name}_4K_Albedo.png", 4096, 8)
+    result = scan_texture_folder(tmp_path)
+    assert {m.source_root.name for m in result.materials} == {"Stone", "Asphalt"}
+    assert all(len(m.resolutions["4K"].maps["Base Color"]) == 1 for m in result.materials)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("schema", ["maps", "components"])
+def test_legacy_megascans_metadata_without_semantic_tags(tmp_path, nested, schema) -> None:
+    maps = tmp_path / "textures" if nested else tmp_path
+    maps.mkdir(exist_ok=True)
+    image(maps / "sfonaboa_4K_Albedo.png", 4096, 8)
+    relative = (maps / "sfonaboa_4K_Albedo.png").relative_to(tmp_path).as_posix()
+    document = {
+        "id": "sfonaboa", "name": "Coarse Asphalt", "physicalSize": "2x2",
+        "categories": ["surface", "Asphalt", "Coarse"], "tags": ["road"],
+        "maps": [{"uri": relative, "type": "albedo", "resolution": "4096x4096",
+                  "bitDepth": 16, "colorSpace": "sRGB"}],
+    }
+    if schema == "components":
+        record = document.pop("maps")[0]
+        document["components"] = [{"type": "albedo", "uris": [{"resolutions": [{
+            "resolution": "4096x4096", "formats": [record],
+        }]}]}]
+    (tmp_path / "sfonaboa.json").write_text(json.dumps(document))
+    material = scan_texture_folder(tmp_path).materials[0]
+    assert (material.name, material.provider, material.provider_id) == (
+        "Coarse Asphalt", "Megascans", "sfonaboa",
+    )
+    assert material.physical_size == "2x2"
+    texture = material.resolutions["4K"].maps["Base Color"][0]
+    assert texture.metadata_source == "json"
+    assert texture.bit_depth == 16
+
+
+def test_empty_archive_does_not_consume_preview_or_block_material(tmp_path) -> None:
+    (tmp_path / "missing.zip").touch()
+    image(tmp_path / "stone_4K_Albedo.png", 16, 16)
+    result = scan_texture_folder(tmp_path)
+    assert len(result.materials) == 1
+    assert any(d.code == "archive_empty" for d in result.diagnostics)
+    assert not result.temporary_roots
+
+
 def test_filename_only_material_detects_resolution_channels_and_preview(tmp_path) -> None:
     material = tmp_path / "2K_Bricks06"
     material.mkdir()

@@ -851,7 +851,7 @@ def test_repository_publishes_one_jpeg_and_retains_video(
     assert update.asset.preview_path is not None
     assert update.asset.preview_path.read_bytes() == b"video"
     assert captured["request"].vdb_path.endswith(
-        "/volumes/MID/cloud_formation_001_mid_res.vdb"
+        "/volumes/cloud_formation_001_mid_res.vdb"
     )
     assert captured["request"].density_scale == 240
     assert update.asset.preview_render["density_scale"] == 240

@@ -484,6 +484,61 @@ def test_vdb_preview_is_manual_only_and_uses_houdini_serial_queue(
     tab.shutdown_preview_queue()
 
 
+@pytest.mark.parametrize("confirm", [False, True])
+def test_bulk_stop_deadline_preserves_selection_and_unaffected_previews(
+    app, tmp_path, monkeypatch, confirm,
+) -> None:
+    source = tmp_path / "incoming"
+    source.mkdir()
+    library = tmp_path / "library"
+    library.mkdir()
+    for number in range(3):
+        (source / f"cloud_{number:03d}_Mid_Res.vdb").write_bytes(str(number).encode())
+    repository = LibraryRepository(library)
+    assets = repository.import_vdbs(scan_vdb_folder(source).materials).imported
+    for asset, status in zip(assets, ("awaiting_deadline", "failed", "ready")):
+        manifest = asset.asset_dir / "asset.json"
+        document = json.loads(manifest.read_text())
+        document["previews"]["render"] = {
+            "backend": assets_tab_module.DEADLINE_BACKEND, "status": status,
+        }
+        manifest.write_text(json.dumps(document))
+    assets = repository.list_vdb_assets()
+    tab = AssetsTab()
+    tab.section.blockSignals(True)
+    tab.section.setCurrentIndex(tab.section.findData("vdb"))
+    tab.section.blockSignals(False)
+    tab._library_path = str(library)
+    tab._all_assets = assets
+    tab._reindex_all_assets()
+    tab.source_model.replace(assets)
+    for row in range(3):
+        tab.view.selectionModel().select(
+            tab.proxy.index(row, 0), QItemSelectionModel.SelectionFlag.Select
+        )
+    prompts = []
+
+    def warning(_parent, _title, message, *_args):
+        prompts.append(message)
+        return QMessageBox.StandardButton.Yes if confirm else QMessageBox.StandardButton.Cancel
+
+    monkeypatch.setattr(QMessageBox, "warning", warning)
+    assert tab.bulk_stop_deadline_button.text() == "Stop watching Deadline (2)"
+    assert not tab.bulk_stop_deadline_button.isHidden()
+    tab.bulk_stop_deadline_button.click()
+
+    assert len(prompts) == 1
+    assert assets[0].name in prompts[0] and assets[1].name in prompts[0]
+    assert assets[2].name not in prompts[0]
+    assert [asset.preview_render["status"] for asset in repository.list_vdb_assets()] == (
+        ["canceled", "canceled", "ready"] if confirm
+        else ["awaiting_deadline", "failed", "ready"]
+    )
+    assert {asset.id for asset in tab._selected_assets()} == {asset.id for asset in assets}
+    assert tab.bulk_stop_deadline_button.isHidden() == confirm
+    tab.close()
+
+
 def test_multiple_selected_vdbs_offer_bulk_still_and_turntable_previews(
     app, tmp_path, monkeypatch
 ) -> None:

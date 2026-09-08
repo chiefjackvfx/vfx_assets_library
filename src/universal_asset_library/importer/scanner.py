@@ -355,6 +355,13 @@ def _archive_preview_pairs(
         )
     used_previews: set[Path] = set()
     for archive in archives:
+        if archive.stat().st_size == 0:
+            diagnostics.append(Diagnostic(
+                "warning", "archive_empty",
+                f"Skipped empty archive {archive.name}; download it again before importing.",
+                archive.relative_to(root).as_posix(), archive.stem,
+            ))
+            continue
         available = [
             path for path in previews_by_parent[archive.parent]
             if path not in used_previews
@@ -798,40 +805,49 @@ def _emit_scan_progress(
 
 def _discover_material_roots(root: Path, inventory: list[_InventoryEntry]) -> list[Path]:
     files_by_directory: dict[Path, list[_InventoryEntry]] = {}
-    subtree_channel_counts: dict[Path, int] = {}
     for entry in inventory:
         files_by_directory.setdefault(entry.path.parent, []).append(entry)
-        if entry.snapshot.kind != "image" or not _filename_channel(entry.path.name)[0]:
-            continue
-        parent = entry.path.parent
-        while _is_within(parent, root):
-            subtree_channel_counts[parent] = subtree_channel_counts.get(parent, 0) + 1
-            if parent == root:
-                break
-            parent = parent.parent
 
     anchored: list[Path] = []
     for directory, entries in files_by_directory.items():
         if any(entry.snapshot.kind == "json" for entry in entries):
-            if subtree_channel_counts.get(directory, 0) >= 1:
+            direct_maps = any(
+                entry.snapshot.kind == "image" and _filename_channel(entry.path.name)[0]
+                for entry in entries
+            )
+            # Export manifests and collection settings are not material roots:
+            # anchoring them would swallow every material beneath the folder.
+            facts = None
+            if not direct_maps:
+                facts, _ = _metadata_for_root(directory, [], [], entries)
+            if direct_maps or (facts and (facts.maps_by_path or facts.maps_by_basename)):
                 anchored.append(directory)
+
+    # Walk a folder's short ancestor chain instead of comparing it with every
+    # material in a large collection (thousands of Megascans packs).
+    anchor_set = set(anchored)
+
+    def covered(path: Path, parents: set[Path]) -> bool:
+        return path in parents or any(parent in parents for parent in path.parents)
 
     generic: list[Path] = []
     for directory, entries in files_by_directory.items():
-        if any(_is_within(directory, anchor) for anchor in anchored):
+        if covered(directory, anchor_set):
             continue
         channel_count = sum(1 for entry in entries if entry.snapshot.kind == "image" and _filename_channel(entry.path.name)[0])
         if channel_count < 1:
             continue
         candidate = directory.parent if directory.name.casefold() in MAP_CONTAINER_NAMES or _resolution_directory(directory.name) else directory
-        if not any(_is_within(candidate, anchor) for anchor in anchored):
+        if not covered(candidate, anchor_set):
             generic.append(candidate)
 
     roots: list[Path] = []
+    root_set: set[Path] = set()
     for candidate in sorted(set((*anchored, *generic)), key=lambda path: (len(path.parts), str(path).casefold())):
-        if any(_is_within(candidate, existing) for existing in roots):
+        if covered(candidate, root_set):
             continue
         roots.append(candidate)
+        root_set.add(candidate)
     return roots
 
 

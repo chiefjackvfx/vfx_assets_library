@@ -7,6 +7,7 @@ import pytest
 
 from universal_asset_library.domain import LibraryVdbAsset
 from universal_asset_library.importer import ScanCancellationToken, scan_vdb_folder
+from universal_asset_library.importer.models import VdbCandidate, VdbFile, VdbVariant
 from universal_asset_library.library import AssetMetadataPatch, LibraryRepository
 from universal_asset_library.library.catalog import decode_asset, encode_asset
 
@@ -111,6 +112,13 @@ def test_vdb_import_manifest_catalog_and_managed_layout(tmp_path: Path) -> None:
     assert asset.asset_dir == library / "vdbs" / "clouds" / "cloud-formation-001"
     assert list(asset.variants) == ["Low", "Mid", "High"]
     assert all((asset.asset_dir / variant.files[0].path).is_file() for variant in asset.variants.values())
+    assert all(
+        Path(variant.files[0].path).parent == Path("volumes")
+        for variant in asset.variants.values()
+    )
+    assert {path.name for path in (asset.asset_dir / "volumes").iterdir()} == {
+        f"cloud_formation_001_{label}_res.vdb" for label in ("low", "mid", "high")
+    }
     document = json.loads((asset.asset_dir / "asset.json").read_text(encoding="utf-8"))
     assert document["type"] == "vdb"
     assert document["variants"]["Mid"]["label"] == "Mid"
@@ -130,6 +138,46 @@ def test_vdb_import_manifest_catalog_and_managed_layout(tmp_path: Path) -> None:
     assert isinstance(moved, LibraryVdbAsset)
     assert moved.category == "Fog"
     assert moved.asset_dir.parent == library / "vdbs" / "fog"
+
+
+@pytest.mark.parametrize("frames", [(None,), (1001, 1002)])
+def test_flat_volume_lods_preserve_colliding_payloads_and_frame_patterns(
+    tmp_path: Path, frames,
+) -> None:
+    source = tmp_path / "incoming"
+    library = tmp_path / "library"
+    library.mkdir()
+    variants = {}
+    for label in ("Low", "Mid", "High"):
+        files = []
+        for frame in frames:
+            filename = "cloud.vdb" if frame is None else f"cloud_{frame:04d}.vdb"
+            relative = f"{label}/{filename}"
+            _vdb(source / relative, f"{label}-{frame}".encode())
+            files.append(VdbFile(relative, frame, 0 if frame is None else 4))
+        variants[label] = VdbVariant(label, files)
+    candidate = VdbCandidate(
+        source_root=source, name="Cloud", category="Clouds", variants=variants,
+    )
+
+    summary = LibraryRepository(library).import_vdbs([candidate])
+
+    assert not summary.failed
+    asset = summary.imported[0]
+    paths = []
+    for label, variant in asset.variants.items():
+        for item in variant.files:
+            path = asset.asset_dir / item.path
+            paths.append(path)
+            assert path.parent == asset.asset_dir / "volumes"
+            assert path.read_bytes() == f"{label}-{item.frame}".encode()
+        if frames[0] is not None:
+            assert variant.is_sequence
+            assert variant.padding == 4
+            names = [Path(item.path).name for item in variant.files]
+            assert names[0].endswith("_1001.vdb")
+            assert names[1] == names[0].replace("_1001.vdb", "_1002.vdb")
+    assert len(set(paths)) == len(frames) * 3
 
 
 def test_real_cloud_pack_scans_as_75_static_assets() -> None:

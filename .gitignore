@@ -10,3 +10,5 @@ build/
 temp_cache/
 *.egg-info/
 *.blend1
+graphify-out/
+*graphify*
