@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from html import escape
 
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QDesktopServices, QWheelEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -63,6 +63,7 @@ from universal_asset_library.integrations.blender import (
 )
 from universal_asset_library.importer import StockTaxonomyStore
 from universal_asset_library.categories import CategoryConfigStore
+from .polyhaven_panel import PolyHavenPanel
 
 
 class RepairSignals(QObject):
@@ -91,10 +92,11 @@ class RepairWorker(QRunnable):
 
 
 class LibraryUpdateWorker(QRunnable):
-    def __init__(self, library_path: str, cancel_token: CancelToken) -> None:
+    def __init__(self, library_path: str, cancel_token: CancelToken, dry_run: bool = False) -> None:
         super().__init__()
         self.library_path = library_path
         self.cancel_token = cancel_token
+        self.dry_run = dry_run
         self.signals = RepairSignals()
 
     def run(self) -> None:
@@ -102,6 +104,7 @@ class LibraryUpdateWorker(QRunnable):
             summary = LibraryRepository(self.library_path).update_library(
                 progress=self.signals.progress.emit,
                 cancel_token=self.cancel_token,
+                dry_run=self.dry_run,
             )
         except Exception:
             self.signals.failed.emit(traceback.format_exc(limit=5))
@@ -235,12 +238,25 @@ class BlenderBridgeWorker(QRunnable):
             self.signals.finished.emit(self.operation, result)
 
 
+class _SettingsComboBox(QComboBox):
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        # Let the page scroll, even when this control has keyboard focus.
+        event.ignore()
+
+
+class _SettingsSpinBox(QSpinBox):
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        event.ignore()
+
+
 class SettingsTab(QWidget):
     settings_saved = pyqtSignal(object)
     library_repaired = pyqtSignal(object)
     library_updated = pyqtSignal(object)
     houdini_bridge_changed = pyqtSignal()
     blender_bridge_changed = pyqtSignal()
+    polyhaven_imported = pyqtSignal(object)
+    polyhaven_busy_changed = pyqtSignal(bool)
 
     def __init__(self, store: SettingsStore, initial: AppSettings) -> None:
         super().__init__()
@@ -399,7 +415,13 @@ class SettingsTab(QWidget):
         self.update_library_button = QPushButton("Update / Fix Library")
         self.update_library_button.setObjectName("primaryButton")
         self.update_library_button.clicked.connect(self._confirm_library_update)
+        self.dry_run_library_button = QPushButton("Dry run")
+        self.dry_run_library_button.setToolTip(
+            "Preview category additions and library updates without changing any files."
+        )
+        self.dry_run_library_button.clicked.connect(lambda: self._start_library_update(dry_run=True))
         update_row.addWidget(self.update_status, 1)
+        update_row.addWidget(self.dry_run_library_button)
         update_row.addWidget(self.update_library_button)
         maintenance_layout.addLayout(update_row)
         recovery_row = QHBoxLayout()
@@ -437,7 +459,7 @@ class SettingsTab(QWidget):
         form = QFormLayout()
         form.setHorizontalSpacing(28)
         form.setVerticalSpacing(14)
-        self.thumbnail_size = QComboBox()
+        self.thumbnail_size = _SettingsComboBox()
         self.thumbnail_size.addItem("Small — more textures", "small")
         self.thumbnail_size.addItem("Medium — balanced", "medium")
         self.thumbnail_size.addItem("Large — bigger previews", "large")
@@ -447,9 +469,9 @@ class SettingsTab(QWidget):
         self.stock_hover_previews.setToolTip(
             "Uses the managed low-resolution preview and remains muted."
         )
-        self.default_category = QComboBox()
+        self.default_category = _SettingsComboBox()
         self.default_category.addItems(TEXTURE_CATEGORIES)
-        self.default_model_category = QComboBox()
+        self.default_model_category = _SettingsComboBox()
         self.default_model_category.addItems(MODEL_CATEGORIES)
         form.addRow("Thumbnail size", self.thumbnail_size)
         form.addRow("Grid previews", self.stock_hover_previews)
@@ -491,7 +513,7 @@ class SettingsTab(QWidget):
         self.blender_status.setWordWrap(True)
         blender_parallel_row = QHBoxLayout()
         blender_parallel_label = QLabel("Parallel Blender preview renders")
-        self.blender_parallel_renders = QSpinBox()
+        self.blender_parallel_renders = _SettingsSpinBox()
         self.blender_parallel_renders.setRange(
             1, BLENDER_PREVIEW_MAX_WORKERS
         )
@@ -525,7 +547,7 @@ class SettingsTab(QWidget):
         self.houdini_preview_status.setWordWrap(True)
         vdb_parallel_row = QHBoxLayout()
         vdb_parallel_label = QLabel("Parallel VDB turntable renders")
-        self.vdb_parallel_renders = QSpinBox()
+        self.vdb_parallel_renders = _SettingsSpinBox()
         self.vdb_parallel_renders.setRange(1, VDB_TURNTABLE_MAX_WORKERS)
         self.vdb_parallel_renders.setValue(2)
         self.vdb_parallel_renders.setSuffix(" instances")
@@ -680,6 +702,12 @@ class SettingsTab(QWidget):
         blender_bridge_layout.addWidget(self.blender_bridge_status)
         root.addWidget(blender_bridge_panel)
         self._refresh_blender_installations()
+
+        self.polyhaven_panel = PolyHavenPanel(self)
+        self.polyhaven_panel.preferences_changed.connect(self._changed)
+        self.polyhaven_panel.busy_changed.connect(self._polyhaven_busy_changed)
+        self.polyhaven_panel.imported.connect(self.polyhaven_imported)
+        root.insertWidget(3, self.polyhaven_panel)
 
         future = QLabel(
             "Later settings: filename-token mappings, scan on startup, thumbnail cache, "
@@ -1046,6 +1074,7 @@ class SettingsTab(QWidget):
 
     def _draft(self) -> AppSettings:
         return AppSettings(
+            polyhaven=self.polyhaven_panel.preferences(),
             library_path=self.library_path.text(),
             thumbnail_size=str(self.thumbnail_size.currentData()),
             default_import_category=self.default_category.currentText(),
@@ -1067,6 +1096,7 @@ class SettingsTab(QWidget):
 
     def _show(self, settings: AppSettings) -> None:
         self._loading = True
+        self.polyhaven_panel.set_preferences(settings.polyhaven)
         self.library_path.setText(settings.library_path)
         self._refresh_texture_categories(settings.library_path, settings.default_import_category)
         size_index = self.thumbnail_size.findData(settings.thumbnail_size)
@@ -1152,6 +1182,7 @@ class SettingsTab(QWidget):
         if self._loading:
             return
         draft = self._draft()
+        self.polyhaven_panel.set_context(self._saved, draft.library_path)
         valid, message = validate_library_path(draft.library_path)
         if not valid:
             color = "#ef7d7d"
@@ -1169,6 +1200,17 @@ class SettingsTab(QWidget):
         if dirty:
             self.save_message.clear()
         self._update_repair_button(draft, valid)
+        if self.polyhaven_panel.busy:
+            self.save_button.setEnabled(False)
+            self.reset_button.setEnabled(False)
+
+    def _polyhaven_busy_changed(self, active: bool) -> None:
+        self._set_controls_for_repair(active)
+        self.repair_cancel.setEnabled(False)
+        if not active:
+            self._changed()
+            self.refresh_maintenance_state()
+        self.polyhaven_busy_changed.emit(active)
 
     def _save(self) -> None:
         try:
@@ -1216,7 +1258,7 @@ class SettingsTab(QWidget):
 
     def refresh_maintenance_state(self) -> None:
         """Queue a coalesced maintenance inspection for the saved library."""
-        if self._inspection_shutdown:
+        if self._inspection_shutdown or self.polyhaven_panel.busy:
             return
         self._inspection_requested = True
         self._inspection_generation += 1
@@ -1261,6 +1303,7 @@ class SettingsTab(QWidget):
         QThreadPool.globalInstance().start(worker, -1)
 
     def _set_inspection_busy(self, active: bool) -> None:
+        self.polyhaven_panel.set_blocked(active or self._repairing or self._maintenance_worker is not None)
         self.refresh_maintenance_button.setEnabled(
             not active and bool(self._saved.library_path)
         )
@@ -1271,6 +1314,7 @@ class SettingsTab(QWidget):
             for widget in (
                 self.repair_button,
                 self.update_library_button,
+                self.dry_run_library_button,
                 self.cleanup_staging_button,
                 self.recover_lock_button,
             ):
@@ -1387,6 +1431,7 @@ class SettingsTab(QWidget):
         self.refresh_maintenance_state()
 
     def shutdown_maintenance(self) -> None:
+        self.polyhaven_panel.cancel()
         self._inspection_shutdown = True
         self._inspection_pending = False
         self._inspection_generation += 1
@@ -1394,7 +1439,8 @@ class SettingsTab(QWidget):
     def _update_repair_button(self, draft: AppSettings, valid: bool) -> None:
         saved_path = self._saved.library_path
         ready = (
-            not self._repairing
+            not self.polyhaven_panel.busy
+            and not self._repairing
             and self._inspection_worker is None
             and valid
             and bool(saved_path)
@@ -1406,7 +1452,8 @@ class SettingsTab(QWidget):
         self.repair_button.setText(f"Rename existing assets ({self._legacy_count})" if self._legacy_count else "Asset names up to date")
         self.repair_button.setEnabled(ready)
         update_ready = (
-            not self._repairing
+            not self.polyhaven_panel.busy
+            and not self._repairing
             and self._inspection_worker is None
             and valid
             and bool(saved_path)
@@ -1417,6 +1464,11 @@ class SettingsTab(QWidget):
         label = f"Update / Fix Library ({self._library_update_count})" if self._library_update_count else "Check / Fix Library"
         self.update_library_button.setText(label)
         self.update_library_button.setEnabled(update_ready)
+        self.dry_run_library_button.setEnabled(
+            not self.polyhaven_panel.busy and not self._repairing and self._inspection_worker is None
+            and valid and bool(saved_path) and draft.library_path == saved_path
+            and os.path.isdir(saved_path)
+        )
 
     def _confirm_library_update(self) -> None:
         answer = QMessageBox.question(
@@ -1424,6 +1476,8 @@ class SettingsTab(QWidget):
             "Update and validate library?",
             "Validate all catalog manifests, convert legacy secondary categories into tags, remove the reserved “surface” term, "
             "register manually added Preview/Hero/Thumbnail images, upgrade older HDRI/model layouts, and flatten legacy Stock assets into their category folders.\n\n"
+            "Existing unrecognized categories will be preserved as custom categories, with backups of changed category configuration files. "
+            "Category reconciliation does not move assets or change their IDs. Use Dry run first to review additions and planned updates.\n\n"
             "Updates use the library lock, staging, validation, and atomic replacement.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
@@ -1431,14 +1485,14 @@ class SettingsTab(QWidget):
         if answer == QMessageBox.StandardButton.Yes:
             self._start_library_update()
 
-    def _start_library_update(self) -> None:
+    def _start_library_update(self, dry_run: bool = False) -> None:
         if self._repairing or not self._saved.library_path:
             return
         self._repairing = True
         self._reported_maintenance_failures.clear()
         self.maintenance_log.clear()
         self._append_maintenance_log(
-            f"Starting Update / Fix Library: {self._saved.library_path}"
+            f"Starting {'Dry run (no files changed)' if dry_run else 'Update / Fix Library'}: {self._saved.library_path}"
         )
         self._append_maintenance_log(
             f"Found {self._library_update_count} asset or manifest operation(s) to process."
@@ -1450,7 +1504,7 @@ class SettingsTab(QWidget):
         self.repair_progress.show()
         self.repair_cancel.show()
         self.update_status.setText("Validating and updating the library…")
-        worker = LibraryUpdateWorker(self._saved.library_path, self._repair_token)
+        worker = LibraryUpdateWorker(self._saved.library_path, self._repair_token, dry_run=dry_run)
         self._update_worker = worker
         worker.signals.progress.connect(self._library_update_progressed)
         worker.signals.finished.connect(self._library_update_finished)
@@ -1484,9 +1538,24 @@ class SettingsTab(QWidget):
         self._set_controls_for_repair(False)
         self.repair_progress.hide()
         self.repair_cancel.hide()
-        if summary.updated:
+        if not summary.dry_run and (summary.updated or summary.categories_preserved):
             self.library_updated.emit(summary)
-        parts = [f"Updated {len(summary.updated)}", f"valid {summary.valid}"]
+        parts = (
+            ["Dry run — no files changed", f"planned updates {len(summary.planned_updates)}"]
+            if summary.dry_run else [f"Updated {len(summary.updated)}", f"valid {summary.valid}"]
+        )
+        category_count = sum(len(names) for names in summary.categories_preserved.values())
+        if category_count:
+            parts.append(f"{'proposed' if summary.dry_run else 'preserved'} categories {category_count}")
+        for asset_type, names in summary.categories_preserved.items():
+            for name, count in names.items():
+                self._append_maintenance_log(
+                    f"{'WOULD PRESERVE' if summary.dry_run else 'PRESERVED'} "
+                    f"{asset_type} category {name!r}: {count} asset(s)"
+                )
+        if summary.dry_run:
+            for operation in summary.planned_updates:
+                self._append_maintenance_log(f"WOULD UPDATE {operation}")
         if summary.failed:
             parts.append(f"needs attention {len(summary.failed)}")
         if summary.canceled:
@@ -1620,6 +1689,7 @@ class SettingsTab(QWidget):
         self.repair_status.setStyleSheet("color: #ef7d7d;")
 
     def _set_controls_for_repair(self, active: bool) -> None:
+        self.polyhaven_panel.set_blocked(active and not self.polyhaven_panel.busy)
         for widget in (
             self.library_path,
             self.browse_button,
@@ -1634,6 +1704,7 @@ class SettingsTab(QWidget):
             self.reset_button,
             self.repair_button,
             self.update_library_button,
+            self.dry_run_library_button,
             self.cleanup_staging_button,
             self.recover_lock_button,
             self.refresh_maintenance_button,

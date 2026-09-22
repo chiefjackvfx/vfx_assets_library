@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -59,6 +60,7 @@ from universal_asset_library.importer.stock_scanner import (
     resolve_ffprobe,
 )
 from universal_asset_library.categories import (
+    CategoryDefinition, category_icon_id,
     TRASH_CATEGORY,
     CategoryCatalog,
     CategoryConfigStore,
@@ -225,6 +227,9 @@ class LibraryUpdateSummary:
     valid: int = 0
     failed: dict[str, str] = field(default_factory=dict)
     canceled: bool = False
+    dry_run: bool = False
+    categories_preserved: dict[str, dict[str, int]] = field(default_factory=dict)
+    planned_updates: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -2455,16 +2460,30 @@ class LibraryRepository:
         self,
         progress: Callable[[RepairProgress], None] | None = None,
         cancel_token: CancelToken | None = None,
+        dry_run: bool = False,
     ) -> LibraryUpdateSummary:
         """Validate manifests and safely update legacy HDRI, model, and Stock layouts."""
         token = cancel_token or CancelToken()
-        self.initialize()
-        summary = LibraryUpdateSummary()
-        with _ImportLock(self.root / ".ual" / "import.lock"):
+        summary = LibraryUpdateSummary(dry_run=dry_run)
+        if token.cancelled:
+            summary.canceled = True
+            return summary
+        if not dry_run:
+            self.initialize()
+        with nullcontext() if dry_run else _ImportLock(self.root / ".ual" / "import.lock"):
+            catalogs, additions = self._category_reconciliation_plan(token)
+            if token.cancelled:
+                summary.canceled = True
+                return summary
+            summary.categories_preserved = additions
+            if not dry_run:
+                store = CategoryConfigStore(self.root)
+                for asset_type, names in additions.items():
+                    store.preserve_categories(asset_type, list(names))
             hdri_candidates, failures = self._hdri_layout_candidates()
             model_candidates, model_failures = self._model_layout_candidates()
             stock_candidates, stock_failures = self._stock_layout_candidates()
-            metadata_candidates, metadata_failures = self._metadata_migration_candidates()
+            metadata_candidates, metadata_failures = self._metadata_migration_candidates(catalogs)
             preview_candidates, preview_failures = self._preview_repair_candidates()
             failures.update(model_failures)
             failures.update(stock_failures)
@@ -2486,7 +2505,7 @@ class LibraryRepository:
             normalized_layout_candidates = []
             for kind, path, document in layout_candidates:
                 updated = (
-                    self._single_category_document(document)
+                    self._single_category_document(document, catalogs)
                     if path in metadata_by_path else document
                 )
                 if path in preview_by_path:
@@ -2500,7 +2519,7 @@ class LibraryRepository:
             for path in sorted(manifest_paths, key=lambda value: str(value).casefold()):
                 document = metadata_by_path.get(path) or preview_by_path[path]
                 if path in metadata_by_path:
-                    document = self._single_category_document(document)
+                    document = self._single_category_document(document, catalogs)
                 if path in preview_by_path:
                     document = _merge_preview_repair(document, preview_by_path[path])
                 manifest_candidates.append(("metadata", path, document))
@@ -2508,6 +2527,10 @@ class LibraryRepository:
                 normalized_layout_candidates
                 + manifest_candidates
             )
+            summary.planned_updates = [f"{kind}: {path}" for kind, path, _ in candidates]
+            if dry_run:
+                summary.canceled = token.cancelled
+                return summary
             if candidates:
                 # Updates are published and cleaned one asset at a time, so
                 # only the largest candidate needs simultaneous staging space.
@@ -2571,8 +2594,45 @@ class LibraryRepository:
                     summary.valid += 1
         return summary
 
+    def _category_reconciliation_plan(
+        self, token: CancelToken,
+    ) -> tuple[dict[str, CategoryCatalog], dict[str, dict[str, int]]]:
+        store = CategoryConfigStore(self.root)
+        catalogs: dict[str, CategoryCatalog] = {}
+        additions: dict[str, dict[str, int]] = {}
+        for path in sorted(_asset_manifest_paths(self.root), key=str):
+            if token.cancelled:
+                break
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(document, dict):
+                    continue
+                asset_type = str(document.get("type", "texture_set"))
+                primary = _manifest_primary_category(document)
+                # Only category labels, never path-like or malformed values.
+                if not isinstance(document.get("category", ""), str) or any(
+                    ord(char) < 32 or char in "/\\" for char in primary
+                ):
+                    continue
+                store.path_for(asset_type)
+            except (OSError, ValueError, TypeError):
+                continue  # Normal validation reports broken manifests below.
+            if asset_type not in catalogs:
+                catalogs[asset_type] = store.load_strict(asset_type)
+            catalog = catalogs[asset_type]
+            canonical = _canonical_metadata_category(catalog, primary)
+            if canonical is None:
+                catalogs[asset_type] = CategoryCatalog(asset_type, (
+                    *catalog.categories, CategoryDefinition(primary, category_icon_id(primary)),
+                ))
+                additions.setdefault(asset_type, {})[primary] = 1
+            elif canonical in additions.get(asset_type, {}):
+                additions[asset_type][canonical] += 1
+        return catalogs, additions
+
     def _metadata_migration_candidates(
         self,
+        catalogs: dict[str, CategoryCatalog] | None = None,
     ) -> tuple[list[tuple[Path, dict]], dict[str, str]]:
         candidates: list[tuple[Path, dict]] = []
         failures: dict[str, str] = {}
@@ -2581,7 +2641,7 @@ class LibraryRepository:
             try:
                 document = json.loads(path.read_text(encoding="utf-8"))
                 asset_type = str(document.get("type", "texture_set"))
-                catalog = store.load(asset_type)
+                catalog = (catalogs or {}).get(asset_type) or store.load(asset_type)
                 primary = _manifest_primary_category(document)
                 if _canonical_metadata_category(catalog, primary) is None:
                     raise ValueError(
@@ -2627,10 +2687,12 @@ class LibraryRepository:
         _atomic_json(manifest_path, updated)
         return asset
 
-    def _single_category_document(self, document: dict) -> dict:
+    def _single_category_document(
+        self, document: dict, catalogs: dict[str, CategoryCatalog] | None = None,
+    ) -> dict:
         updated = json.loads(json.dumps(document))
         asset_type = str(updated.get("type", "texture_set"))
-        catalog = CategoryConfigStore(self.root).load(asset_type)
+        catalog = (catalogs or {}).get(asset_type) or CategoryConfigStore(self.root).load(asset_type)
         raw_primary = str(updated.get("category", "")).strip()
         if not raw_primary:
             legacy = _normalized_values(updated.get("categories", ()))
@@ -4554,6 +4616,9 @@ class LibraryRepository:
                     "size": size,
                     "sha256": digest,
                 })
+                package = next((value for value in material.provider_packages if value.entry_path == item.relative_path), None)
+                if package:
+                    model_manifest[-1]["resolution"] = package.resolution
 
             texture_manifest: dict[str, dict] = {}
             for set_name, texture_set in sorted(material.texture_sets.items(), key=lambda value: value[0].casefold()):
@@ -4638,6 +4703,8 @@ class LibraryRepository:
                 ],
                 "fingerprint": fingerprint,
             }
+            if material.provider_packages:
+                manifest["provider_packages"] = _import_model_packages(material, stage, copied, token)
             _atomic_json(stage / "asset.json", manifest)
             asset = _asset_from_manifest(manifest, stage)
             if not isinstance(asset, LibraryModelAsset):
@@ -6306,6 +6373,33 @@ def _primary_file_records(material: MaterialCandidate):
         for channel in sorted(variant.maps, key=str.casefold):
             for texture_file in variant.maps[channel]:
                 yield label, channel, texture_file
+
+
+def _import_model_packages(material: ModelCandidate, stage: Path, copied: dict, token: CancelToken) -> list[dict]:
+    """Keep scene-relative dependencies valid after managed filename changes."""
+    packages = []
+    for package in material.provider_packages:
+        token.check()
+        entry, size, digest = copied[package.entry_path]
+        records = [{"path": entry, "role": "entry", "size": size, "sha256": digest}]
+        for relative, source in package.dependencies.items():
+            token.check()
+            stored, size, digest = copied[source]
+            reference = (Path(entry).parent / _safe_manifest_path(relative)).as_posix()
+            destination = stage / reference
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                if _sha256_path(destination) != digest:
+                    raise LibraryError(f"Conflicting model dependency: {reference}")
+            else:
+                try:
+                    os.link(stage / stored, destination)
+                except OSError:
+                    shutil.copy2(stage / stored, destination)
+            records.append({"path": stored, "reference_path": reference, "role": "dependency", "size": size, "sha256": digest})
+        packages.append({"kind": package.kind, "resolution": package.resolution, "entry_path": entry,
+                         "downloaded_at": _utc_now(), "files": records})
+    return packages
 
 
 def _model_source_destinations(material: ModelCandidate) -> dict[str, str]:

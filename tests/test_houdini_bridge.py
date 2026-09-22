@@ -126,8 +126,8 @@ def test_installer_detects_installs_updates_and_uninstalls(tmp_path) -> None:
     assert config.stat().st_mode & 0o077 == 0
     package = json.loads((h21 / "packages" / "shotbox_assets_bridge.json").read_text(encoding="utf-8"))
     assert package["enable"] is True
-    assert package["version"] == "0.7.0"
-    assert package["path"].endswith("shotbox-assets-plugin-0.7.0")
+    assert package["version"] == "0.7.1"
+    assert package["path"].endswith("shotbox-assets-plugin-0.7.1")
     plugin_root = Path(package["path"])
     assert (plugin_root / "python3.11libs" / "uiready.py").is_file()
     assert (plugin_root / "python3.13libs" / "uiready.py").is_file()

@@ -50,6 +50,14 @@ python -m pip install -e '.[dev]'
 pytest
 ```
 
+## Poly Haven downloads
+
+In **Settings → Poly Haven**, choose HDRIs, textures and/or models and a resolution for each (4K by default), then **Save settings**. **Check for new assets** compares the complete Poly Haven catalogue with the saved library, including older assets you have never imported. Review the selected assets and download sizes, then choose **Download selected**.
+
+Owned assets are skipped at any resolution. Older imports are also matched through stored Poly Haven metadata; uncertain name/filename matches appear unchecked for review. HDRIs prefer EXR, texture sets use one best available format per map, and models include USD and Blender packages with their required textures. The review shows resolution fallbacks and packages that are unavailable.
+
+Downloads run in the background with progress and cancellation. Files download locally into **Downloads/ShotBox/PolyHaven** first, then verified assets are imported into your main library, including libraries on network drives. The panel shows the resolved system Downloads path; keep **Settings → Library** pointed at your main library. Both locations need free space, and staging files are cleaned up after import or cancellation. Completed imports survive cancellation or another asset failing. Check again to retry missing assets. Automatic preview settings also apply to these imports. Assets and metadata are provided by [Poly Haven](https://polyhaven.com/our-api); no API key is required.
+
 ## HDRI composite previews
 
 HDRI imports can use the immutable `templates/hdri_preview.blend` scene to generate one clean 1024×768 preview without text or resolution badges: the source equirectangular image is directly resized and tone-mapped to 1024×512 above a 1024×256 sphere render from the template. It is not projected through another camera or mapped to geometry. Both the catalog card and inspector use this same `_HDRI_Preview.jpg`; no separate generated thumbnail is stored. When the source package already includes a WebP preview, that image is converted directly to JPEG and the Blender render is skipped. The driver replaces only `World.001`'s `Environment Texture` image and explicitly renders with the first available Cycles GPU backend in OptiX, CUDA, HIP, oneAPI, then Metal order; the template's camera, geometry, materials, render engine, sampling, denoising, and color management remain authoritative.
@@ -182,6 +190,8 @@ The Assets catalog uses an expandable category rail beside the asset grid. It st
 
 Portable category order, suggestions, aliases, and bundled icon IDs live in `.ual/texture_categories.json`, `.ual/atlas_categories.json`, `.ual/hdri_categories.json`, `.ual/model_categories.json`, `.ual/vdb_categories.json`, and `.ual/stock_categories.json`. Missing files are created from defaults without replacing existing edits. Unknown icon IDs use the generic icon, and invalid configuration falls back to built-in categories with a library warning. Stock aliases continue to drive filename and folder classification.
 
-**Settings → Update / Fix Library** migrates older `categories` arrays by preserving the manifest's primary `category`, moving useful secondary values into lowercase tags, removing `surface`, and atomically publishing the validated manifest. Unknown primary categories are reported for taxonomy attention rather than guessed.
+**Settings → Dry run** reports proposed category additions (with affected-asset counts), planned layout/metadata/preview updates, and remaining failures without changing library files. The plan is advisory: applying maintenance rescans the current library under its write lock.
+
+**Settings → Update / Fix Library** preserves unrecognized primary categories as custom entries in the corresponding `.ual/*_categories.json` file, keeping existing entries, aliases, and custom fields. Changed category files receive uniquely named `.bak` recovery copies; broken custom configuration is not overwritten. Category reconciliation itself does not move assets or change their IDs. Maintenance then migrates older `categories` arrays by preserving the primary category, moving useful secondary values into lowercase tags, removing `surface`, and atomically publishing the validated manifest.
 
 See [SHOTBOX_ASSETS_PLAN.md](SHOTBOX_ASSETS_PLAN.md) for the deliberately reduced roadmap.

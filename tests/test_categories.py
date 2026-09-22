@@ -72,6 +72,26 @@ def test_category_store_invalid_document_uses_defaults_without_rewriting(tmp_pat
     assert any("Built-in categories" in warning for warning in store.last_warnings)
 
 
+def test_preserve_categories_keeps_custom_fields_aliases_and_deduplicates(tmp_path) -> None:
+    store = CategoryConfigStore(tmp_path)
+    store.ensure_defaults()
+    path = store.path_for("model")
+    document = json.loads(path.read_text())
+    document["custom_note"] = "keep this"
+    document["categories"][0]["custom_field"] = {"value": 1}
+    path.write_text(json.dumps(document))
+    before = path.read_bytes()
+    store.preserve_categories("model", ["Edible", "edible", "Chapel"])
+    after = json.loads(path.read_text())
+    assert after["custom_note"] == "keep this"
+    assert after["categories"][:-2] == document["categories"]
+    assert [c["name"] for c in after["categories"][-2:]] == ["Edible", "Chapel"]
+    backups = list(path.parent.glob('model_categories.json.*.bak'))
+    assert len(backups) == 1 and backups[0].read_bytes() == before
+    store.preserve_categories("model", ["EDIBLE", "chapel"])
+    assert len(list(path.parent.glob('model_categories.json.*.bak'))) == 1
+
+
 def test_texture_defaults_cover_real_library_primary_categories() -> None:
     catalog = default_category_catalog("texture_set")
 

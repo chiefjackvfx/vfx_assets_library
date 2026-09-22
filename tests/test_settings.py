@@ -33,6 +33,19 @@ def test_defaults_and_round_trip(tmp_path) -> None:
     assert saved.husk_submitter_path == DEFAULT_HUSK_SUBMITTER
 
 
+def test_polyhaven_preferences_round_trip_and_invalid_resolution(tmp_path) -> None:
+    from universal_asset_library.polyhaven_settings import PolyHavenSyncPreferences
+
+    store = make_store(tmp_path)
+    saved = store.save(AppSettings(polyhaven=PolyHavenSyncPreferences(
+        textures=False, hdri_resolution="8K", texture_resolution="invalid", model_resolution="Highest available",
+    )))
+    assert store.load() == saved
+    assert saved.polyhaven.texture_resolution == "4K"
+    assert not saved.polyhaven.textures
+    assert saved.polyhaven.model_resolution == "Highest available"
+
+
 def test_deadline_husk_paths_round_trip(tmp_path) -> None:
     store = make_store(tmp_path)
     command = tmp_path / "deadlinecommand"

@@ -222,6 +222,16 @@ class ModelTextureSet:
 
 
 @dataclass(slots=True)
+class ModelPackageSource:
+    """A provider scene and its dependency paths relative to that scene."""
+
+    kind: str
+    resolution: str
+    entry_path: str
+    dependencies: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class ModelCandidate(MaterialCandidate):
     model_files: list[ModelFile] = field(default_factory=list)
     lods: dict[str, ModelLod] = field(default_factory=dict)
@@ -230,6 +240,7 @@ class ModelCandidate(MaterialCandidate):
     polycount: int | None = None
     excluded_paths: dict[str, str] = field(default_factory=dict)
     asset_type: str = "model"
+    provider_packages: list[ModelPackageSource] = field(default_factory=list)
 
     @property
     def usd_ready(self) -> bool:

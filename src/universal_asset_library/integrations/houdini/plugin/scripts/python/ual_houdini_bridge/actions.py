@@ -338,25 +338,33 @@ def import_fbx_model(hou, payload, session_id):
     with hou.undos.group("Import FBX model from ShotBox Assets"):
         try:
             material_children = {
-                id(child) for child in _network_children_by_path(hou, ("/mat", "/shop"))
+                child.sessionId() for child in _network_children_by_path(hou, ("/mat", "/shop"))
             }
-            result = hou.hipFile.importFBX(
-                model_path.as_posix(),
-                suppress_save_prompt=True,
-                merge_into_scene=True,
-                import_cameras=False,
-                import_joints_and_skin=False,
-                import_geometry=True,
-                import_lights=False,
-                import_animation=False,
-                import_materials=bool(texture_sets),
-                convert_file_paths_to_relative=False,
-                unlock_geometry=True,
-                unlock_deformations=False,
-                import_nulls_as_subnets=True,
-                import_into_object_subnet=True,
-                override_scene_frame_range=False,
-            )
+            try:
+                result = hou.hipFile.importFBX(
+                    model_path.as_posix(),
+                    suppress_save_prompt=True,
+                    merge_into_scene=True,
+                    import_cameras=False,
+                    import_joints_and_skin=False,
+                    import_geometry=True,
+                    import_lights=False,
+                    import_animation=False,
+                    import_materials=bool(texture_sets),
+                    convert_file_paths_to_relative=False,
+                    unlock_geometry=True,
+                    unlock_deformations=False,
+                    import_nulls_as_subnets=True,
+                    import_into_object_subnet=True,
+                    override_scene_frame_range=False,
+                )
+            finally:
+                # HOM can return new Python wrappers for the same Houdini node.
+                # Only native materials created by this import may be removed.
+                native_materials = [
+                    child for child in _network_children_by_path(hou, ("/mat", "/shop"))
+                    if child.sessionId() not in material_children
+                ]
             if not isinstance(result, tuple) or not result:
                 raise ActionError("Houdini's FBX importer did not return an imported object subnet.")
             imported_root = result[0]
@@ -366,10 +374,6 @@ def import_fbx_model(hou, payload, session_id):
             imported_sops = _fbx_geometry_outputs(imported_root)
             if not imported_sops:
                 raise ActionError("The FBX file did not produce any importable SOP geometry.")
-            native_materials = [
-                child for child in _network_children_by_path(hou, ("/mat", "/shop"))
-                if id(child) not in material_children
-            ]
             if texture_sets:
                 builders, assignments = _setup_fbx_materials(
                     hou, imported_sops, texture_sets,
@@ -775,8 +779,9 @@ def _setup_fbx_materials(
         for key, item in used_sets.items():
             builder, surface, displacement = _create_usd_materialx_builder(
                 material_network,
-                f"shotbox_{_slug(asset_name)}_{_slug(item['name'])}_{instance_id[:8]}",
+                f"{_slug(asset_name)}_{_slug(item['name'])}_{instance_id[:8]}",
             )
+            builders.append(builder)
             _mark_model_node(
                 builder, asset_id, asset_name, instance_id,
                 f"{item['resolution']} · FBX Material", "sop", model_path,
@@ -787,13 +792,13 @@ def _setup_fbx_materials(
             sources = _materialx_sources(builder, item["maps"])
             _build_materialx_graph(builder, surface, displacement, sources)
             _layout_materialx_graph(builder)
-            builders.append(builder)
             built[key] = builder
 
         for sop, bindings in assignments_by_sop:
             assignment = _create_first_node(
                 sop.parent(), ("material",), f"assign_{_slug(asset_name)}"
             )
+            assignments.append(assignment)
             assignment.setInput(0, sop)
             _set_first_parm(
                 assignment, ("num_materials", "nummaterials"), len(bindings), required=False
@@ -820,7 +825,6 @@ def _setup_fbx_materials(
                 assignment.moveToGoodPosition()
             except Exception:
                 pass
-            assignments.append(assignment)
         return builders, assignments
     except Exception:
         for assignment in reversed(assignments):

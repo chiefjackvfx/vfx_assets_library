@@ -747,7 +747,8 @@ def test_update_library_migrates_categories_to_tags_and_removes_surface(tmp_path
     assert repository.update_library().updated == []
 
 
-def test_update_library_rejects_unknown_primary_without_rewriting(tmp_path) -> None:
+@pytest.mark.parametrize("legacy", [True, False])
+def test_update_library_preserves_unknown_primary_and_dry_run_does_not_write(tmp_path, legacy) -> None:
     _source, candidate = source_material(tmp_path)
     library = tmp_path / "library"
     library.mkdir()
@@ -756,17 +757,59 @@ def test_update_library_rejects_unknown_primary_without_rewriting(tmp_path) -> N
     manifest = asset.asset_dir / "asset.json"
     document = json.loads(manifest.read_text(encoding="utf-8"))
     document["category"] = "Future Category"
-    document["categories"] = ["Future Category", "surface", "useful"]
+    if legacy:
+        document["categories"] = ["Future Category", "surface", "useful"]
     manifest.write_text(json.dumps(document, indent=2), encoding="utf-8")
     before = manifest.read_bytes()
+    before_tree = {p.relative_to(library): p.read_bytes() for p in library.rglob('*') if p.is_file()}
 
     assert repository.library_update_count() == 1
+    plan = repository.update_library(dry_run=True)
+    assert plan.dry_run
+    assert plan.categories_preserved == {"texture_set": {"Future Category": 1}}
+    assert len(plan.planned_updates) == int(legacy)
+    assert not plan.failed
+    assert {p.relative_to(library): p.read_bytes() for p in library.rglob('*') if p.is_file()} == before_tree
     summary = repository.update_library()
 
-    assert summary.updated == []
-    assert str(manifest) in summary.failed
-    assert "not defined" in summary.failed[str(manifest)]
-    assert manifest.read_bytes() == before
+    assert len(summary.updated) == int(legacy)
+    assert not summary.failed
+    assert summary.categories_preserved == plan.categories_preserved
+    updated = json.loads(manifest.read_text())
+    assert updated["category"] == "Future Category"
+    assert updated["id"] == document["id"]
+    assert "categories" not in updated
+    if not legacy:
+        assert manifest.read_bytes() == before
+    assert asset.asset_dir.is_dir()
+    backups = list((library / '.ual').glob('texture_categories.json.*.bak'))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == before_tree[Path('.ual/texture_categories.json')]
+    assert not repository.update_library().categories_preserved
+    assert repository.library_update_count() == 0
+
+
+def test_dry_run_does_not_initialize_an_empty_library(tmp_path) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    summary = LibraryRepository(library).update_library(dry_run=True)
+    assert summary.dry_run and not summary.failed
+    assert list(library.iterdir()) == []
+
+
+def test_reconciliation_refuses_broken_custom_category_config(tmp_path) -> None:
+    _source, candidate = source_material(tmp_path)
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library)
+    repository.import_materials([candidate])
+    config = library / '.ual/texture_categories.json'
+    config.write_text('{broken custom config')
+    for dry_run in (True, False):
+        with pytest.raises(ValueError):
+            repository.update_library(dry_run=dry_run)
+        assert config.read_text() == '{broken custom config'
+    assert not list(config.parent.glob('texture_categories.json.*.bak'))
 
 
 def test_update_library_maps_surface_primary_to_uncategorized(tmp_path) -> None:

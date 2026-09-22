@@ -15,7 +15,7 @@ from .actions import ActionError, execute
 from .protocol import PROTOCOL_VERSION, encode_message, receive_message
 
 
-BRIDGE_VERSION = "0.7.0"
+BRIDGE_VERSION = "0.7.1"
 REQUEST_TIMEOUT = 300.0
 _INSTANCE = None
 

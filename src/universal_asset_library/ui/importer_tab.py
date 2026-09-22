@@ -272,6 +272,7 @@ class ImporterTab(QWidget):
     """Shared folder scanner and review workflow for supported asset types."""
 
     import_completed = pyqtSignal(object)
+    busy_changed = pyqtSignal(bool)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1587,6 +1588,7 @@ class ImporterTab(QWidget):
         self._update_import_state()
 
     def _set_busy(self, active: bool) -> None:
+        self.busy_changed.emit(active)
         self.import_mode.setEnabled(not active)
         self.scan_button.setEnabled(not active)
         self.browse_button.setEnabled(not active)

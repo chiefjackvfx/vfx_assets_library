@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 import os
 from pathlib import Path
 
@@ -13,6 +13,7 @@ from .previews.blender_config import (
     normalize_blender_preview_workers,
 )
 from .previews.vdb_config import normalize_vdb_turntable_workers
+from .polyhaven_settings import PolyHavenSyncPreferences
 
 
 THUMBNAIL_SIZES = ("small", "medium", "large")
@@ -74,6 +75,7 @@ class AppSettings:
     vdb_parallel_renders: int = 2
     deadline_command_path: str = DEFAULT_DEADLINE_COMMAND
     husk_submitter_path: str = DEFAULT_HUSK_SUBMITTER
+    polyhaven: PolyHavenSyncPreferences = field(default_factory=PolyHavenSyncPreferences)
 
     def normalized(self) -> "AppSettings":
         library_path = normalize_library_path(self.library_path)
@@ -84,6 +86,7 @@ class AppSettings:
         category = self.default_import_category if self.default_import_category in texture_categories else DEFAULT_IMPORT_CATEGORY
         model_category = self.default_model_category if self.default_model_category in MODEL_CATEGORIES else DEFAULT_IMPORT_CATEGORY
         return AppSettings(
+            polyhaven=self.polyhaven.normalized(),
             library_path=library_path,
             thumbnail_size=thumbnail_size,
             default_import_category=category,
@@ -120,7 +123,14 @@ class SettingsStore:
         self._settings = settings if settings is not None else QSettings()
 
     def load(self) -> AppSettings:
+        defaults = PolyHavenSyncPreferences()
+        values = {}
+        for item in fields(defaults):
+            default = getattr(defaults, item.name)
+            value = self._settings.value(f"polyhaven/{item.name}", default)
+            values[item.name] = _setting_bool(value) if isinstance(default, bool) else str(value)
         return AppSettings(
+            polyhaven=PolyHavenSyncPreferences(**values),
             library_path=str(self._settings.value("library/path", "") or ""),
             thumbnail_size=str(self._settings.value("display/thumbnail_size", DEFAULT_THUMBNAIL_SIZE)),
             default_import_category=str(self._settings.value("import/default_category", DEFAULT_IMPORT_CATEGORY)),
@@ -163,6 +173,8 @@ class SettingsStore:
         valid, message = validate_library_path(normalized.library_path)
         if not valid:
             raise ValueError(message)
+        for item in fields(normalized.polyhaven):
+            self._settings.setValue(f"polyhaven/{item.name}", getattr(normalized.polyhaven, item.name))
         self._settings.setValue("library/path", normalized.library_path)
         self._settings.setValue("display/thumbnail_size", normalized.thumbnail_size)
         self._settings.setValue("import/default_category", normalized.default_import_category)

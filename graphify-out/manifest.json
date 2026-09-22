@@ -100,8 +100,8 @@
     "semantic_hash": "ab4af9f5dbff719c1732497252fbeb54"
   },
   "src/universal_asset_library/categories.py": {
-    "mtime": 1788533584.3584938,
-    "ast_hash": "069280c21462116d86683133ce58c64f",
+    "mtime": 1788858737.1002998,
+    "ast_hash": "2c9a0b95028dc3b325885b48f474dc4b",
     "semantic_hash": ""
   },
   "src/universal_asset_library/domain/__init__.py": {
@@ -155,8 +155,8 @@
     "semantic_hash": ""
   },
   "src/universal_asset_library/importer/models.py": {
-    "mtime": 1786699238.774531,
-    "ast_hash": "11a19383f4407189ba7bc3acd23d4265",
+    "mtime": 1788949789.7911775,
+    "ast_hash": "01f1e04de544ed5c33947b13be5aa998",
     "semantic_hash": ""
   },
   "src/universal_asset_library/importer/scanner.py": {
@@ -245,8 +245,8 @@
     "semantic_hash": ""
   },
   "src/universal_asset_library/integrations/houdini/bridge.py": {
-    "mtime": 1788517789.8289783,
-    "ast_hash": "c998b59ba80d482a237568f5197a1213",
+    "mtime": 1790073196.6326652,
+    "ast_hash": "cb1573761ac8e474ea705cfafeea6150",
     "semantic_hash": ""
   },
   "src/universal_asset_library/integrations/houdini/installer.py": {
@@ -275,8 +275,8 @@
     "semantic_hash": "97ef9c1df79ad0f2c86c84474d878e22"
   },
   "src/universal_asset_library/integrations/houdini/plugin/scripts/python/ual_houdini_bridge/actions.py": {
-    "mtime": 1787323628.1937222,
-    "ast_hash": "b14954b770cd0df6d095be02be2a591f",
+    "mtime": 1790073196.6326652,
+    "ast_hash": "4365cd52acbd088da5494266eb81f5c8",
     "semantic_hash": ""
   },
   "src/universal_asset_library/integrations/houdini/plugin/scripts/python/ual_houdini_bridge/protocol.py": {
@@ -285,8 +285,8 @@
     "semantic_hash": "2bc10b0a56f3aac92db1a33e9be9b65d"
   },
   "src/universal_asset_library/integrations/houdini/plugin/scripts/python/ual_houdini_bridge/server.py": {
-    "mtime": 1787321229.101636,
-    "ast_hash": "ae9d77f871245fe48647d5db5f6b9c12",
+    "mtime": 1790073196.6326652,
+    "ast_hash": "167f8cf2ba41e4361f69eae43fc3dd52",
     "semantic_hash": ""
   },
   "src/universal_asset_library/integrations/model_conversion.py": {
@@ -325,13 +325,13 @@
     "semantic_hash": ""
   },
   "src/universal_asset_library/library/polyhaven.py": {
-    "mtime": 1784738769.064841,
-    "ast_hash": "952dc44e45fc4b6578e5fa5ff4199a50",
-    "semantic_hash": "952dc44e45fc4b6578e5fa5ff4199a50"
+    "mtime": 1788950516.2869685,
+    "ast_hash": "4cdf4b2a986d903541988ab457f00084",
+    "semantic_hash": ""
   },
   "src/universal_asset_library/library/repository.py": {
-    "mtime": 1788790467.4965472,
-    "ast_hash": "ee14188f67764975618223bffd1c6737",
+    "mtime": 1788950544.681113,
+    "ast_hash": "672bd55b9bf0d059711481952a193857",
     "semantic_hash": ""
   },
   "src/universal_asset_library/previews/__init__.py": {
@@ -365,8 +365,8 @@
     "semantic_hash": ""
   },
   "src/universal_asset_library/settings.py": {
-    "mtime": 1788454245.271351,
-    "ast_hash": "899f35462daafb3d95bd7a088dfedfa1",
+    "mtime": 1788949976.4661925,
+    "ast_hash": "1ca001a4eacca67d2b4d011a568dd0f7",
     "semantic_hash": ""
   },
   "src/universal_asset_library/ui/__init__.py": {
@@ -385,8 +385,8 @@
     "semantic_hash": ""
   },
   "src/universal_asset_library/ui/assets_tab.py": {
-    "mtime": 1788792459.416662,
-    "ast_hash": "9628748970f17cc1d071eb68a0e895b6",
+    "mtime": 1789382733.5458555,
+    "ast_hash": "4da8b715a2ea499f7b6a198ba46df8e6",
     "semantic_hash": ""
   },
   "src/universal_asset_library/ui/batch_metadata.py": {
@@ -400,18 +400,18 @@
     "semantic_hash": "2413a61b56107023b98ffd85f202ec92"
   },
   "src/universal_asset_library/ui/importer_tab.py": {
-    "mtime": 1787324517.9666982,
-    "ast_hash": "5c1f98a77c1919daf992e4eef51f6844",
+    "mtime": 1788950198.7673507,
+    "ast_hash": "fd31b9b7c44a084c3035706ad08b172a",
     "semantic_hash": ""
   },
   "src/universal_asset_library/ui/main_window.py": {
-    "mtime": 1788454245.4023519,
-    "ast_hash": "eaddd42557e8191aad101220b75d571c",
+    "mtime": 1788950198.9263515,
+    "ast_hash": "07db9343724a31cf6e36fd32e841f7de",
     "semantic_hash": ""
   },
   "src/universal_asset_library/ui/settings_tab.py": {
-    "mtime": 1788454245.3393514,
-    "ast_hash": "5181ab4db7c7852cd362c54c638a27fc",
+    "mtime": 1788950699.0819027,
+    "ast_hash": "bbb59e0607c501df391e67ac8ebcce0f",
     "semantic_hash": ""
   },
   "src/universal_asset_library/ui/theme.py": {
@@ -445,9 +445,9 @@
     "semantic_hash": ""
   },
   "tests/test_categories.py": {
-    "mtime": 1784887904.9187517,
-    "ast_hash": "4513daf7c29037c2ae0e56378abd6814",
-    "semantic_hash": "4513daf7c29037c2ae0e56378abd6814"
+    "mtime": 1788858954.6960948,
+    "ast_hash": "58a890b1ecdce831bd359be078609203",
+    "semantic_hash": ""
   },
   "tests/test_hdri_importer.py": {
     "mtime": 1787326029.649206,
@@ -475,13 +475,13 @@
     "semantic_hash": "47452b2eeac7fc690c5f07832a8e552c"
   },
   "tests/test_houdini_bridge.py": {
-    "mtime": 1788517789.9129786,
-    "ast_hash": "461110903c46f447c3017f7694318f73",
+    "mtime": 1790073272.2240114,
+    "ast_hash": "71a19ac5a97d3a1d2f8bd9963f0dec11",
     "semantic_hash": ""
   },
   "tests/test_houdini_plugin.py": {
-    "mtime": 1787324217.913371,
-    "ast_hash": "364124d082755c49510622c5cdc74430",
+    "mtime": 1790073242.697876,
+    "ast_hash": "61fad7ac8514168fd585dfcd913d428a",
     "semantic_hash": ""
   },
   "tests/test_houdini_ui.py": {
@@ -495,8 +495,8 @@
     "semantic_hash": ""
   },
   "tests/test_library_repository.py": {
-    "mtime": 1788533683.7939868,
-    "ast_hash": "a0e8601226674a4caa18a4a0c34b982e",
+    "mtime": 1788858978.688183,
+    "ast_hash": "a06bff765cea215e18afac0ad741ba88",
     "semantic_hash": ""
   },
   "tests/test_model_conversion.py": {
@@ -525,8 +525,8 @@
     "semantic_hash": ""
   },
   "tests/test_settings.py": {
-    "mtime": 1788454537.17684,
-    "ast_hash": "7783a2866da72080b82ee29b99833071",
+    "mtime": 1788950455.5516589,
+    "ast_hash": "4e6f06dc6233796b31bc43e97c9c3348",
     "semantic_hash": ""
   },
   "tests/test_stock_importer.py": {
@@ -555,8 +555,8 @@
     "semantic_hash": "e08ba5690c9cf77e3a20a913cae7bab0"
   },
   "tests/test_ui.py": {
-    "mtime": 1788792434.279531,
-    "ast_hash": "1daa6a2684f0e5eadb559b72cdb38f42",
+    "mtime": 1789382720.9517906,
+    "ast_hash": "8c4b0cc78186132b3bc4ad9063aa3330",
     "semantic_hash": ""
   },
   "Asset Category Icon Sidebar plan.md": {
@@ -575,8 +575,8 @@
     "semantic_hash": "d79c62fa4369eefae4271be867d0336c"
   },
   "README.md": {
-    "mtime": 1788795929.3710659,
-    "ast_hash": "6dcb084dae068cd15675b35de24d67a7",
+    "mtime": 1788951733.3922272,
+    "ast_hash": "7171e6bd7ee91af494d91d7e7394baff",
     "semantic_hash": ""
   },
   "SHOTBOX_ASSETS_PLAN.md": {
@@ -807,6 +807,31 @@
   "graphify-out/memory/query_20260731_143848_its_still_pretty_slow_would_it_be_faster_on_cpu.md": {
     "mtime": 1785508728.0596957,
     "ast_hash": "ba28e980891ded2dee1a5463fcdd749d",
+    "semantic_hash": ""
+  },
+  "src/universal_asset_library/library/polyhaven_sync.py": {
+    "mtime": 1788951733.2652264,
+    "ast_hash": "d113196d5cccbf1053e71eec3a56349e",
+    "semantic_hash": ""
+  },
+  "src/universal_asset_library/polyhaven_settings.py": {
+    "mtime": 1788951733.203226,
+    "ast_hash": "19a078a36bd460ae991e13827d99ef0a",
+    "semantic_hash": ""
+  },
+  "src/universal_asset_library/ui/polyhaven_panel.py": {
+    "mtime": 1788951733.3292267,
+    "ast_hash": "958b8de2293f3658a7f32a74909f2441",
+    "semantic_hash": ""
+  },
+  "tests/test_polyhaven_sync.py": {
+    "mtime": 1788950786.8783522,
+    "ast_hash": "b776625272a3930b5059767570d28e30",
+    "semantic_hash": ""
+  },
+  "tests/test_polyhaven_ui.py": {
+    "mtime": 1788950788.3423595,
+    "ast_hash": "57f9b1db1a783fd6abffe2f9c4a10154",
     "semantic_hash": ""
   }
 }

@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+from uuid import uuid4
 from tempfile import NamedTemporaryFile
 
 from universal_asset_library.domain import (
@@ -230,6 +232,36 @@ class CategoryConfigStore:
 
     def load_all(self) -> dict[str, CategoryCatalog]:
         return {asset_type: self.load(asset_type) for asset_type in CATEGORY_FILENAMES}
+
+    def load_strict(self, asset_type: str) -> CategoryCatalog:
+        """Never replace a broken custom catalog with defaults during repair."""
+        path = self.path_for(asset_type)
+        if not path.exists():
+            return default_category_catalog(asset_type)
+        return _parse_catalog(json.loads(path.read_text(encoding="utf-8-sig")), asset_type, [])
+
+    def preserve_categories(self, asset_type: str, names: list[str]) -> None:
+        """Append missing categories, preserving custom fields and a recovery copy.
+
+        The caller must hold the library write lock.
+        """
+        catalog = self.load_strict(asset_type)
+        additions = []
+        for name in names:
+            if catalog.canonical_name(name) is None:
+                definition = CategoryDefinition(name, category_icon_id(name))
+                additions.append({"name": name, "icon": definition.icon, "aliases": []})
+                catalog = CategoryCatalog(asset_type, (*catalog.categories, definition))
+        if not additions:
+            return
+        path = self.path_for(asset_type)
+        if path.exists():
+            document = json.loads(path.read_text(encoding="utf-8-sig"))
+            shutil.copy2(path, path.with_name(f"{path.name}.{uuid4().hex}.bak"))
+        else:
+            document = _catalog_document(default_category_catalog(asset_type))
+        document["categories"].extend(additions)
+        _atomic_json(path, document)
 
 
 def category_icon_id(name: str) -> str:

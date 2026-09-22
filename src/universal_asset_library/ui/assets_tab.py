@@ -502,6 +502,89 @@ class MaterialEditDialog(QDialog):
         self.accept()
 
 
+class BatchAssetEditDialog(QDialog):
+    """Edit only metadata fields that are safe to share across assets."""
+
+    def __init__(
+        self,
+        assets: tuple[AssetRecord, ...],
+        parent: QWidget | None = None,
+        category_suggestions: tuple[str, ...] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Edit {len(assets)} selected assets")
+        self.setMinimumWidth(540)
+        layout = QVBoxLayout(self)
+        heading = QLabel(f"Edit {len(assets)} Selected Assets")
+        heading.setObjectName("pageTitle")
+        note = QLabel(
+            "Only the checked shared fields are applied. Asset names and existing "
+            "metadata remain unchanged, and tags entered here are added rather than replaced."
+        )
+        note.setObjectName("mutedLabel")
+        note.setWordWrap(True)
+        layout.addWidget(heading)
+        layout.addWidget(note)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(22)
+        form.setVerticalSpacing(12)
+        self.change_category = QCheckBox("Change category")
+        self.category = QComboBox()
+        self.category.addItems(tuple(category_suggestions or ()))
+        common_category = assets[0].category if assets else ""
+        if common_category and self.category.findText(common_category) < 0:
+            self.category.addItem(common_category)
+        self.category.setCurrentText(common_category)
+        self.category.setEnabled(False)
+        self.change_category.toggled.connect(self.category.setEnabled)
+        category_row = QWidget()
+        category_layout = QHBoxLayout(category_row)
+        category_layout.setContentsMargins(0, 0, 0, 0)
+        category_layout.setSpacing(8)
+        category_layout.addWidget(self.change_category)
+        category_layout.addWidget(self.category, 1)
+        self.tags = TagEditor(
+            (),
+            placeholder="Tags to add to every selected asset…",
+            helper_text="Existing tags are preserved · press Enter or comma to add",
+        )
+        form.addRow("Category", category_row)
+        form.addRow("Add tags", self.tags)
+        layout.addLayout(form)
+        self.validation = QLabel()
+        self.validation.setStyleSheet("color:#ef7d7d;")
+        layout.addWidget(self.validation)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def metadata_patch(self) -> AssetMetadataPatch:
+        return AssetMetadataPatch(
+            category=(
+                self.category.currentText().strip()
+                if self.change_category.isChecked()
+                else None
+            ),
+            add_tags=self.tags.tags(),
+        )
+
+    def _accept_if_valid(self) -> None:
+        patch = self.metadata_patch()
+        if patch.category is None and not patch.add_tags:
+            self.validation.setText("Choose a category change or add at least one tag.")
+            return
+        if self.change_category.isChecked() and not patch.category:
+            self.validation.setText("Choose an asset category.")
+            self.category.setFocus()
+            return
+        self.accept()
+
+
 class MoveToTrashDialog(QDialog):
     """Confirm a recoverable asset move and identify its managed payload."""
 
@@ -1004,6 +1087,7 @@ class TextureFilterModel(QSortFilterProxyModel):
         self.category = "All"
         self.channel = "All"
         self.rating_filter = "All ratings"
+        self.show_trash = False
         self.sort_mode = "Name"
         self.category_catalog = default_category_catalog("texture_set")
 
@@ -1011,6 +1095,11 @@ class TextureFilterModel(QSortFilterProxyModel):
         index = self.sourceModel().index(source_row, 0, source_parent)
         asset = self.sourceModel().data(index, ASSET_ROLE)
         if not asset or not asset.matches(self.query, "All", self.channel):
+            return False
+        if (
+            not self.show_trash
+            and asset.category.casefold() == TRASH_CATEGORY.casefold()
+        ):
             return False
         if not _rating_filter_matches(asset.rating, self.rating_filter):
             return False
@@ -1047,9 +1136,11 @@ class TextureFilterModel(QSortFilterProxyModel):
         category: str,
         channel: str,
         rating_filter: str = "All ratings",
+        show_trash: bool = False,
     ) -> None:
         self.query, self.category, self.channel = query, category, channel
         self.rating_filter = rating_filter
+        self.show_trash = bool(show_trash)
         self.invalidateFilter()
 
     def set_category_catalog(self, catalog: CategoryCatalog) -> None:
@@ -1934,6 +2025,7 @@ class DetailPanel(QFrame):
     def __init__(self) -> None:
         super().__init__()
         self._asset: AssetRecord | None = None
+        self._selection_provider = None
         self._ai_busy = False
         self._library_mutation_busy = False
         self._asset_task_busy = False
@@ -2385,6 +2477,42 @@ class DetailPanel(QFrame):
         # earlier prototype; disabled future actions no longer clutter the UI.
         self.future_buttons = []
         self.clear()
+
+    def set_selection_provider(self, provider) -> None:
+        self._selection_provider = provider
+
+    def _action_assets(self) -> tuple[AssetRecord, ...]:
+        if self._asset is None:
+            return ()
+        if self._selection_provider is None:
+            return (self._asset,)
+        selected = tuple(self._selection_provider())
+        if len(selected) > 1 and any(
+            asset.id == self._asset.id for asset in selected
+        ):
+            return selected
+        return (self._asset,)
+
+    def set_action_scope(self, count: int) -> None:
+        """Make the inspector's current batch target visible to the user."""
+        if count > 1:
+            self.path_button.setText(f"Copy {count} asset paths")
+            self.reveal_button.setText("Reveal selected folders")
+            self.trash_button.setText(f"Move {count} to Trash…")
+            self.edit_button.setText(f"Edit {count} assets…")
+            self.guess_category_button.setText("Guess Categories")
+            self.guess_tags_button.setText("Guess Tags")
+            if not self.hdri_render_button.isHidden():
+                self.hdri_render_button.setText(f"Queue {count} Previews")
+            if not self.model_convert_button.isHidden():
+                self.model_convert_button.setText(f"Convert {count} to USD")
+            self.houdini_send_button.setText(f"Send {count} to Houdini")
+            self.blender_send_button.setText(f"Send {count} to Blender")
+            return
+        self.path_button.setText("Copy asset path")
+        self.reveal_button.setText("Reveal in folder")
+        self.guess_category_button.setText("Guess Category")
+        self.guess_tags_button.setText("Guess Tags")
 
     def clear(self) -> None:
         self._asset = None
@@ -2878,6 +3006,7 @@ class DetailPanel(QFrame):
         self.guess_tags_button.show()
         self._update_ai_controls()
         self._apply_library_mutation_gate()
+        self.set_action_scope(len(self._action_assets()))
 
     def set_library_mutation_busy(self, active: bool) -> None:
         changed = self._library_mutation_busy != bool(active)
@@ -3473,21 +3602,29 @@ class DetailPanel(QFrame):
             self.stock_audio.setVolume(max(0.0, min(1.0, value / 100.0)))
 
     def _open_stock_preview(self) -> None:
-        if isinstance(self._asset, (LibraryStockAsset, LibraryVdbAsset)) and self._asset.preview_path:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._asset.preview_path)))
+        for asset in self._action_assets():
+            if isinstance(asset, (LibraryStockAsset, LibraryVdbAsset)) and asset.preview_path:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(asset.preview_path)))
 
     def _copy_path(self) -> None:
-        if self._asset:
+        paths = []
+        for asset in self._action_assets():
             path = (
-                self._asset.source_path
-                if isinstance(self._asset, LibraryStockAsset)
-                else self._asset.asset_dir
+                asset.source_path
+                if isinstance(asset, LibraryStockAsset)
+                else asset.asset_dir
             )
-            QApplication.clipboard().setText(str(path))
+            paths.append(str(path))
+        if paths:
+            QApplication.clipboard().setText("\n".join(paths))
 
     def _reveal(self) -> None:
-        if self._asset:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._asset.asset_dir)))
+        revealed = set()
+        for asset in self._action_assets():
+            path = str(asset.asset_dir)
+            if path not in revealed:
+                revealed.add(path)
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def _copy_extra_path(self) -> None:
         value = str(self.extra_selector.currentData() or "")
@@ -3500,9 +3637,14 @@ class DetailPanel(QFrame):
             QDesktopServices.openUrl(QUrl.fromLocalFile(value))
 
     def _view_3d(self) -> None:
-        if not isinstance(self._asset, LibraryModelAsset) or not self._asset.usd_path:
-            return
-        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._asset.usd_path))):
+        failed = False
+        for asset in self._action_assets():
+            if not isinstance(asset, LibraryModelAsset) or not asset.usd_path:
+                continue
+            failed = not QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(asset.usd_path))
+            ) or failed
+        if failed:
             QMessageBox.warning(self, "No USD viewer", "No application is associated with this USD file. Install or configure an external USD viewer and try again.")
 
 
@@ -4182,12 +4324,24 @@ class AssetsTab(QWidget):
         )
         self._model_conversion_worker: ModelConversionWorker | None = None
         self._model_conversion_token: CancelToken | None = None
+        self._model_conversion_queue: list[tuple[LibraryModelAsset, str, str]] = []
+        self._model_conversion_total = 0
+        self._model_conversion_completed = 0
+        self._model_conversion_failures: list[str] = []
         self._model_rescan_worker: ModelRescanWorker | None = None
         self._model_rescan_token: CancelToken | None = None
         self._houdini_worker: HoudiniWorker | None = None
         self._houdini_sessions: list[HoudiniSession] = []
+        self._houdini_send_queue: list[tuple[AssetRecord, str, str, HoudiniSession]] = []
+        self._houdini_send_total = 0
+        self._houdini_send_completed = 0
+        self._houdini_send_failures: list[str] = []
         self._blender_worker: BlenderWorker | None = None
         self._blender_sessions: list[BlenderSession] = []
+        self._blender_send_queue: list[tuple[AssetRecord, str, str, BlenderSession]] = []
+        self._blender_send_total = 0
+        self._blender_send_completed = 0
+        self._blender_send_failures: list[str] = []
         self._polyhaven_worker: PolyHavenWorker | None = None
         self._polyhaven_token: CancelToken | None = None
         self._polyhaven_options: PolyHavenOptions | None = None
@@ -4263,6 +4417,11 @@ class AssetsTab(QWidget):
             "All ratings", "Rated", "2+", "3+", "4+", "5 stars", "Unrated",
         ])
         self.rating_filter.setToolTip("Filter assets by their shared library rating")
+        self.show_trash = QCheckBox("Show Trash")
+        self.show_trash.setChecked(False)
+        self.show_trash.setToolTip(
+            "Include recoverable assets from the Trash category in the catalog."
+        )
         self.sort = QComboBox()
         self.sort.addItems([
             "Name", "Rating", "Category", "Resolution", "Duration", "Import Date",
@@ -4276,6 +4435,7 @@ class AssetsTab(QWidget):
         toolbar_layout.addWidget(self.search, 1)
         toolbar_layout.addWidget(self.channel)
         toolbar_layout.addWidget(self.rating_filter)
+        toolbar_layout.addWidget(self.show_trash)
         toolbar_layout.addWidget(self.sort)
         self.refresh_catalog_button = QPushButton("Refresh Catalog")
         self.refresh_catalog_button.setToolTip(
@@ -4336,22 +4496,29 @@ class AssetsTab(QWidget):
         )
         self.proxy.modelReset.connect(self.quick_look.dismiss)
         self.detail = DetailPanel()
+        self.detail.set_selection_provider(self._selected_assets)
         self.detail.stock_playback_active_changed.connect(
             self.stock_hover_previews.set_suspended
         )
-        self.detail.edit_requested.connect(self._edit_material)
-        self.detail.trash_requested.connect(self._move_asset_to_trash)
-        self.detail.rating_requested.connect(self._rate_asset)
-        self.detail.ai_guess_requested.connect(self._guess_asset_metadata)
-        self.detail.model_convert_requested.connect(self._convert_model_to_usd)
+        self.detail.edit_requested.connect(self._edit_selected_assets)
+        self.detail.trash_requested.connect(self._move_selected_assets_to_trash)
+        self.detail.rating_requested.connect(self._rate_selected_assets)
+        self.detail.ai_guess_requested.connect(self._guess_selected_asset_metadata)
+        self.detail.model_convert_requested.connect(self._convert_selected_models_to_usd)
         self.detail.model_convert_canceled.connect(self._cancel_model_conversion)
         self.detail.model_rescan_requested.connect(self._rescan_model_asset)
         self.detail.model_rescan_canceled.connect(self._cancel_model_rescan)
-        self.detail.hdri_render_requested.connect(self._render_hdri_preview)
+        self.detail.hdri_render_requested.connect(self._render_selected_previews)
         self.detail.hdri_render_canceled.connect(self._cancel_hdri_render)
-        self.detail.vdb_render_requested.connect(self._render_vdb_preview)
+        self.detail.vdb_render_requested.connect(self._render_selected_vdb_previews)
         self.detail.vdb_deadline_generate_requested.connect(
-            lambda asset: self._open_deadline_vdb_batch((asset,))
+            lambda asset: self._open_deadline_vdb_batch(
+                tuple(
+                    selected
+                    for selected in self._inspector_action_assets(asset)
+                    if isinstance(selected, LibraryVdbAsset)
+                )
+            )
         )
         self.detail.vdb_deadline_resubmit_requested.connect(
             self._resubmit_vdb_deadline
@@ -4364,9 +4531,9 @@ class AssetsTab(QWidget):
         )
         self.detail.vdb_render_canceled.connect(self._cancel_hdri_render)
         self.detail.houdini_refresh_requested.connect(self.refresh_houdini_sessions)
-        self.detail.houdini_send_requested.connect(self._send_hdri_to_houdini)
+        self.detail.houdini_send_requested.connect(self._send_selected_to_houdini)
         self.detail.blender_refresh_requested.connect(self.refresh_blender_sessions)
-        self.detail.blender_send_requested.connect(self._send_hdri_to_blender)
+        self.detail.blender_send_requested.connect(self._send_selected_to_blender)
         self.detail.polyhaven_check_requested.connect(self._check_polyhaven)
         self.detail.polyhaven_download_requested.connect(self._download_polyhaven)
         self.detail.polyhaven_cancel_requested.connect(self._cancel_polyhaven)
@@ -4570,6 +4737,7 @@ class AssetsTab(QWidget):
         self.category_rail.category_changed.connect(self._rail_category_changed)
         self.channel.currentTextChanged.connect(self._filter)
         self.rating_filter.currentTextChanged.connect(self._filter)
+        self.show_trash.toggled.connect(self._trash_visibility_changed)
         self.sort.currentTextChanged.connect(self.proxy.set_sort_mode)
         self.view.clicked.connect(self._selected)
         self.view.selectionModel().selectionChanged.connect(
@@ -4587,13 +4755,18 @@ class AssetsTab(QWidget):
     @property
     def metadata_update_active(self) -> bool:
         return (
-            self._metadata_update_worker is not None
+            getattr(self, "_external_library_busy", False)
+            or self._metadata_update_worker is not None
             or self._batch_metadata_worker is not None
             or self._rating_update_worker is not None
             or bool(self._pending_rating_updates)
         )
 
-    def _set_library_mutation_busy(self, active: bool) -> None:
+    def set_external_library_busy(self, active: bool) -> None:
+        self._external_library_busy = active
+        self._set_library_mutation_busy(active or self.metadata_update_active, notify=False)
+
+    def _set_library_mutation_busy(self, active: bool, *, notify: bool = True) -> None:
         active = bool(active)
         changed = self._library_mutation_busy != active
         self._library_mutation_busy = active
@@ -4608,7 +4781,7 @@ class AssetsTab(QWidget):
         self.bulk_stop_deadline_button.setEnabled(not active)
         self.detail.set_library_mutation_busy(active)
         self.card_delegate.set_rating_enabled(not active)
-        if changed:
+        if changed and notify:
             self.library_mutation_busy_changed.emit(active)
 
     def resizeEvent(self, event) -> None:
@@ -4872,6 +5045,8 @@ class AssetsTab(QWidget):
                 self._proxy_index_for_id(selected_id)
                 if selected_id else self.proxy.index(0, 0)
             )
+            if not selected.isValid():
+                selected = self.proxy.index(0, 0)
             if selected.isValid():
                 self.view.setCurrentIndex(selected)
                 asset = selected.data(ASSET_ROLE)
@@ -4923,6 +5098,42 @@ class AssetsTab(QWidget):
                 return index
         return QModelIndex()
 
+    def _inspector_action_assets(
+        self, focused: AssetRecord
+    ) -> tuple[AssetRecord, ...]:
+        """Resolve a right-hand inspector action to its intended selection."""
+        selected = self._selected_assets()
+        if len(selected) > 1 and any(
+            asset.id == focused.id for asset in selected
+        ):
+            return selected
+        return (focused,)
+
+    def _edit_selected_assets(self, focused: AssetRecord) -> None:
+        assets = self._inspector_action_assets(focused)
+        if len(assets) == 1:
+            self._edit_material(focused)
+            return
+        if self.metadata_update_active:
+            return
+        dialog = BatchAssetEditDialog(
+            assets,
+            self,
+            self._category_catalogs[self._section_type()].names,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        patch = dialog.metadata_patch()
+        requests = tuple(
+            BatchMetadataRequest(asset.id, asset.name, patch)
+            for asset in assets
+        )
+        self._start_batch_metadata(
+            requests,
+            origin="manual-batch-edit",
+            title=f"Editing {len(requests)} selected assets",
+        )
+
     def _edit_material(self, asset: AssetRecord) -> None:
         if self.metadata_update_active:
             return
@@ -4934,6 +5145,42 @@ class AssetsTab(QWidget):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._save_material_edit(asset, dialog.metadata_update())
+
+    def _move_selected_assets_to_trash(self, focused: AssetRecord) -> bool:
+        assets = tuple(
+            asset
+            for asset in self._inspector_action_assets(focused)
+            if asset.category.casefold() != TRASH_CATEGORY.casefold()
+        )
+        if len(assets) <= 1:
+            return bool(assets) and self._move_asset_to_trash(assets[0])
+        if self.metadata_update_active or not self._library_path:
+            return False
+        answer = QMessageBox.warning(
+            self,
+            "Move selected assets to Trash?",
+            f"Move {len(assets)} selected assets to Trash?\n\n"
+            "The assets remain recoverable. ShotBox will move every managed "
+            "payload into its Trash category folder.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self.quick_look.dismiss()
+        requests = tuple(
+            BatchMetadataRequest(
+                asset.id,
+                asset.name,
+                AssetMetadataPatch(category=TRASH_CATEGORY),
+            )
+            for asset in assets
+        )
+        return self._start_batch_metadata(
+            requests,
+            origin="trash",
+            title=f"Moving {len(requests)} selected assets to Trash",
+        )
 
     def _move_asset_to_trash(self, asset: AssetRecord) -> bool:
         if (
@@ -5037,6 +5284,12 @@ class AssetsTab(QWidget):
             self.detail.star_rating.set_save_state("saving")
         self._start_next_rating_update()
         return True
+
+    def _rate_selected_assets(self, focused: AssetRecord, rating: int) -> bool:
+        changed = False
+        for asset in self._inspector_action_assets(focused):
+            changed = self._rate_asset(asset, rating) or changed
+        return changed
 
     def _start_next_rating_update(self) -> None:
         if self._rating_update_worker is not None or not self._pending_rating_updates:
@@ -5283,12 +5536,15 @@ class AssetsTab(QWidget):
             self._show_failed_task(len(result.updated), result.failures)
         elif result.canceled:
             self._show_completed_task(
-                f"Updated {len(result.updated)} asset(s); remaining moves canceled.",
+                f"{'Moved' if origin == 'trash' else 'Updated'} "
+                f"{len(result.updated)} asset(s); remaining moves canceled.",
                 auto_hide=False,
             )
         else:
             self._show_completed_task(
-                f"Updated {len(result.updated)} asset(s).", auto_hide=True
+                f"{'Moved to Trash' if origin == 'trash' else 'Updated'} "
+                f"{len(result.updated)} asset(s).",
+                auto_hide=True,
             )
 
     def _show_active_task(
@@ -5480,6 +5736,17 @@ class AssetsTab(QWidget):
         )
         QThreadPool.globalInstance().start(worker)
 
+    def _guess_selected_asset_metadata(
+        self, focused: AssetRecord, operation: str
+    ) -> None:
+        assets = self._inspector_action_assets(focused)
+        if len(assets) == 1:
+            self._guess_asset_metadata(focused, operation)
+            return
+        # The organiser is the batch-safe AI workflow: it analyzes every
+        # selected preview and lets the user approve the generated patches.
+        self._open_ai_organiser(initial_scope="selected")
+
     def _ensure_ollama_ready(self) -> bool:
         status = OllamaClient(timeout=2).status()
         if status.available and status.has_model(DEFAULT_MODEL):
@@ -5668,11 +5935,19 @@ class AssetsTab(QWidget):
 
     def _rebuild_categories(self) -> None:
         current = self.category.currentText()
+        trash_visible = self.show_trash.isChecked()
+        if (
+            not trash_visible
+            and current.casefold() == TRASH_CATEGORY.casefold()
+        ):
+            current = "All"
         catalog = self._category_catalogs[self._section_type()]
         self.proxy.set_category_catalog(catalog)
         used = {
             category
             for asset in self.source_model.assets
+            if trash_visible
+            or asset.category.casefold() != TRASH_CATEGORY.casefold()
             for category in _asset_filter_categories(asset, catalog)
         }
         if current and current != "All":
@@ -5701,6 +5976,11 @@ class AssetsTab(QWidget):
         facet = self.channel.currentText()
 
         def adjust(asset: AssetRecord, amount: int) -> None:
+            if (
+                not self.show_trash.isChecked()
+                and asset.category.casefold() == TRASH_CATEGORY.casefold()
+            ):
+                return
             if not asset.matches(query, "All", facet):
                 return
             counts["All"] = max(0, counts.get("All", 0) + amount)
@@ -5711,6 +5991,11 @@ class AssetsTab(QWidget):
         adjust(updated, 1)
         self._category_count_cache = counts
         current = self.category.currentText()
+        if (
+            not self.show_trash.isChecked()
+            and current.casefold() == TRASH_CATEGORY.casefold()
+        ):
+            current = "All"
         used = {
             category
             for category, count in counts.items()
@@ -5858,6 +6143,7 @@ class AssetsTab(QWidget):
             self.detail.show_asset(asset)
         elif count == 0:
             self.detail.clear()
+        self.detail.set_action_scope(count)
         self._sync_detail_task_state()
         self._sync_preview_render_status()
         self._rebuild_bulk_categories()
@@ -6376,6 +6662,7 @@ class AssetsTab(QWidget):
             self.category.currentText(),
             self.channel.currentText(),
             self.rating_filter.currentText(),
+            self.show_trash.isChecked(),
         )
         self.category_rail.set_counts(self._category_counts())
         current = self.view.currentIndex()
@@ -6387,11 +6674,19 @@ class AssetsTab(QWidget):
             self.detail.clear()
         self._update_count()
 
+    def _trash_visibility_changed(self, _visible: bool) -> None:
+        self._rebuild_categories()
+
     def _category_counts(self) -> dict[str, int]:
         counts = {"All": 0}
         query = self.search.text()
         facet = self.channel.currentText()
         for asset in self.source_model.assets:
+            if (
+                not self.show_trash.isChecked()
+                and asset.category.casefold() == TRASH_CATEGORY.casefold()
+            ):
+                continue
             if not asset.matches(query, "All", facet):
                 continue
             if not _rating_filter_matches(
@@ -6517,6 +6812,89 @@ class AssetsTab(QWidget):
         worker.signals.failed.connect(self._houdini_failed)
         QThreadPool.globalInstance().start(worker)
 
+    @staticmethod
+    def _matching_model_export_path(
+        focused: AssetRecord,
+        asset: LibraryModelAsset,
+        requested_path: str,
+    ) -> str:
+        options = model_export_options(asset)
+        if not options:
+            return ""
+        if asset.id == focused.id and any(
+            option.path == requested_path for option in options
+        ):
+            return requested_path
+        focused_options = (
+            model_export_options(focused)
+            if isinstance(focused, LibraryModelAsset)
+            else ()
+        )
+        requested = next(
+            (option for option in focused_options if option.path == requested_path),
+            None,
+        )
+        if requested is None:
+            return options[0].path
+        best = min(
+            options,
+            key=lambda option: (
+                option.resolution != requested.resolution,
+                option.lod != requested.lod,
+                option.file_format.upper() != requested.file_format.upper(),
+                not option.preferred,
+                option.path.casefold(),
+            ),
+        )
+        return best.path
+
+    def _send_selected_to_houdini(
+        self,
+        focused: AssetRecord,
+        resolution: str,
+        target: str,
+        session: HoudiniSession,
+    ) -> None:
+        if self._houdini_worker is not None or not self._library_path:
+            return
+        assets = tuple(
+            asset
+            for asset in self._inspector_action_assets(focused)
+            if isinstance(
+                asset,
+                (LibraryHdriAsset, LibraryTextureAsset, LibraryModelAsset, LibraryVdbAsset),
+            )
+        )
+        jobs = []
+        for asset in assets:
+            selected = (
+                self._matching_model_export_path(focused, asset, resolution)
+                if isinstance(asset, LibraryModelAsset)
+                else resolution
+            )
+            selected_target = target
+            if isinstance(asset, LibraryModelAsset):
+                record = next(
+                    (
+                        option for option in model_export_options(asset)
+                        if option.path == selected
+                    ),
+                    None,
+                )
+                if record is not None and record.file_format.upper() == "FBX":
+                    selected_target = "sop"
+            jobs.append((asset, selected, selected_target, session))
+        if not jobs:
+            return
+        if len(jobs) == 1:
+            self._send_hdri_to_houdini(*jobs[0])
+            return
+        self._houdini_send_total = len(jobs)
+        self._houdini_send_completed = 0
+        self._houdini_send_failures = []
+        self._houdini_send_queue = jobs[1:]
+        self._send_hdri_to_houdini(*jobs[0])
+
     def _send_hdri_to_houdini(
         self,
         asset: LibraryHdriAsset | LibraryTextureAsset | LibraryModelAsset | LibraryVdbAsset,
@@ -6554,6 +6932,9 @@ class AssetsTab(QWidget):
             preferred = str(QSettings().value("houdini/last_session_id", "") or "")
             self.detail.set_houdini_sessions(self._houdini_sessions, preferred)
             return
+        if self._houdini_send_total:
+            self._advance_houdini_send_queue()
+            return
         response = result
         if isinstance(response, BridgeResponse):
             self.detail.set_houdini_result(response.diagnostic or f"Created {response.node_path}.", True)
@@ -6565,8 +6946,38 @@ class AssetsTab(QWidget):
         if operation == "discover":
             self._houdini_sessions = []
             self.detail.set_houdini_sessions([])
+        elif self._houdini_send_total:
+            self._houdini_send_failures.append(message)
+            self._advance_houdini_send_queue()
         else:
             self.detail.set_houdini_result(message, False)
+
+    def _advance_houdini_send_queue(self) -> None:
+        self._houdini_send_completed += 1
+        if self._houdini_send_queue:
+            job = self._houdini_send_queue.pop(0)
+            self.detail.set_houdini_busy(
+                True,
+                f"Sending selected asset {self._houdini_send_completed + 1} "
+                f"of {self._houdini_send_total} to Houdini…",
+            )
+            self._send_hdri_to_houdini(*job)
+            return
+        total = self._houdini_send_total
+        failures = tuple(self._houdini_send_failures)
+        self._houdini_send_total = 0
+        self._houdini_send_completed = 0
+        self._houdini_send_failures = []
+        if failures:
+            self.detail.set_houdini_result(
+                f"Sent {total - len(failures)} of {total} selected assets. "
+                f"{len(failures)} failed: {failures[-1]}",
+                False,
+            )
+        else:
+            self.detail.set_houdini_result(
+                f"Sent {total} selected assets to Houdini.", True
+            )
 
     def refresh_blender_sessions(self) -> None:
         if self._blender_worker is not None:
@@ -6578,6 +6989,44 @@ class AssetsTab(QWidget):
         worker.signals.finished.connect(self._blender_finished)
         worker.signals.failed.connect(self._blender_failed)
         QThreadPool.globalInstance().start(worker)
+
+    def _send_selected_to_blender(
+        self,
+        focused: AssetRecord,
+        resolution: str,
+        world_mode: str,
+        session: BlenderSession,
+    ) -> None:
+        if self._blender_worker is not None or not self._library_path:
+            return
+        assets = tuple(
+            asset
+            for asset in self._inspector_action_assets(focused)
+            if isinstance(
+                asset, (LibraryHdriAsset, LibraryTextureAsset, LibraryModelAsset)
+            )
+        )
+        jobs = [
+            (
+                asset,
+                self._matching_model_export_path(focused, asset, resolution)
+                if isinstance(asset, LibraryModelAsset)
+                else resolution,
+                world_mode,
+                session,
+            )
+            for asset in assets
+        ]
+        if not jobs:
+            return
+        if len(jobs) == 1:
+            self._send_hdri_to_blender(*jobs[0])
+            return
+        self._blender_send_total = len(jobs)
+        self._blender_send_completed = 0
+        self._blender_send_failures = []
+        self._blender_send_queue = jobs[1:]
+        self._send_hdri_to_blender(*jobs[0])
 
     def _send_hdri_to_blender(
         self,
@@ -6612,6 +7061,9 @@ class AssetsTab(QWidget):
             preferred = str(QSettings().value("blender_bridge/last_session_id", "") or "")
             self.detail.set_blender_sessions(self._blender_sessions, preferred)
             return
+        if self._blender_send_total:
+            self._advance_blender_send_queue()
+            return
         if isinstance(result, BlenderBridgeResponse):
             self.detail.set_blender_result(result.diagnostic or f"Updated {result.world_name}.", True)
         else:
@@ -6622,8 +7074,38 @@ class AssetsTab(QWidget):
         if operation == "discover":
             self._blender_sessions = []
             self.detail.set_blender_sessions([])
+        elif self._blender_send_total:
+            self._blender_send_failures.append(message)
+            self._advance_blender_send_queue()
         else:
             self.detail.set_blender_result(message, False)
+
+    def _advance_blender_send_queue(self) -> None:
+        self._blender_send_completed += 1
+        if self._blender_send_queue:
+            job = self._blender_send_queue.pop(0)
+            self.detail.set_blender_busy(
+                True,
+                f"Sending selected asset {self._blender_send_completed + 1} "
+                f"of {self._blender_send_total} to Blender…",
+            )
+            self._send_hdri_to_blender(*job)
+            return
+        total = self._blender_send_total
+        failures = tuple(self._blender_send_failures)
+        self._blender_send_total = 0
+        self._blender_send_completed = 0
+        self._blender_send_failures = []
+        if failures:
+            self.detail.set_blender_result(
+                f"Sent {total - len(failures)} of {total} selected assets. "
+                f"{len(failures)} failed: {failures[-1]}",
+                False,
+            )
+        else:
+            self.detail.set_blender_result(
+                f"Sent {total} selected assets to Blender.", True
+            )
 
     def _check_polyhaven(self, asset: AssetRecord) -> None:
         if self._polyhaven_worker is not None or not self._library_path:
@@ -6719,6 +7201,16 @@ class AssetsTab(QWidget):
     def _render_hdri_preview(self, asset: AssetRecord) -> None:
         self.queue_preview_renders((asset,), automatic=False)
 
+    def _render_selected_previews(self, focused: AssetRecord) -> None:
+        assets = tuple(
+            asset
+            for asset in self._inspector_action_assets(focused)
+            if isinstance(asset, LibraryHdriAsset)
+            or isinstance(asset, LibraryTextureAsset)
+            and asset.asset_type == "texture_set"
+        )
+        self.queue_preview_renders(assets, automatic=False)
+
     def _render_vdb_preview(
         self,
         asset: AssetRecord,
@@ -6728,6 +7220,26 @@ class AssetsTab(QWidget):
     ) -> None:
         self.queue_preview_renders(
             (asset,),
+            automatic=False,
+            vdb_variant=variant,
+            vdb_density_scale=density_scale,
+            vdb_mode=mode,
+        )
+
+    def _render_selected_vdb_previews(
+        self,
+        focused: AssetRecord,
+        variant: str,
+        density_scale: int,
+        mode: str,
+    ) -> None:
+        assets = tuple(
+            asset
+            for asset in self._inspector_action_assets(focused)
+            if isinstance(asset, LibraryVdbAsset)
+        )
+        self.queue_preview_renders(
+            assets,
             automatic=False,
             vdb_variant=variant,
             vdb_density_scale=density_scale,
@@ -6935,32 +7447,42 @@ class AssetsTab(QWidget):
         self._preview_thread_pool.start(worker)
 
     def _cancel_hdri_render(self) -> None:
-        asset = self.detail._asset
-        if asset is None:
+        focused = self.detail._asset
+        if focused is None:
             return
-        active = self._active_preview_renders.get(asset.id)
-        if active is not None:
-            active.token.cancel()
-            application = (
-                "Houdini" if active.job.asset_type == "vdb" else "Blender"
-            )
-            self.detail.set_hdri_rendering(
-                True, f"Canceling {application} safely…"
-            )
-            return
-        before = len(self._preview_render_jobs)
+        assets = self._inspector_action_assets(focused)
+        asset_ids = {asset.id for asset in assets}
+        active_count = 0
+        for asset_id in asset_ids:
+            active = self._active_preview_renders.get(asset_id)
+            if active is not None:
+                active.token.cancel()
+                active_count += 1
+        queued_ids = {
+            job.asset_id
+            for job in self._preview_render_jobs
+            if job.asset_id in asset_ids
+        }
         self._preview_render_jobs = [
             job
             for job in self._preview_render_jobs
-            if job.asset_id != asset.id
+            if job.asset_id not in asset_ids
         ]
-        if len(self._preview_render_jobs) != before:
-            self._preview_render_ids.discard(asset.id)
-            self.card_delegate.clear_task_state(asset.id)
+        queued_count = len(queued_ids)
+        if queued_count:
+            self._preview_render_ids.difference_update(queued_ids)
+            self.card_delegate.clear_task_states(queued_ids)
             self._update_preview_queue_controls()
-            self.detail.show_asset(asset)
+        if active_count:
             self.detail.set_hdri_rendering(
-                False, "Preview render removed from the queue."
+                True,
+                f"Canceling {active_count} selected preview render(s) safely…",
+            )
+        elif queued_count:
+            self.detail.show_asset(focused)
+            self.detail.set_hdri_rendering(
+                False,
+                f"Removed {queued_count} selected preview render(s) from the queue.",
             )
 
     def _preview_render_progressed(
@@ -7169,24 +7691,95 @@ class AssetsTab(QWidget):
         if not self._preview_session_close_workers:
             QTimer.singleShot(0, self._start_queued_preview_renders)
 
-    def _convert_model_to_usd(self, asset: AssetRecord) -> None:
+    @staticmethod
+    def _matching_model_conversion_source(
+        focused: LibraryModelAsset,
+        asset: LibraryModelAsset,
+        requested_path: str,
+    ) -> str:
+        sources = model_conversion_sources(asset)
+        if not sources:
+            return ""
+        if asset.id == focused.id and any(
+            source.path == requested_path for source in sources
+        ):
+            return requested_path
+        requested = next(
+            (
+                source for source in model_conversion_sources(focused)
+                if source.path == requested_path
+            ),
+            None,
+        )
+        if requested is None:
+            return sources[0].path
+        best = min(
+            sources,
+            key=lambda source: (
+                source.resolution != requested.resolution,
+                source.lod != requested.lod,
+                source.file_format.upper() != requested.file_format.upper(),
+                not source.preferred,
+                source.path.casefold(),
+            ),
+        )
+        return best.path
+
+    def _convert_selected_models_to_usd(self, focused: AssetRecord) -> None:
         if (
-            not isinstance(asset, LibraryModelAsset)
+            not isinstance(focused, LibraryModelAsset)
             or self._model_conversion_worker is not None
             or self._model_rescan_worker is not None
         ):
             return
         dialog = ModelConversionDialog(
-            asset, self._library_path, self._blender_path, self,
+            focused, self._library_path, self._blender_path, self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        assets = tuple(
+            asset
+            for asset in self._inspector_action_assets(focused)
+            if isinstance(asset, LibraryModelAsset)
+            and bool(model_conversion_sources(asset))
+        )
+        jobs = [
+            (
+                asset,
+                self._matching_model_conversion_source(
+                    focused, asset, dialog.source_path
+                ),
+                dialog.orientation_preset,
+            )
+            for asset in assets
+        ]
+        if not jobs:
+            return
+        if len(jobs) > 1:
+            self._model_conversion_total = len(jobs)
+            self._model_conversion_completed = 0
+            self._model_conversion_failures = []
+            self._model_conversion_queue = jobs[1:]
+        self._start_model_conversion(*jobs[0])
+
+    def _convert_model_to_usd(self, asset: AssetRecord) -> None:
+        """Compatibility entry point for a single model conversion."""
+        if not isinstance(asset, LibraryModelAsset):
+            return
+        self._convert_selected_models_to_usd(asset)
+
+    def _start_model_conversion(
+        self,
+        asset: LibraryModelAsset,
+        source_path: str,
+        orientation_preset: str,
+    ) -> None:
         token = CancelToken()
         worker = ModelConversionWorker(
             self._library_path,
             asset.id,
-            dialog.source_path,
-            dialog.orientation_preset,
+            source_path,
+            orientation_preset,
             self._blender_path,
             token,
         )
@@ -7201,6 +7794,12 @@ class AssetsTab(QWidget):
         QThreadPool.globalInstance().start(worker)
 
     def _cancel_model_conversion(self) -> None:
+        if self._model_conversion_total:
+            self._model_conversion_failures.extend(
+                "Canceled before conversion"
+                for _job in self._model_conversion_queue
+            )
+        self._model_conversion_queue = []
         if self._model_conversion_token:
             self._model_conversion_token.cancel()
             self.detail.set_model_conversion_busy(True, "Canceling Blender safely…")
@@ -7209,6 +7808,9 @@ class AssetsTab(QWidget):
         self._model_conversion_worker = None
         self._model_conversion_token = None
         self.apply_asset_updates((update.asset,))
+        if self._model_conversion_total:
+            self._advance_model_conversion_queue()
+            return
         self.detail.set_model_conversion_result(
             f"Published preferred USDC with {update.conversion.mesh_count} mesh(es) "
             f"and {update.conversion.material_count} material binding(s).",
@@ -7218,10 +7820,41 @@ class AssetsTab(QWidget):
     def _model_conversion_failed(self, message: str) -> None:
         self._model_conversion_worker = None
         self._model_conversion_token = None
+        if self._model_conversion_total:
+            self._model_conversion_failures.append(message)
+            self._advance_model_conversion_queue()
+            return
         self.detail.set_model_conversion_result(
             message or "USD conversion failed; the previous model was retained.",
             False,
         )
+
+    def _advance_model_conversion_queue(self) -> None:
+        self._model_conversion_completed += 1
+        if self._model_conversion_queue:
+            job = self._model_conversion_queue.pop(0)
+            self.detail.set_model_conversion_busy(
+                True,
+                f"Converting selected model {self._model_conversion_completed + 1} "
+                f"of {self._model_conversion_total}…",
+            )
+            self._start_model_conversion(*job)
+            return
+        total = self._model_conversion_total
+        failures = tuple(self._model_conversion_failures)
+        self._model_conversion_total = 0
+        self._model_conversion_completed = 0
+        self._model_conversion_failures = []
+        if failures:
+            self.detail.set_model_conversion_result(
+                f"Converted {total - len(failures)} of {total} selected models. "
+                f"{len(failures)} failed: {failures[-1]}",
+                False,
+            )
+        else:
+            self.detail.set_model_conversion_result(
+                f"Converted {total} selected models to USD.", True
+            )
 
     def _rescan_model_asset(self, asset: AssetRecord) -> None:
         if (

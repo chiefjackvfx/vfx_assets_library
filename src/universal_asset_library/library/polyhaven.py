@@ -96,12 +96,22 @@ class PolyHavenClient:
         user_agent: str = USER_AGENT,
         timeout: float = 20.0,
         download_hosts: frozenset[str] = DEFAULT_DOWNLOAD_HOSTS,
+        cancel: Callable[[], None] | None = None,
     ) -> None:
         self.api_root = api_root.rstrip("/")
         self.user_agent = user_agent
         self.timeout = timeout
         self.download_hosts = download_hosts
+        self.cancel = cancel
         self._cache: dict[tuple[str, str], dict] = {}
+
+    def fetch_assets(self) -> dict:
+        """Start a fresh catalogue check, retaining file listings only within it."""
+        self._cache.clear()
+        return self._json("/assets")
+
+    def fetch_files(self, slug: str) -> dict:
+        return self._json(f"/files/{_safe_slug(slug)}")
 
     def fetch_catalog(self, slug: str, expected_type: int) -> dict:
         slug = _safe_slug(slug)
@@ -126,10 +136,11 @@ class PolyHavenClient:
             response.close()
             raise PolyHavenError("Poly Haven API redirected to an untrusted host.")
         try:
-            payload = response.read(10 * 1024 * 1024 + 1)
+            limit = (64 if endpoint == "/assets" else 10) * 1024 * 1024
+            payload = response.read(limit + 1)
         finally:
             response.close()
-        if len(payload) > 10 * 1024 * 1024:
+        if len(payload) > limit:
             raise PolyHavenError("Poly Haven returned an oversized JSON response.")
         try:
             document = json.loads(payload.decode("utf-8-sig"))
@@ -157,6 +168,7 @@ class PolyHavenClient:
         for attempt in range(retries + 1):
             temporary = destination.with_name(destination.name + ".part")
             temporary.unlink(missing_ok=True)
+            size = 0
             try:
                 response = self._open(remote.url)
                 final = urlparse(response.geturl())
@@ -192,19 +204,43 @@ class PolyHavenClient:
                 return size, sha256.hexdigest()
             except Exception as error:
                 temporary.unlink(missing_ok=True)
+                if progress and size:
+                    progress(-size)
+                if cancel:
+                    cancel()
                 last_error = error
                 if attempt < retries:
-                    time.sleep(0.15 * (attempt + 1))
+                    self._pause(0.15 * (attempt + 1), cancel)
         raise PolyHavenError(str(last_error or "Poly Haven download failed.")) from last_error
 
     def _open(self, url: str):
         request = Request(url, headers={"User-Agent": self.user_agent, "Accept": "application/json, application/octet-stream"})
-        try:
-            return urlopen(request, timeout=self.timeout)
-        except HTTPError as error:
-            raise PolyHavenError(f"Poly Haven returned HTTP {error.code}.") from error
-        except (URLError, TimeoutError, OSError) as error:
-            raise PolyHavenError(f"Could not contact Poly Haven: {error}") from error
+        for attempt in range(3):
+            if self.cancel:
+                self.cancel()
+            try:
+                return urlopen(request, timeout=self.timeout)
+            except HTTPError as error:
+                retry_after = error.headers.get("Retry-After", "") if error.headers else ""
+                error.close()
+                if error.code not in {429, 500, 502, 503, 504} or attempt == 2:
+                    raise PolyHavenError(f"Poly Haven returned HTTP {error.code}.") from error
+                try:
+                    delay = min(60.0, max(1.0, float(retry_after)))
+                except ValueError:
+                    delay = float(2 ** (attempt + 1))
+                self._pause(delay)
+            except (URLError, TimeoutError, OSError) as error:
+                if attempt == 2:
+                    raise PolyHavenError(f"Could not contact Poly Haven: {error}") from error
+                self._pause(float(2 ** attempt))
+
+    def _pause(self, seconds: float, cancel: Callable[[], None] | None = None) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if cancel or self.cancel:
+                (cancel or self.cancel)()
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
 
 def resolve_polyhaven_slug(provider_id: str, metadata_documents: list[dict]) -> str:
@@ -418,7 +454,7 @@ def _safe_slug(value: str) -> str:
 
 def _safe_relative(value: str) -> str:
     path = PurePosixPath(value.replace("\\", "/"))
-    if not value or path.is_absolute() or ".." in path.parts or any(part in {"", "."} for part in path.parts):
+    if not value or not path.parts or ":" in value or "\x00" in value or path.is_absolute() or ".." in path.parts or any(part in {"", "."} for part in path.parts):
         raise PolyHavenError(f"Unsafe Poly Haven package path: {value}")
     return path.as_posix()
 

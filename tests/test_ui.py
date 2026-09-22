@@ -7,8 +7,8 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtCore import QEvent, QPoint, QRect, QItemSelectionModel, QSettings, QThreadPool, Qt
-from PyQt6.QtGui import QColor, QCloseEvent, QImage, QPixmap
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QRect, QItemSelectionModel, QSettings, QThreadPool, Qt
+from PyQt6.QtGui import QColor, QCloseEvent, QImage, QPixmap, QWheelEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMessageBox
 
@@ -17,6 +17,7 @@ from universal_asset_library.settings import AppSettings, SettingsStore
 from universal_asset_library.ui.assets_tab import (
     ASSET_ROLE,
     AssetsTab,
+    BatchAssetEditDialog,
     DetailPanel,
     MaterialEditDialog,
     MoveToTrashDialog,
@@ -1029,6 +1030,163 @@ def test_texture_inspector_exposes_shader_preview_controls(app, tmp_path) -> Non
     assert "disabled" in tab.detail.hdri_render_status.text().casefold()
 
 
+def test_inspector_preview_button_uses_complete_asset_selection(
+    app, tmp_path, monkeypatch,
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library, render_texture_previews=False)
+    assets = []
+    for index, name in enumerate(("Selected_Preview_A", "Selected_Preview_B")):
+        source = texture_source(tmp_path, name)
+        image = QImage(1024, 1024, QImage.Format.Format_RGB32)
+        image.fill(QColor(70 + index * 80, 90, 110))
+        assert image.save(str(source / f"{name}_diff_4k.jpg"))
+        assets.extend(
+            repository.import_materials(
+                scan_texture_folder(source).materials
+            ).imported
+        )
+    tab = AssetsTab()
+    tab._library_path = str(library)
+    tab._all_assets = list(assets)
+    tab._reindex_all_assets()
+    tab.source_model.replace(list(assets))
+    selection = tab.view.selectionModel()
+    flags = (
+        QItemSelectionModel.SelectionFlag.Select
+        | QItemSelectionModel.SelectionFlag.Rows
+    )
+    selection.select(tab.proxy.index(0, 0), flags)
+    selection.select(tab.proxy.index(1, 0), flags)
+    tab.detail.show_asset(assets[0])
+    queued = []
+    monkeypatch.setattr(
+        tab,
+        "queue_preview_renders",
+        lambda selected, **_kwargs: queued.append(tuple(selected)) or len(selected),
+    )
+
+    assert tab.detail.hdri_render_button.text() == "Queue 2 Previews"
+    tab.detail.hdri_render_button.click()
+
+    assert {asset.id for asset in queued[0]} == {asset.id for asset in assets}
+
+
+def test_inspector_rating_and_paths_use_complete_asset_selection(
+    app, tmp_path, monkeypatch,
+) -> None:
+    first = stock_asset(tmp_path, "selected-stock-a")
+    second = stock_asset(tmp_path, "selected-stock-b")
+    tab = AssetsTab()
+    tab._all_assets = [first, second]
+    tab._reindex_all_assets()
+    tab.source_model.replace([first, second])
+    selection = tab.view.selectionModel()
+    flags = (
+        QItemSelectionModel.SelectionFlag.Select
+        | QItemSelectionModel.SelectionFlag.Rows
+    )
+    selection.select(tab.proxy.index(0, 0), flags)
+    selection.select(tab.proxy.index(1, 0), flags)
+    tab.detail.show_asset(first)
+    rated = []
+    monkeypatch.setattr(
+        tab,
+        "_rate_asset",
+        lambda asset, rating: rated.append((asset.id, rating)) or True,
+    )
+
+    tab.detail.rating_requested.emit(first, 4)
+    tab.detail.path_button.click()
+
+    assert rated == [(first.id, 4), (second.id, 4)]
+    assert QApplication.clipboard().text().splitlines() == [
+        str(first.source_path), str(second.source_path),
+    ]
+
+
+def test_batch_asset_edit_patch_only_changes_shared_fields(app, tmp_path) -> None:
+    assets = (
+        stock_asset(tmp_path, "batch-edit-a"),
+        stock_asset(tmp_path, "batch-edit-b"),
+    )
+    dialog = BatchAssetEditDialog(assets, category_suggestions=("Smoke", "Fire"))
+    dialog.change_category.setChecked(True)
+    dialog.category.setCurrentText("Fire")
+    dialog.tags.add_tags(("hero", "night"))
+
+    assert dialog.metadata_patch() == AssetMetadataPatch(
+        category="Fire", add_tags=("hero", "night")
+    )
+
+
+def test_inspector_trash_action_builds_batch_for_complete_selection(
+    app, tmp_path, monkeypatch,
+) -> None:
+    first = stock_asset(tmp_path, "trash-selected-a")
+    second = stock_asset(tmp_path, "trash-selected-b")
+    tab = AssetsTab()
+    tab._library_path = str(tmp_path)
+    monkeypatch.setattr(tab, "_selected_assets", lambda: (first, second))
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    batches = []
+    monkeypatch.setattr(
+        tab,
+        "_start_batch_metadata",
+        lambda requests, **kwargs: batches.append((requests, kwargs)) or True,
+    )
+
+    assert tab._move_selected_assets_to_trash(first)
+
+    requests, options = batches[0]
+    assert {request.asset_id for request in requests} == {first.id, second.id}
+    assert all(request.patch.category == "Trash" for request in requests)
+    assert options["origin"] == "trash"
+
+
+def test_inspector_dcc_send_queues_complete_selection(
+    app, tmp_path, monkeypatch,
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    repository = LibraryRepository(library, render_texture_previews=False)
+    assets = []
+    for index, name in enumerate(("Dcc_Selected_A", "Dcc_Selected_B")):
+        source = texture_source(tmp_path, name)
+        image = QImage(1024, 1024, QImage.Format.Format_RGB32)
+        image.fill(QColor(80 + index * 70, 100, 120))
+        assert image.save(str(source / f"{name}_diff_4k.jpg"))
+        assets.extend(
+            repository.import_materials(
+                scan_texture_folder(source).materials
+            ).imported
+        )
+    first, second = assets
+    tab = AssetsTab()
+    tab._library_path = str(library)
+    monkeypatch.setattr(tab, "_selected_assets", lambda: (first, second))
+    started = []
+    monkeypatch.setattr(
+        tab,
+        "_send_hdri_to_blender",
+        lambda *job: started.append(job),
+    )
+    session = object()
+
+    tab._send_selected_to_blender(first, "4K", "new", session)
+
+    assert started[0][0] == first
+    assert tab._blender_send_total == 2
+    assert tab._blender_send_queue[0][0] == second
+    tab._advance_blender_send_queue()
+    assert started[1][0] == second
+
+
 def test_missing_import_previews_use_parallel_persistent_blender_sessions(
     app, tmp_path, monkeypatch
 ) -> None:
@@ -1422,6 +1580,41 @@ def test_preflight_status_describes_current_phase_file_and_progress(app) -> None
     assert tab.import_progress.value() == int(5 / 18 * 1000)
 
 
+@pytest.mark.parametrize("focused", [False, True])
+def test_settings_wheel_does_not_change_values_but_keyboard_still_works(app, tmp_path, focused) -> None:
+    store = SettingsStore(QSettings(str(tmp_path / "wheel.ini"), QSettings.Format.IniFormat))
+    tab = SettingsTab(store, AppSettings())
+    tab.show()
+    app.processEvents()
+    controls = (
+        tab.thumbnail_size, tab.default_category, tab.default_model_category,
+        tab.blender_parallel_renders, tab.vdb_parallel_renders,
+    )
+    for control in controls:
+        is_combo = hasattr(control, "currentIndex")
+        if is_combo:
+            control.setCurrentIndex(1)
+        else:
+            control.setValue(2)
+        if focused:
+            control.setFocus()
+        else:
+            control.clearFocus()
+        before = control.currentIndex() if is_combo else control.value()
+        for delta in (-120, 120):
+            event = QWheelEvent(
+                QPointF(control.rect().center()), QPointF(control.mapToGlobal(control.rect().center())),
+                QPoint(), QPoint(0, delta), Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False,
+            )
+            QApplication.sendEvent(control, event)
+            assert not event.isAccepted()
+            assert (control.currentIndex() if is_combo else control.value()) == before
+        QTest.keyClick(control, Qt.Key.Key_Down)
+        assert (control.currentIndex() if is_combo else control.value()) != before
+    tab.close()
+
+
 def test_settings_detects_abandoned_staging_for_confirmed_cleanup(app, tmp_path) -> None:
     library = tmp_path / "library"
     library.mkdir()
@@ -1437,6 +1630,29 @@ def test_settings_detects_abandoned_staging_for_confirmed_cleanup(app, tmp_path)
     assert "1 abandoned" in tab.recovery_status.text()
     assert tab.cleanup_staging_button.isEnabled()
     assert tab.update_library_button.isEnabled()
+
+
+def test_settings_dry_run_reports_plan_without_mutating_library(app, tmp_path) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    LibraryRepository(library).initialize()
+    store = SettingsStore(QSettings(str(tmp_path / "dry-run.ini"), QSettings.Format.IniFormat))
+    tab = SettingsTab(store, store.save(AppSettings(str(library))))
+    tab.refresh_maintenance_state()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    before = {p.relative_to(library): p.read_bytes() for p in library.rglob('*') if p.is_file()}
+    emitted = []
+    tab.library_updated.connect(emitted.append)
+    assert tab.dry_run_library_button.isEnabled()
+    tab.dry_run_library_button.click()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    assert QThreadPool.globalInstance().waitForDone(5000)
+    app.processEvents()
+    assert "Dry run — no files changed" in tab.maintenance_log.toPlainText()
+    assert not emitted
+    assert {p.relative_to(library): p.read_bytes() for p in library.rglob('*') if p.is_file()} == before
 
 
 def test_settings_fix_library_registers_manually_added_model_preview(app, tmp_path) -> None:
@@ -1628,11 +1844,49 @@ def test_asset_trash_button_confirms_and_moves_managed_folder(
     assert trashed.category == "Trash"
     assert trashed.asset_dir.parent == library / "textures" / "trash"
     assert not asset.asset_dir.exists()
+    assert tab.proxy.rowCount() == 0
+    assert tab.detail._asset is None
+    assert tab.category.findText("Trash") < 0
+
+    tab.show_trash.setChecked(True)
+
+    assert tab.proxy.rowCount() == 1
     assert tab.detail._asset.category == "Trash"
     assert tab.detail.trash_button.text() == "In Trash"
     assert not tab.detail.trash_button.isEnabled()
     assert tab.category.findText("Trash") >= 0
     assert tab.task_status.text() == "Moved 1 asset to Trash."
+
+
+def test_trash_assets_are_hidden_until_show_trash_is_checked(
+    app, tmp_path,
+) -> None:
+    visible = stock_asset(tmp_path, "visible-asset")
+    trashed = replace(
+        stock_asset(tmp_path, "trashed-asset"), category="Trash"
+    )
+    tab = AssetsTab()
+    tab.source_model.replace([visible, trashed])
+    tab._rebuild_categories()
+
+    assert not tab.show_trash.isChecked()
+    assert tab.proxy.rowCount() == 1
+    assert tab.proxy.index(0, 0).data(ASSET_ROLE).id == visible.id
+    assert tab.category.findText("Trash") < 0
+
+    tab.show_trash.setChecked(True)
+
+    assert tab.proxy.rowCount() == 2
+    assert tab.category.findText("Trash") >= 0
+    assert tab._category_counts()["Trash"] == 1
+    tab.category.setCurrentText("Trash")
+    assert tab.proxy.rowCount() == 1
+
+    tab.show_trash.setChecked(False)
+
+    assert tab.proxy.rowCount() == 1
+    assert tab.category.currentText() == "All"
+    assert tab.category.findText("Trash") < 0
 
 
 def test_rating_filter_sort_and_star_toggle(app, tmp_path) -> None:

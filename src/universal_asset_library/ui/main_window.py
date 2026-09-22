@@ -29,6 +29,9 @@ class MainWindow(QMainWindow):
         self.settings_tab.settings_saved.connect(self._apply_settings)
         self.settings_tab.library_repaired.connect(self._library_repaired)
         self.settings_tab.library_updated.connect(self._library_updated)
+        self.settings_tab.polyhaven_imported.connect(self._polyhaven_imported)
+        self.settings_tab.polyhaven_busy_changed.connect(self._polyhaven_busy_changed)
+        self.importer_tab.busy_changed.connect(self.settings_tab.polyhaven_panel.set_external_blocked)
         self.settings_tab.houdini_bridge_changed.connect(self.assets_tab.refresh_houdini_sessions)
         self.settings_tab.blender_bridge_changed.connect(self.assets_tab.refresh_blender_sessions)
         self.assets_tab.open_settings_requested.connect(lambda: self.tabs.setCurrentWidget(self.settings_tab))
@@ -59,6 +62,11 @@ class MainWindow(QMainWindow):
             )
 
     def closeEvent(self, event) -> None:
+        if self.settings_tab.polyhaven_panel.busy:
+            self._polyhaven_close_pending = True
+            self.settings_tab.polyhaven_panel.cancel()
+            event.ignore()
+            return
         if self.assets_tab.metadata_update_active:
             QMessageBox.information(
                 self,
@@ -122,6 +130,19 @@ class MainWindow(QMainWindow):
             self.assets_tab.refresh_catalog()
         self.tabs.setCurrentWidget(self.assets_tab)
 
+    def _polyhaven_imported(self, summary) -> None:
+        if summary.imported:
+            self.assets_tab.apply_asset_updates(summary.imported)
+            self.assets_tab.queue_import_previews(summary.imported)
+        self.assets_tab.refresh_catalog()
+
+    def _polyhaven_busy_changed(self, active: bool) -> None:
+        self.importer_tab.setEnabled(not active)
+        self.assets_tab.set_external_library_busy(active)
+        if not active and getattr(self, "_polyhaven_close_pending", False):
+            self._polyhaven_close_pending = False
+            QTimer.singleShot(0, self.close)
+
     def _library_repaired(self, summary) -> None:
         self.assets_tab.apply_asset_updates(summary.renamed)
         self.assets_tab.refresh_catalog()
@@ -136,6 +157,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Updated material metadata: {asset.name}", 6000)
 
     def _library_mutation_busy_changed(self, active: bool) -> None:
+        self.settings_tab.polyhaven_panel.set_external_blocked(active)
         for widget in (self.importer_tab, self.settings_tab):
             index = self.tabs.indexOf(widget)
             self.tabs.setTabEnabled(index, not active)

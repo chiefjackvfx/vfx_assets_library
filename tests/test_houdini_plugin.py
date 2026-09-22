@@ -98,6 +98,9 @@ class FakeNode:
                 )
             }
 
+    def sessionId(self):
+        return id(self)
+
     def name(self):
         return self._name
 
@@ -624,3 +627,100 @@ def test_import_fbx_model_rejects_lop_and_outside_library(tmp_path) -> None:
         actions.import_fbx_model(
             FakeHou(), _fbx_payload(library, outside, maps=False), "session"
         )
+
+
+class FreshNodeWrapper:
+    """A fresh Python handle to an existing node, matching HOM lookups."""
+
+    def __init__(self, node):
+        self.node = node
+
+    def __getattr__(self, name):
+        return getattr(self.node, name)
+
+
+@pytest.fixture
+def fbx_scene(tmp_path, monkeypatch):
+    source = tmp_path / "oak.fbx"
+    source.write_bytes(b"fbx")
+    (tmp_path / "oak_base.jpg").write_bytes(b"base")
+    hou = FakeHou()
+    existing = []
+    for network in ("mat", "shop"):
+        parent = hou.node("/").createNode(network + "net", network)
+        node = parent.createNode("fbxshader", "Oak_Bark")
+        node.setUserData("sentinel", "preserve")
+        existing.append(node)
+    original = actions._network_children_by_path
+    # Retain wrappers so Python ID recycling cannot conceal the regression.
+    wrappers = []
+
+    def fresh_children(hou, paths):
+        result = [FreshNodeWrapper(node) for node in original(hou, paths)]
+        wrappers.extend(result)
+        return result
+
+    monkeypatch.setattr(actions, "_network_children_by_path", fresh_children)
+    return hou, _fbx_payload(tmp_path, source), existing
+
+
+def test_fbx_repeated_imports_preserve_materials_with_fresh_wrappers(fbx_scene):
+    hou, payload, existing = fbx_scene
+    imports = []
+    for name in ("Oak Tree", "Oak Tree", "Birch Tree"):
+        request = dict(payload, asset_name=name, asset_id=name)
+        if name == "Birch Tree":
+            source = Path(payload["library_root"]) / "birch.fbx"
+            source.write_bytes(b"second fbx")
+            request["model_path"] = str(source)
+        imports.append(actions.import_fbx_model(hou, request, "session"))
+        for previous in imports:
+            material = hou.node(previous["material_paths"][0])
+            assert material is not None
+            assert not material.name().startswith("shotbox_")
+            sop = hou.node(previous["imported_targets"][0])
+            assignment = sop.parent().displayNode()
+            assert assignment.parm("shop_materialpath1").value == material.path()
+        for node in existing:
+            assert hou.node(node.path()) is node
+            assert node.userData("sentinel") == "preserve"
+    assert len({result["material_paths"][0] for result in imports}) == 3
+    assert len(hou.node("/mat").children) == 4
+    assert len(hou.node("/shop").children) == 1
+
+
+@pytest.mark.parametrize("failure", ["matching", "shader", "geometry", "assignment", "importer"])
+def test_fbx_failed_import_preserves_previous_scene(fbx_scene, monkeypatch, failure):
+    hou, payload, existing = fbx_scene
+    first = actions.import_fbx_model(hou, payload, "session")
+    before = dict(hou.nodes)
+    if failure == "matching":
+        payload["texture_sets"].append(dict(payload["texture_sets"][0], name="Leaves"))
+        hou.hipFile.fbx_material_paths = ["/mat/Unknown"]
+    elif failure == "geometry":
+        monkeypatch.setattr(actions, "_fbx_geometry_outputs", lambda root: [])
+    elif failure == "importer":
+        def failed_import(*args, **kwargs):
+            hou.node("/mat").createNode("fbxshader", "partial_native")
+            raise RuntimeError("importer failure")
+        monkeypatch.setattr(hou.hipFile, "importFBX", failed_import)
+    else:
+        def fail(*args, **kwargs):
+            raise RuntimeError("setup failure")
+        if failure == "shader":
+            monkeypatch.setattr(actions, "_materialx_sources", fail)
+        else:
+            original = FakeNode.setInput
+            def set_input(node, *args, **kwargs):
+                if node.type().name() == "material":
+                    fail()
+                return original(node, *args, **kwargs)
+            monkeypatch.setattr(FakeNode, "setInput", set_input)
+    with pytest.raises((actions.ActionError, RuntimeError)):
+        actions.import_fbx_model(hou, payload, "session")
+    assert hou.nodes == before
+    material = hou.node(first["material_paths"][0])
+    sop = hou.node(first["imported_targets"][0])
+    assert sop.parent().displayNode().parm("shop_materialpath1").value == material.path()
+    for node in existing:
+        assert node.userData("sentinel") == "preserve"
